@@ -17,10 +17,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <string.h>
 
 #include "config.h"
 #include "display.h"
 #include "modem.h"
+#include "wificfg.h"
 
 extern "C" {
 #include "lwip/opt.h"
@@ -53,6 +55,54 @@ static uint32_t pkts_from_host = 0;
 enum LinkMode { MODE_MODEM = 0, MODE_SLIP = 1 };
 static LinkMode g_mode = MODE_MODEM;
 static Preferences g_prefs;
+
+// ---- WiFi credentials (NVS-backed, shared by both personalities) ----
+static char g_ssid[33];
+static char g_pass[65];
+
+// Deferred reconfigure: disconnect now, then WiFi.begin() a beat later, so we
+// don't call set_config while the STA is still mid-transition (ESP_ERR_WIFI_STATE).
+static volatile bool g_wifi_reconfig = false;
+static uint32_t g_wifi_reconfig_at = 0;
+
+// Debounced auto-apply: setting SSID/PASS arms this so a quick SSID+PASS pair
+// coalesces into one connect (instead of a doomed attempt after just the SSID).
+static uint32_t g_wifi_apply_at = 0;
+
+void wifi_load_and_begin() {
+    String s = g_prefs.getString("ssid", WIFI_SSID);   // NVS, else config.h default
+    String p = g_prefs.getString("pass", WIFI_PASS);
+    strncpy(g_ssid, s.c_str(), sizeof(g_ssid) - 1); g_ssid[sizeof(g_ssid) - 1] = 0;
+    strncpy(g_pass, p.c_str(), sizeof(g_pass) - 1); g_pass[sizeof(g_pass) - 1] = 0;
+    WiFi.begin(g_ssid, g_pass);
+    DBG("[wifi] connecting to \"%s\"\n", g_ssid);
+}
+
+void wifi_set_ssid(const char *s) {
+    strncpy(g_ssid, s, sizeof(g_ssid) - 1); g_ssid[sizeof(g_ssid) - 1] = 0;
+    g_prefs.putString("ssid", g_ssid);
+    DBG("[wifi] ssid set \"%s\"\n", g_ssid);
+}
+
+void wifi_set_pass(const char *p) {
+    strncpy(g_pass, p, sizeof(g_pass) - 1); g_pass[sizeof(g_pass) - 1] = 0;
+    g_prefs.putString("pass", g_pass);
+    DBG("[wifi] pass set (%u chars)\n", (unsigned)strlen(g_pass));
+}
+
+const char *wifi_ssid() { return g_ssid; }
+bool wifi_has_pass()    { return g_pass[0] != 0; }
+
+void wifi_reconnect() {
+    napt_enabled = false;
+    g_wifi_apply_at = 0;              // cancel any pending debounced apply
+    WiFi.disconnect(true, false);     // wifioff=true: radio off, nothing can re-dial
+    g_wifi_reconfig = true;
+    g_wifi_reconfig_at = millis() + 500;   // bring it back up + begin() once settled
+    DBG("[wifi] reconnect scheduled for \"%s\"\n", g_ssid);
+}
+
+void wifi_apply_soon() { g_wifi_apply_at = millis() + 2500; }
 
 // ---------------------------------------------------------------------------
 // SLIP: outbound (lwIP -> SLIP-encode -> USB CDC). tcpip-thread context.
@@ -155,9 +205,11 @@ static void on_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info) {
             enable_napt();
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-            DBG("[wifi] disconnected, reconnecting\n");
             napt_enabled = false;
-            WiFi.reconnect();
+            if (!g_wifi_reconfig) {       // a real drop, not an intentional reconfigure
+                DBG("[wifi] disconnected, reconnecting\n");
+                WiFi.reconnect();
+            }
             break;
         default: break;
     }
@@ -205,14 +257,14 @@ void setup() {
     WiFi.onEvent(on_wifi_event);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    DBG("[wifi] connecting to \"%s\"\n", WIFI_SSID);
+
+    g_prefs.begin("slip-router", false);
+    wifi_load_and_begin();      // NVS creds (or config.h defaults) -> WiFi.begin
 
     display_init();
     slip_start();
     modem_begin();
 
-    g_prefs.begin("slip-router", false);
     g_mode = (LinkMode)g_prefs.getUChar("mode", MODE_MODEM);  // default: modem
     apply_mode();
     DBG("[boot] setup complete, mode=%s\n", g_mode == MODE_SLIP ? "SLIP" : "MODEM");
@@ -225,6 +277,21 @@ void loop() {
     else                     modem_poll();
 
     uint32_t now = millis();
+
+    // Debounced auto-apply after a credential change.
+    if (g_wifi_apply_at && (int32_t)(now - g_wifi_apply_at) >= 0) {
+        g_wifi_apply_at = 0;
+        wifi_reconnect();
+    }
+
+    // Deferred WiFi reconfigure (see wifi_reconnect): radio back on, then begin.
+    if (g_wifi_reconfig && (int32_t)(now - g_wifi_reconfig_at) >= 0) {
+        g_wifi_reconfig = false;
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(g_ssid, g_pass);
+        DBG("[wifi] begin \"%s\"\n", g_ssid);
+    }
+
     static uint32_t t_disp = 0;
     if (now - t_disp > 1000) {
         t_disp = now;

@@ -1,4 +1,5 @@
 #include "modem.h"
+#include "wificfg.h"
 #include <WiFi.h>
 #include <string.h>
 #include <stdlib.h>
@@ -182,11 +183,72 @@ static void dial(const char *a) {
     }
 }
 
+static void print_wifi_status() {
+    Serial.print("\r\nSSID: "); Serial.print(wifi_ssid());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("\r\nIP: "); Serial.print(WiFi.localIP().toString());
+        Serial.print("\r\nstatus: connected\r\n");
+    } else {
+        Serial.print("\r\nstatus: not connected\r\n");
+    }
+}
+
+// Extended config commands: AT$SSID=/?  AT$PASS=/?  AT$WIFI[?]  AT$HELP
+// `s` is the text after the '$'. The key is matched case-insensitively; the
+// value (after '=') keeps its original case.
+static void handle_dollar(char *s) {
+    char key[16];
+    int k = 0;
+    char *p = s;
+    while (*p && *p != '=' && *p != '?' && k < (int)sizeof(key) - 1)
+        key[k++] = (char)toupper((unsigned char)*p++);
+    key[k] = 0;
+    char op = *p;                                  // '=', '?', or 0
+    char *val = (op == '=') ? p + 1 : (char *)"";
+
+    if (!strcmp(key, "SSID")) {
+        // setting a credential auto-connects (debounced, so SSID+PASS coalesce)
+        if (op == '=') { wifi_set_ssid(val); wifi_apply_soon(); r_ok(); }
+        else { Serial.print("\r\n"); Serial.print(wifi_ssid()); Serial.print("\r\n"); r_ok(); }
+    } else if (!strcmp(key, "PASS")) {
+        if (op == '=') { wifi_set_pass(val); wifi_apply_soon(); r_ok(); }
+        else { Serial.print(wifi_has_pass() ? "\r\n(set)\r\n" : "\r\n(none)\r\n"); r_ok(); }
+    } else if (!strcmp(key, "WIFI")) {
+        if (op == '?') { print_wifi_status(); r_ok(); }
+        else if (op == '=') {
+            // AT$WIFI=ssid,password  — set both atomically and connect now.
+            // No comma => open network (empty password).
+            char *comma = strchr(val, ',');
+            if (comma) {
+                *comma = 0;
+                wifi_set_ssid(val);
+                wifi_set_pass(comma + 1);
+            } else {
+                wifi_set_ssid(val);
+                wifi_set_pass("");
+            }
+            Serial.print("\r\nconnecting...\r\n"); wifi_reconnect(); r_ok();
+        } else {
+            Serial.print("\r\nconnecting...\r\n"); wifi_reconnect(); r_ok();
+        }
+    } else if (!strcmp(key, "HELP")) {
+        Serial.print("\r\nAT$WIFI=<ssid>,<pw>  set both + connect (auto)\r\n"
+                     "AT$SSID=<ssid>       set SSID  (auto-connects)\r\n"
+                     "AT$PASS=<pw>         set pass  (auto-connects)\r\n"
+                     "AT$WIFI              reconnect with stored creds\r\n"
+                     "AT$WIFI?             status   AT$SSID?  AT$PASS?\r\n");
+        r_ok();
+    } else {
+        r_error();
+    }
+}
+
 static void exec(char *line) {
     if (line[0] == 0) { r_ok(); return; }     // bare "AT"
     char c = (char)toupper((unsigned char)line[0]);
     char *rest = line + 1;
     switch (c) {
+        case '$': handle_dollar(rest); return;
         case 'D': dial(rest); return;
         case 'H': modem_leave(); r_ok(); return;
         case 'O': if (client.connected()) { online = true; r_connect(); }

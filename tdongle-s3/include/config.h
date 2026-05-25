@@ -5,6 +5,9 @@
 //
 
 // ---- WiFi (STA) credentials ----
+// Normally set at runtime via the modem's AT$ commands (AT$SSID=, AT$PASS=) and
+// stored in NVS. These compile-time values are only the fallback when NVS is
+// empty; leave them blank so no credentials live in the source tree.
 #ifndef WIFI_SSID
 #define WIFI_SSID ""
 #endif
