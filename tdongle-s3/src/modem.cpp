@@ -208,8 +208,8 @@ static void exec(char *line) {
 }
 
 static void feed_cmd(uint8_t ch) {
-    if (echo) Serial.write(ch);
     if (ch == '\r') {
+        if (echo) Serial.write('\r');
         cmd[cmdlen] = 0;
         if ((cmd[0] == 'A' || cmd[0] == 'a') && (cmd[1] == 'T' || cmd[1] == 't'))
             exec(cmd + 2);
@@ -218,10 +218,14 @@ static void feed_cmd(uint8_t ch) {
         cmdlen = 0;
     } else if (ch == '\n') {
         /* ignore */
-    } else if (ch == 8 || ch == 127) {
-        if (cmdlen > 0) cmdlen--;
+    } else if (ch == 8 || ch == 127) {        // BS or DEL
+        if (cmdlen > 0) {
+            cmdlen--;
+            if (echo) Serial.print("\b \b");  // erase on screen: back, space, back
+        }
     } else if (cmdlen < sizeof(cmd) - 1) {
         cmd[cmdlen++] = ch;
+        if (echo) Serial.write(ch);           // echo only what we actually buffer
     }
 }
 
