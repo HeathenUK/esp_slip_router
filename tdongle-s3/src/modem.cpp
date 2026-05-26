@@ -306,8 +306,17 @@ static void pump_usb_to_tcp() {
             plus_count++; plus_time = now;
         } else {
             flush_plus();
-            if (telnet && ch == TN_IAC) client.write((uint8_t)TN_IAC);  // double IAC
-            client.write(ch);
+            if (telnet && ch == 0x0DU && !bget(local_on, OPT_BINARY)) {
+                /* NVT end-of-line: the DOS keyboard sends Enter as a bare CR,
+                 * but a telnet server submits a line on CR LF. The dongle is
+                 * the telnet client, so do the translation here. Skipped when
+                 * telnet is off (ATNET0) or we're transmitting binary (raw). */
+                client.write((uint8_t)0x0D);
+                client.write((uint8_t)0x0A);
+            } else {
+                if (telnet && ch == TN_IAC) client.write((uint8_t)TN_IAC);  // double IAC
+                client.write(ch);
+            }
             last_tx_ms = now;
         }
     }
