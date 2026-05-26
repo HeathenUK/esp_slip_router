@@ -7,9 +7,10 @@
 
 void display_init();
 
-// SLIP-router personality status.
+// SLIP-router personality status. dl_bps/ul_bps are live throughput in
+// bytes/sec from the DOS host's perspective (download = net->host).
 void display_slip(bool wifi_up, IPAddress sta_ip, bool napt,
-                  uint32_t pkts_from_host, uint32_t pkts_to_host);
+                  uint32_t dl_bps, uint32_t ul_bps);
 
 // WiFi-modem personality status.
 void display_modem(bool wifi_up, IPAddress sta_ip, bool online, const char *peer);

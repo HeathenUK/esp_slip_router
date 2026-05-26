@@ -12,6 +12,9 @@
 #define LCD_MOSI  3
 #define LCD_RST   1
 #define LCD_BL    38   // backlight, ACTIVE LOW (LOW = on)
+// Brightness via LEDC PWM. Active-low, so duty = pin HIGH time and brightness =
+// (255 - duty)/255:  0 = full, 128 = ~half, 192 = ~quarter, 255 = off.
+#define LCD_BL_DUTY 192
 
 static Arduino_DataBus *bus =
     new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, GFX_NOT_DEFINED);
@@ -53,26 +56,32 @@ static void clear_rows() {
 }
 
 void display_init() {
-    pinMode(LCD_BL, OUTPUT);
-    digitalWrite(LCD_BL, LOW);     // backlight on (active low)
+    ledcAttach(LCD_BL, 1000, 8);   // 1 kHz, 8-bit PWM
+    ledcWrite(LCD_BL, LCD_BL_DUTY);
     gfx->begin();
     gfx->fillScreen(C_BLACK);
     clear_rows();
 }
 
+// Compact bytes/sec with a single-letter unit, so both directions fit one row.
+static String rate_short(uint32_t bps) {
+    char b[12];
+    if (bps < 1024)                 snprintf(b, sizeof(b), "%uB", (unsigned)bps);
+    else if (bps < 1024UL * 1024)   snprintf(b, sizeof(b), "%.1fK", bps / 1024.0);
+    else                            snprintf(b, sizeof(b), "%.1fM", bps / (1024.0 * 1024.0));
+    return String(b);
+}
+
 void display_slip(bool wifi_up, IPAddress sta_ip, bool napt,
-                  uint32_t pkts_from_host, uint32_t pkts_to_host) {
-    char buf[40];
+                  uint32_t dl_bps, uint32_t ul_bps) {
     draw_line(0, "SLIP Router", C_CYAN);
+    // WiFi: yellow until both associated and NAT is enabled, then green.
     draw_line(1, String("WiFi: ") + (wifi_up ? "up" : "..."),
-              wifi_up ? C_GREEN : C_YELLOW);
+              (wifi_up && napt) ? C_GREEN : C_YELLOW);
     draw_line(2, wifi_up ? sta_ip.toString() : String("no ip"), C_WHITE);
-    snprintf(buf, sizeof(buf), "SLIP %d.%d.%d.%d",
-             SLIP_LOCAL_A, SLIP_LOCAL_B, SLIP_LOCAL_C, SLIP_LOCAL_D);
-    draw_line(3, buf, napt ? C_WHITE : C_GREY);
-    snprintf(buf, sizeof(buf), "rx%lu tx%lu",
-             (unsigned long)pkts_from_host, (unsigned long)pkts_to_host);
-    draw_line(4, buf, C_GREY);
+    // Down (net->host) and Up (host->net) on one row: "D12.3K U0.8K"
+    draw_line(3, "D" + rate_short(dl_bps) + " U" + rate_short(ul_bps), C_GREEN);
+    draw_line(4, "", C_GREY);   // blank (also clears any stale row from modem mode)
 }
 
 void display_modem(bool wifi_up, IPAddress sta_ip, bool online, const char *peer) {

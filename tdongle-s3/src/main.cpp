@@ -50,6 +50,8 @@ static struct netif slip_nif;
 static bool napt_enabled = false;
 static uint32_t pkts_to_host = 0;
 static uint32_t pkts_from_host = 0;
+static uint32_t bytes_to_host = 0;    // net -> host (the DOS box's "download")
+static uint32_t bytes_from_host = 0;  // host -> net ("upload")
 
 // ---- personality ----
 enum LinkMode { MODE_MODEM = 0, MODE_SLIP = 1 };
@@ -126,6 +128,7 @@ static err_t slip_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ip
     txbuf[n++] = SLIP_END;
     Serial.write(txbuf, n);
     pkts_to_host++;
+    bytes_to_host += p->tot_len;   // count IP payload, not SLIP-encoded size
     return ERR_OK;
 }
 
@@ -161,8 +164,12 @@ static void slip_deliver(const uint8_t *data, size_t len) {
     struct pbuf *p = pbuf_alloc(PBUF_RAW, len, PBUF_POOL);
     if (!p) { DBG("[slip] pbuf alloc fail (%u)\n", (unsigned)len); return; }
     pbuf_take(p, data, len);
-    if (slip_nif.input(p, &slip_nif) != ERR_OK) pbuf_free(p);
-    else pkts_from_host++;
+    if (slip_nif.input(p, &slip_nif) != ERR_OK) {
+        pbuf_free(p);
+    } else {
+        pkts_from_host++;
+        bytes_from_host += len;
+    }
 }
 
 static void slip_poll() {
@@ -292,14 +299,20 @@ void loop() {
         DBG("[wifi] begin \"%s\"\n", g_ssid);
     }
 
-    static uint32_t t_disp = 0;
+    static uint32_t t_disp = 0, last_dl = 0, last_ul = 0, last_rate_ms = 0;
     if (now - t_disp > 1000) {
         t_disp = now;
         bool w = (WiFi.status() == WL_CONNECTED);
-        if (g_mode == MODE_SLIP)
-            display_slip(w, WiFi.localIP(), napt_enabled, pkts_from_host, pkts_to_host);
-        else
+        if (g_mode == MODE_SLIP) {
+            // bytes/sec over the actual elapsed interval since the last sample
+            uint32_t dt = now - last_rate_ms; if (dt == 0) dt = 1;
+            uint32_t dl_bps = (uint32_t)((uint64_t)(bytes_to_host   - last_dl) * 1000 / dt);
+            uint32_t ul_bps = (uint32_t)((uint64_t)(bytes_from_host - last_ul) * 1000 / dt);
+            display_slip(w, WiFi.localIP(), napt_enabled, dl_bps, ul_bps);
+        } else {
             display_modem(w, WiFi.localIP(), modem_is_online(), modem_peer());
+        }
+        last_dl = bytes_to_host; last_ul = bytes_from_host; last_rate_ms = now;
     }
 
     static uint32_t t_log = 0;
