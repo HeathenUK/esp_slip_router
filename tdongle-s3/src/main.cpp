@@ -255,7 +255,10 @@ static void poll_button() {
 void setup() {
     Serial.begin(115200);
     Serial.setRxBufferSize(2048);
-    Serial.setTxTimeoutMs(0);   // never block lwIP/loop if the host isn't reading
+    // NOTE: was Serial.setTxTimeoutMs(0) here — intended to make Serial.write
+    // fire-and-forget, but USBCDC interprets a 0 timeout as "timeout expires
+    // immediately = send nothing", so every write was silently dropped. Default
+    // (250 ms) is fine for the modem path; SLIP throughput is well below it.
 
     Serial0.begin(115200);      // human-readable debug, off the USB data link
     pinMode(BTN_PIN, INPUT);    // GPIO0 has an external pull-up; pressed = LOW
