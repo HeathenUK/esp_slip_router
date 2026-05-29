@@ -274,6 +274,12 @@ void setup() {
     WiFi.onEvent(on_wifi_event);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+    // Maximum TX power for the worst-signal case. The T-Dongle S3 has a stub
+    // PCB antenna and tends to sit far from APs in the wild (Pocket386 USB
+    // port). +19.5 dBm is the chip's documented max for WIFI_PROTOCOL_11G/N
+    // and stays within FCC class B for unintentional radiators -- no reason
+    // to throttle.
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
     g_prefs.begin("slip-router", false);
     wifi_load_and_begin();      // NVS creds (or config.h defaults) -> WiFi.begin

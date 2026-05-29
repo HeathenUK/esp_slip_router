@@ -221,9 +221,15 @@ static void dial(const char *a) {
 }
 
 static void print_wifi_status() {
+    char line[80];
     cdc_print("\r\nSSID: "); cdc_print(wifi_ssid());
     if (WiFi.status() == WL_CONNECTED) {
         cdc_print("\r\nIP: "); cdc_print(WiFi.localIP().toString().c_str());
+        cdc_print("\r\nGW: "); cdc_print(WiFi.gatewayIP().toString().c_str());
+        snprintf(line, sizeof(line), "\r\nRSSI: %d dBm   ch: %d   BSSID: %s",
+                 (int)WiFi.RSSI(), (int)WiFi.channel(),
+                 WiFi.BSSIDstr().c_str());
+        cdc_print(line);
         cdc_print("\r\nstatus: connected\r\n");
     } else {
         cdc_print("\r\nstatus: not connected\r\n");
@@ -418,75 +424,113 @@ static void feed_cmd(uint8_t ch) {
     }
 }
 
-static void flush_plus() {
-    while (plus_count > 0) { client.write('+'); plus_count--; }
-}
-
-// online: host(USB) -> TCP, with +++ escape and telnet IAC-doubling.
+// online: host(USB) -> TCP, with +++ escape + telnet IAC-doubling + CR->CRLF.
+//
+// Reads from Serial in batches and accumulates the post-transform bytes into
+// txbuf, then ONE client.write per batch. With client.setNoDelay(true) every
+// per-byte write was its own TCP segment — over lossy WiFi each one costs the
+// full RTT to ACK, capping throughput at ~RTT^-1 bytes/sec. Batching pulls it
+// back up to USB-CDC line rate and dramatically reduces per-byte overhead in
+// poor-signal conditions where retransmits would otherwise be per-byte too.
 static void pump_usb_to_tcp() {
+    uint8_t inbuf[256];
+    uint8_t txbuf[512];               // worst case: every byte is IAC -> 2x
+    size_t  txlen = 0;
     uint32_t now = millis();
+
     while (Serial.available() && client.connected()) {
-        int ci = Serial.read(); if (ci < 0) break;
-        uint8_t ch = (uint8_t)ci;
-        if (ch == '+' && plus_count < 3 &&
-            (plus_count > 0 || (now - last_tx_ms) > GUARD_MS)) {
-            plus_count++; plus_time = now;
-        } else {
-            flush_plus();
+        int avail = Serial.available();
+        int want  = avail > (int)sizeof(inbuf) ? (int)sizeof(inbuf) : avail;
+        int n = Serial.read(inbuf, want);
+        if (n <= 0) break;
+        for (int i = 0; i < n; ++i) {
+            uint8_t ch = inbuf[i];
+            if (ch == '+' && plus_count < 3 &&
+                (plus_count > 0 || (now - last_tx_ms) > GUARD_MS)) {
+                if (txlen) { client.write(txbuf, txlen); txlen = 0; }
+                plus_count++; plus_time = now;
+                continue;
+            }
+            while (plus_count > 0) { txbuf[txlen++] = '+'; plus_count--; }
             if (telnet && ch == 0x0DU && !bget(local_on, OPT_BINARY)) {
-                /* NVT end-of-line: the DOS keyboard sends Enter as a bare CR,
-                 * but a telnet server submits a line on CR LF. The dongle is
-                 * the telnet client, so do the translation here. Skipped when
-                 * telnet is off (ATNET0) or we're transmitting binary (raw). */
-                client.write((uint8_t)0x0D);
-                client.write((uint8_t)0x0A);
+                txbuf[txlen++] = 0x0D;
+                txbuf[txlen++] = 0x0A;
             } else {
-                if (telnet && ch == TN_IAC) client.write((uint8_t)TN_IAC);  // double IAC
-                client.write(ch);
+                if (telnet && ch == TN_IAC) txbuf[txlen++] = TN_IAC;
+                txbuf[txlen++] = ch;
             }
             last_tx_ms = now;
+            if (txlen >= sizeof(txbuf) - 2) {
+                client.write(txbuf, txlen); txlen = 0;
+            }
         }
     }
+    if (txlen) client.write(txbuf, txlen);
 }
 
-// online: TCP -> host(USB). Gated on USB write room (backpressure to the slow
-// host); telnet negotiation handled inline. Negotiation replies go to the
-// socket, only payload bytes go to USB.
+// online: TCP -> host(USB). Gated on USB write room (host backpressure);
+// telnet negotiation handled inline; only payload bytes reach the USB.
+//
+// Same batching shape as pump_usb_to_tcp: read a chunk from client, run the
+// telnet IAC state machine over it accumulating non-IAC payload, single
+// cdc_write per batch. Previously did cdc_byte per byte, which flushes the
+// TinyUSB TX endpoint per call (~1 bulk-IN packet per byte = ~2 KB/s).
 static void pump_tcp_to_usb() {
-    /* Bypass USBCDC::availableForWrite too — that gates on connected. Talk to
-     * TinyUSB's TX FIFO directly so backpressure works even when the host
-     * hasn't sent SET_CONTROL_LINE_STATE (DOSBox directserial case). */
-    while (client.available() && tud_cdc_n_write_available(0) > 4) {
-        int ci = client.read(); if (ci < 0) break;
-        uint8_t ch = (uint8_t)ci;
-        if (!telnet) { cdc_byte(ch); continue; }
-        switch (tstate) {
-            case T_DATA:
-                if (ch == TN_IAC) tstate = T_IAC; else cdc_byte(ch);
-                break;
-            case T_IAC:
-                if (ch == TN_IAC) { cdc_byte((uint8_t)TN_IAC); tstate = T_DATA; }
-                else if (ch == TN_WILL || ch == TN_WONT || ch == TN_DO || ch == TN_DONT) {
-                    tcmd = ch; tstate = T_OPT;
-                } else if (ch == TN_SB) tstate = T_SB_OPT;
-                else tstate = T_DATA;                  // standalone command
-                break;
-            case T_OPT:
-                handle_neg(tcmd, ch); tstate = T_DATA;
-                break;
-            case T_SB_OPT:
-                sbopt = ch; sblen = 0; tstate = T_SB_DATA;
-                break;
-            case T_SB_DATA:
-                if (ch == TN_IAC) tstate = T_SB_IAC;
-                else if (sblen < sizeof(sbbuf)) sbbuf[sblen++] = ch;
-                break;
-            case T_SB_IAC:
-                if (ch == TN_SE) { handle_sb(); tstate = T_DATA; }
-                else { if (sblen < sizeof(sbbuf)) sbbuf[sblen++] = ch; tstate = T_SB_DATA; }
-                break;
+    uint8_t inbuf[512];
+    uint8_t outbuf[512];
+    size_t  outlen = 0;
+
+    while (client.available() && tud_cdc_n_write_available(0) > 64) {
+        int avail = client.available();
+        int want  = avail > (int)sizeof(inbuf) ? (int)sizeof(inbuf) : avail;
+        int n = client.read(inbuf, want);
+        if (n <= 0) break;
+        for (int i = 0; i < n; ++i) {
+            uint8_t ch = inbuf[i];
+            if (!telnet) {
+                outbuf[outlen++] = ch;
+                if (outlen >= sizeof(outbuf)) { cdc_write(outbuf, outlen); outlen = 0; }
+                continue;
+            }
+            switch (tstate) {
+                case T_DATA:
+                    if (ch == TN_IAC) tstate = T_IAC;
+                    else {
+                        outbuf[outlen++] = ch;
+                        if (outlen >= sizeof(outbuf)) { cdc_write(outbuf, outlen); outlen = 0; }
+                    }
+                    break;
+                case T_IAC:
+                    if (ch == TN_IAC) {
+                        outbuf[outlen++] = TN_IAC;
+                        if (outlen >= sizeof(outbuf)) { cdc_write(outbuf, outlen); outlen = 0; }
+                        tstate = T_DATA;
+                    } else if (ch == TN_WILL || ch == TN_WONT || ch == TN_DO || ch == TN_DONT) {
+                        tcmd = ch; tstate = T_OPT;
+                    } else if (ch == TN_SB) {
+                        tstate = T_SB_OPT;
+                    } else {
+                        tstate = T_DATA;
+                    }
+                    break;
+                case T_OPT:
+                    handle_neg(tcmd, ch); tstate = T_DATA;
+                    break;
+                case T_SB_OPT:
+                    sbopt = ch; sblen = 0; tstate = T_SB_DATA;
+                    break;
+                case T_SB_DATA:
+                    if (ch == TN_IAC) tstate = T_SB_IAC;
+                    else if (sblen < sizeof(sbbuf)) sbbuf[sblen++] = ch;
+                    break;
+                case T_SB_IAC:
+                    if (ch == TN_SE) { handle_sb(); tstate = T_DATA; }
+                    else { if (sblen < sizeof(sbbuf)) sbbuf[sblen++] = ch; tstate = T_SB_DATA; }
+                    break;
+            }
         }
     }
+    if (outlen) cdc_write(outbuf, outlen);
 }
 
 void modem_poll() {
