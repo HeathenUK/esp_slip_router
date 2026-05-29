@@ -293,7 +293,8 @@ static void handle_dollar(char *s) {
         cdc_print("\r\nOTA READY\r\n");
         unsigned long got = 0UL;
         unsigned long last_rx = millis();
-        uint8_t buf[512];
+        unsigned long last_yield = millis();
+        uint8_t buf[2048];                       // bigger chunk -> fewer syscalls
         while (got < (unsigned long)sz) {
             int avail = Serial.available();
             if (avail > 0) {
@@ -309,11 +310,18 @@ static void handle_dollar(char *s) {
                     got += (unsigned long)n;
                     last_rx = millis();
                 }
-            } else if (millis() - last_rx > 8000UL) {
-                esp_ota_abort(h);
-                cdc_print("\r\nOTA TIMEOUT\r\n"); r_error(); return;
+            } else {
+                if (millis() - last_rx > 8000UL) {
+                    esp_ota_abort(h);
+                    cdc_print("\r\nOTA TIMEOUT\r\n"); r_error(); return;
+                }
+                delay(0);   // idle -> yield to TinyUSB / WDT
+                last_yield = millis();
+                continue;
             }
-            delay(0);   // feed wdt, yield
+            // Busy path: only yield every 50ms to keep TinyUSB / WDT happy
+            // without paying a full FreeRTOS context switch per iteration.
+            if (millis() - last_yield > 50UL) { delay(0); last_yield = millis(); }
         }
         if (esp_ota_end(h) != ESP_OK) {
             cdc_print("\r\nOTA END-FAIL (bad image?)\r\n"); r_error(); return;
