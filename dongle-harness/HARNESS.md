@@ -1,12 +1,48 @@
-# T-Dongle S3 AT-mode test harness
+# T-Dongle S3 — test harness + USB-CDC OTA
 
-A headless, scripted way to drive the dongle's Hayes-modem firmware via the
-*actual* `usbterm.exe` running inside DOSBox on macOS. Send a script of AT
-commands, get back the bytes the modem replied with — useful for regression
-testing, reproducing user-reported issues, and demonstrating the modem path
-works without sitting in front of the Pocket386.
+Two related tools in this directory:
 
-## TL;DR
+* **`flash.sh`** — USB-CDC OTA. Stream firmware.bin straight into the
+  inactive OTA partition via `AT$OTASTART`, then the dongle reboots
+  into the new build. No bootloader trip, no esptool, no WiFi, no
+  buttons. ~10s end-to-end for a 1.1 MB image. **This replaces
+  every previous flashing workflow.** See "Flashing" below.
+
+* **`run.sh`** — adversarial / regression test harness. Drives the
+  dongle's Hayes-modem firmware via the *actual* `usbterm.exe`
+  running inside DOSBox on macOS. Send a script of AT commands, get
+  back the bytes the modem replied with. Useful for regression
+  testing, reproducing user-reported issues, and demonstrating the
+  modem path works without sitting in front of the Pocket386.
+
+## Flashing (USB-CDC OTA)
+
+```
+$ ./flash.sh                              # uses ../tdongle-s3/.pio/build/dos/firmware.bin
+$ ./flash.sh path/to/firmware.bin         # custom image
+$ ./flash.sh --boot [factory.bin]         # escape hatch: AT$BOOT → ROM
+                                          # bootloader → esptool (use this if
+                                          # the running firmware can't talk
+                                          # or you need to update the bootloader
+                                          # / partition table itself)
+```
+
+The OTA path uses `AT$OTASTART=<bytes>` to stream the new app image
+through the existing modem CDC link into the inactive OTA partition,
+then `esp_ota_set_boot_partition` + `esp_restart`. Throughput ~110 KB/s,
+1.1 MB image in ~10 s, fully autonomous including post-reboot verify.
+
+**One-time prereq:** if the dongle isn't yet running a firmware
+containing `AT$OTASTART` (i.e. anything before commit `f120652` on
+`tdongle-s3-port`), do one manual download-mode flash first. After
+that, `./flash.sh` handles every subsequent update.
+
+`firmware.bin` (app only, ~1.1 MB) is what OTA writes. `firmware.factory.bin`
+(bootloader + partitions + boot_app0 + app, ~1.16 MB) is what the
+`--boot` escape-hatch writes via esptool. OTA can't replace the
+bootloader from the running app.
+
+## Testing (AT harness via DOSBox + usbterm)
 
 ```
 $ ./run.sh
