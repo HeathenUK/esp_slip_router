@@ -7,22 +7,39 @@
 
 extern "C" {
 #include "esp32-hal-tinyusb.h"   /* tud_cdc_n_write / tud_cdc_n_write_flush */
+#include "esp_ota_ops.h"          /* OTA partition write API (USB-CDC OTA) */
 }
 
 // Debug to the hardware UART only — USB CDC is the data link.
 #define DBG(...) do { Serial0.printf(__VA_ARGS__); } while (0)
 
-/* USBCDC's cdc_byte() returns 0 when the framework's `connected` flag is
+/* USBCDC's Serial.write() returns 0 when the framework's `connected` flag is
  * false — i.e. when the host hasn't sent SET_CONTROL_LINE_STATE with DTR=1.
  * pyserial does that on open; DOSBox's directserial does not. So every modem
  * echo / OK / banner is silently dropped under DOSBox. Talk to TinyUSB CDC
  * itf 0 directly — that path doesn't gate on the connected flag, the host
- * still gets the bytes via the bulk-IN endpoint as soon as it reads. */
+ * still gets the bytes via the bulk-IN endpoint as soon as it reads.
+ *
+ * Loops on partial writes (TinyUSB's TX buffer is ~256B; AT$HELP and a few
+ * other responses exceed that), with a brief yield between attempts so
+ * TinyUSB has time to push a packet. 500ms hard deadline so a dead host
+ * can't hang the modem loop indefinitely. Returns bytes actually accepted. */
 static size_t cdc_write(const void *buf, size_t n)
 {
-    size_t w = tud_cdc_n_write(0, (const uint8_t *)buf, n);
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t total = 0;
+    uint32_t start = millis();
+    while (total < n) {
+        size_t w = tud_cdc_n_write(0, p + total, n - total);
+        total += w;
+        if (total < n) {
+            tud_cdc_n_write_flush(0);
+            if (millis() - start > 500U) break;
+            delay(1);
+        }
+    }
     tud_cdc_n_write_flush(0);
-    return w;
+    return total;
 }
 static inline size_t cdc_print(const char *s) { return cdc_write(s, strlen(s)); }
 static inline void   cdc_byte(uint8_t b)      { (void)cdc_write(&b, 1); }
@@ -35,6 +52,7 @@ static bool telnet   = true;    // ATNETn — telnet protocol on the connection
 
 static char    cmd[128];
 static uint8_t cmdlen = 0;
+static bool    cmd_too_long = false;   /* set when typing past cmd[]; exec() skipped + ERROR */
 static char    peer[80] = "";
 
 // +++ escape (Hayes guard timing): 3 '+' bracketed by ~1s of silence.
@@ -250,12 +268,82 @@ static void handle_dollar(char *s) {
         } else {
             cdc_print("\r\nconnecting...\r\n"); wifi_reconnect(); r_ok();
         }
+    } else if (!strcmp(key, "OTASTART")) {
+        // AT$OTASTART=<size>  — USB-CDC OTA: stream <size> bytes of app image
+        // straight into the inactive OTA partition (app0/app1), then commit
+        // and reboot into the new firmware. No bootloader trip, no esptool,
+        // no WiFi, no buttons; the existing CDC link IS the upload channel.
+        // Protocol:
+        //   host:    AT$OTASTART=<bytes>\r
+        //   dongle:  \r\nOTA READY\r\n
+        //   host:    <bytes> of raw firmware.bin
+        //   dongle:  \r\nOTA OK\r\n     (then esp_restart — new fw boots)
+        //           or  \r\nOTA <code>\r\n  followed by ERROR
+        if (op != '=') { r_error(); return; }
+        long sz = atol(val);
+        if (sz < 16384L || sz > 6L * 1024L * 1024L) {  // 16K..6M sanity
+            cdc_print("\r\nOTA BADSIZE\r\n"); r_error(); return;
+        }
+        const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+        if (!next) { cdc_print("\r\nOTA NOPART\r\n"); r_error(); return; }
+        esp_ota_handle_t h = 0;
+        if (esp_ota_begin(next, (size_t)sz, &h) != ESP_OK) {
+            cdc_print("\r\nOTA BEGIN-FAIL\r\n"); r_error(); return;
+        }
+        cdc_print("\r\nOTA READY\r\n");
+        unsigned long got = 0UL;
+        unsigned long last_rx = millis();
+        uint8_t buf[512];
+        while (got < (unsigned long)sz) {
+            int avail = Serial.available();
+            if (avail > 0) {
+                int want = (avail > (int)sizeof(buf)) ? (int)sizeof(buf) : avail;
+                if ((unsigned long)want > (unsigned long)sz - got)
+                    want = (int)((unsigned long)sz - got);
+                int n = Serial.read(buf, want);
+                if (n > 0) {
+                    if (esp_ota_write(h, buf, (size_t)n) != ESP_OK) {
+                        esp_ota_abort(h);
+                        cdc_print("\r\nOTA WRITE-FAIL\r\n"); r_error(); return;
+                    }
+                    got += (unsigned long)n;
+                    last_rx = millis();
+                }
+            } else if (millis() - last_rx > 8000UL) {
+                esp_ota_abort(h);
+                cdc_print("\r\nOTA TIMEOUT\r\n"); r_error(); return;
+            }
+            delay(0);   // feed wdt, yield
+        }
+        if (esp_ota_end(h) != ESP_OK) {
+            cdc_print("\r\nOTA END-FAIL (bad image?)\r\n"); r_error(); return;
+        }
+        if (esp_ota_set_boot_partition(next) != ESP_OK) {
+            cdc_print("\r\nOTA SETBOOT-FAIL\r\n"); r_error(); return;
+        }
+        cdc_print("\r\nOTA OK\r\n");
+        delay(200);                                  // drain CDC TX
+        esp_restart();
+        /* unreachable */
+    } else if (!strcmp(key, "BOOT")) {
+        // AT$BOOT — escape hatch. Reboots into the ESP32-S3 ROM bootloader so
+        // esptool can reflash via the same USB cable WITHOUT the BOOT-button
+        // download-mode dance. Only needed if AT$OTASTART can't run (e.g.
+        // current firmware is broken / pre-OTA / locked). Bootloader then
+        // enumerates as cu.usbmodem123401; esptool's --after hard_reset flips
+        // back to user firmware on completion.
+        cdc_print("\r\nENTERING BOOTLOADER\r\n");
+        delay(150);                          // let the bytes drain to host
+        usb_persist_restart(RESTART_BOOTLOADER);
+        /* unreachable — esp_restart() above */
     } else if (!strcmp(key, "HELP")) {
         cdc_print("\r\nAT$WIFI=<ssid>,<pw>  set both + connect (auto)\r\n"
                      "AT$SSID=<ssid>       set SSID  (auto-connects)\r\n"
                      "AT$PASS=<pw>         set pass  (auto-connects)\r\n"
                      "AT$WIFI              reconnect with stored creds\r\n"
-                     "AT$WIFI?             status   AT$SSID?  AT$PASS?\r\n");
+                     "AT$WIFI?             status   AT$SSID?  AT$PASS?\r\n"
+                     "AT$OTASTART=<size>   USB-CDC OTA: stream <size> B fw.bin\r\n"
+                     "AT$BOOT              fallback: reboot into ROM bootloader\r\n");
         r_ok();
     } else {
         r_error();
@@ -291,8 +379,14 @@ static void exec(char *line) {
 static void feed_cmd(uint8_t ch) {
     if (ch == '\r') {
         if (echo) cdc_byte('\r');
+        if (cmd_too_long) {
+            r_error();              // line was discarded; report once on CR
+            cmdlen = 0; cmd_too_long = false;
+            return;
+        }
         cmd[cmdlen] = 0;
-        if ((cmd[0] == 'A' || cmd[0] == 'a') && (cmd[1] == 'T' || cmd[1] == 't'))
+        if ((cmd[0] == 'A' || cmd[0] == 'a') && (cmdlen >= 2) &&
+            (cmd[1] == 'T' || cmd[1] == 't'))
             exec(cmd + 2);
         else if (cmdlen != 0)
             r_error();
@@ -300,6 +394,7 @@ static void feed_cmd(uint8_t ch) {
     } else if (ch == '\n') {
         /* ignore */
     } else if (ch == 8 || ch == 127) {        // BS or DEL
+        if (cmd_too_long) return;             // can't recover; wait for CR
         if (cmdlen > 0) {
             cmdlen--;
             if (echo) cdc_print("\b \b");  // erase on screen: back, space, back
@@ -307,6 +402,11 @@ static void feed_cmd(uint8_t ch) {
     } else if (cmdlen < sizeof(cmd) - 1) {
         cmd[cmdlen++] = ch;
         if (echo) cdc_byte(ch);           // echo only what we actually buffer
+    } else {
+        // Buffer full — mark line as discarded so we error on CR rather than
+        // silently exec-ing the truncated prefix. No echo (would lie about what
+        // we accepted).
+        cmd_too_long = true;
     }
 }
 
@@ -383,7 +483,11 @@ static void pump_tcp_to_usb() {
 
 void modem_poll() {
     if (!online) {
-        while (Serial.available()) {
+        // Cap per-poll so a sustained host flood can't starve button polling,
+        // WiFi events, display refresh, etc. 512 chars/iter @ ~1kHz loop()
+        // sustains > 500 kB/s of AT chatter — well above keyboard speed.
+        int budget = 512;
+        while (budget-- > 0 && Serial.available()) {
             int ci = Serial.read(); if (ci < 0) break;
             feed_cmd((uint8_t)ci);
         }
