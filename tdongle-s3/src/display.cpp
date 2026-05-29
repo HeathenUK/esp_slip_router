@@ -85,7 +85,13 @@ void display_slip(bool wifi_up, IPAddress sta_ip, bool napt,
 }
 
 void display_modem(bool wifi_up, IPAddress sta_ip, bool online, const char *peer) {
-    draw_line(0, "WiFi Modem", C_MAGENTA);
+    // `(bool)Serial` returns USBCDC's `connected` flag — i.e. whether the host
+    // has asserted DTR (post-enableReboot(false), just dtr && rts). When this
+    // shows N, the dongle can't echo: Serial.write is gated false at the
+    // framework level. Critical for diagnosing host-side enumeration issues.
+    bool cdc_up = (bool)Serial;
+    draw_line(0, cdc_up ? "WiFi Modem H+" : "WiFi Modem H?",
+              cdc_up ? C_MAGENTA : C_RED);
     draw_line(1, String("WiFi: ") + (wifi_up ? "up" : "..."),
               wifi_up ? C_GREEN : C_YELLOW);
     draw_line(2, wifi_up ? sta_ip.toString() : String("no ip"), C_WHITE);

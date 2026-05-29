@@ -260,6 +260,13 @@ void setup() {
     // immediately = send nothing", so every write was silently dropped. Default
     // (250 ms) is fine for the modem path; SLIP throughput is well below it.
 
+    // T-Dongle S3 has no auto-reset circuit, so the esptool DTR/RTS state
+    // machine inside USBCDC::_onLineState can't do its job here — it can only
+    // get in the way by gating `connected` on a specific 4-step DTR/RTS pattern
+    // that some hosts (DOSBox directserial, USB-Serial-JTAG) don't replicate.
+    // Disable it so connected = (dtr && rts) cleanly, unblocking those hosts.
+    Serial.enableReboot(false);
+
     Serial0.begin(115200);      // human-readable debug, off the USB data link
     pinMode(BTN_PIN, INPUT);    // GPIO0 has an external pull-up; pressed = LOW
     DBG("\n[boot] esp_slip_router (T-Dongle S3)\n");

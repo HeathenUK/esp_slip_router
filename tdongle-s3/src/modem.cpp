@@ -5,8 +5,27 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+extern "C" {
+#include "esp32-hal-tinyusb.h"   /* tud_cdc_n_write / tud_cdc_n_write_flush */
+}
+
 // Debug to the hardware UART only — USB CDC is the data link.
 #define DBG(...) do { Serial0.printf(__VA_ARGS__); } while (0)
+
+/* USBCDC's cdc_byte() returns 0 when the framework's `connected` flag is
+ * false — i.e. when the host hasn't sent SET_CONTROL_LINE_STATE with DTR=1.
+ * pyserial does that on open; DOSBox's directserial does not. So every modem
+ * echo / OK / banner is silently dropped under DOSBox. Talk to TinyUSB CDC
+ * itf 0 directly — that path doesn't gate on the connected flag, the host
+ * still gets the bytes via the bulk-IN endpoint as soon as it reads. */
+static size_t cdc_write(const void *buf, size_t n)
+{
+    size_t w = tud_cdc_n_write(0, (const uint8_t *)buf, n);
+    tud_cdc_n_write_flush(0);
+    return w;
+}
+static inline size_t cdc_print(const char *s) { return cdc_write(s, strlen(s)); }
+static inline void   cdc_byte(uint8_t b)      { (void)cdc_write(&b, 1); }
 
 static WiFiClient client;
 static bool online   = false;   // in data (online) mode with a live socket
@@ -122,17 +141,17 @@ static void handle_sb() {
 }
 
 // ---- result codes ---------------------------------------------------------
-static void r_ok()        { Serial.print(verbose ? "\r\nOK\r\n"         : "0\r\n"); }
-static void r_error()     { Serial.print(verbose ? "\r\nERROR\r\n"      : "4\r\n"); }
-static void r_connect()   { Serial.print(verbose ? "\r\nCONNECT\r\n"    : "1\r\n"); }
-static void r_nocarrier() { Serial.print(verbose ? "\r\nNO CARRIER\r\n" : "3\r\n"); }
+static void r_ok()        { cdc_print(verbose ? "\r\nOK\r\n"         : "0\r\n"); }
+static void r_error()     { cdc_print(verbose ? "\r\nERROR\r\n"      : "4\r\n"); }
+static void r_connect()   { cdc_print(verbose ? "\r\nCONNECT\r\n"    : "1\r\n"); }
+static void r_nocarrier() { cdc_print(verbose ? "\r\nNO CARRIER\r\n" : "3\r\n"); }
 
 void modem_begin() {}
 
 void modem_enter() {
     cmdlen = 0; plus_count = 0; tstate = T_DATA;
     online = client.connected();
-    Serial.print("\r\nWiFi Modem ready\r\n");
+    cdc_print("\r\nWiFi Modem ready\r\n");
     if (!online) r_ok();
 }
 
@@ -184,12 +203,12 @@ static void dial(const char *a) {
 }
 
 static void print_wifi_status() {
-    Serial.print("\r\nSSID: "); Serial.print(wifi_ssid());
+    cdc_print("\r\nSSID: "); cdc_print(wifi_ssid());
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.print("\r\nIP: "); Serial.print(WiFi.localIP().toString());
-        Serial.print("\r\nstatus: connected\r\n");
+        cdc_print("\r\nIP: "); cdc_print(WiFi.localIP().toString().c_str());
+        cdc_print("\r\nstatus: connected\r\n");
     } else {
-        Serial.print("\r\nstatus: not connected\r\n");
+        cdc_print("\r\nstatus: not connected\r\n");
     }
 }
 
@@ -209,10 +228,10 @@ static void handle_dollar(char *s) {
     if (!strcmp(key, "SSID")) {
         // setting a credential auto-connects (debounced, so SSID+PASS coalesce)
         if (op == '=') { wifi_set_ssid(val); wifi_apply_soon(); r_ok(); }
-        else { Serial.print("\r\n"); Serial.print(wifi_ssid()); Serial.print("\r\n"); r_ok(); }
+        else { cdc_print("\r\n"); cdc_print(wifi_ssid()); cdc_print("\r\n"); r_ok(); }
     } else if (!strcmp(key, "PASS")) {
         if (op == '=') { wifi_set_pass(val); wifi_apply_soon(); r_ok(); }
-        else { Serial.print(wifi_has_pass() ? "\r\n(set)\r\n" : "\r\n(none)\r\n"); r_ok(); }
+        else { cdc_print(wifi_has_pass() ? "\r\n(set)\r\n" : "\r\n(none)\r\n"); r_ok(); }
     } else if (!strcmp(key, "WIFI")) {
         if (op == '?') { print_wifi_status(); r_ok(); }
         else if (op == '=') {
@@ -227,12 +246,12 @@ static void handle_dollar(char *s) {
                 wifi_set_ssid(val);
                 wifi_set_pass("");
             }
-            Serial.print("\r\nconnecting...\r\n"); wifi_reconnect(); r_ok();
+            cdc_print("\r\nconnecting...\r\n"); wifi_reconnect(); r_ok();
         } else {
-            Serial.print("\r\nconnecting...\r\n"); wifi_reconnect(); r_ok();
+            cdc_print("\r\nconnecting...\r\n"); wifi_reconnect(); r_ok();
         }
     } else if (!strcmp(key, "HELP")) {
-        Serial.print("\r\nAT$WIFI=<ssid>,<pw>  set both + connect (auto)\r\n"
+        cdc_print("\r\nAT$WIFI=<ssid>,<pw>  set both + connect (auto)\r\n"
                      "AT$SSID=<ssid>       set SSID  (auto-connects)\r\n"
                      "AT$PASS=<pw>         set pass  (auto-connects)\r\n"
                      "AT$WIFI              reconnect with stored creds\r\n"
@@ -258,7 +277,7 @@ static void exec(char *line) {
         case 'V': verbose = !(rest[0] == '0'); r_ok(); return;
         case 'Z': modem_leave(); echo = true; verbose = true; telnet = true;
                   r_ok(); return;
-        case 'I': Serial.print("\r\nFOSSLIP WiFi Modem\r\n"); r_ok(); return;
+        case 'I': cdc_print("\r\nFOSSLIP WiFi Modem\r\n"); r_ok(); return;
         case 'N': {  // ATNETn — telnet protocol on/off
             const char *p = rest;
             while (*p && !isdigit((unsigned char)*p)) p++;
@@ -271,7 +290,7 @@ static void exec(char *line) {
 
 static void feed_cmd(uint8_t ch) {
     if (ch == '\r') {
-        if (echo) Serial.write('\r');
+        if (echo) cdc_byte('\r');
         cmd[cmdlen] = 0;
         if ((cmd[0] == 'A' || cmd[0] == 'a') && (cmd[1] == 'T' || cmd[1] == 't'))
             exec(cmd + 2);
@@ -283,11 +302,11 @@ static void feed_cmd(uint8_t ch) {
     } else if (ch == 8 || ch == 127) {        // BS or DEL
         if (cmdlen > 0) {
             cmdlen--;
-            if (echo) Serial.print("\b \b");  // erase on screen: back, space, back
+            if (echo) cdc_print("\b \b");  // erase on screen: back, space, back
         }
     } else if (cmdlen < sizeof(cmd) - 1) {
         cmd[cmdlen++] = ch;
-        if (echo) Serial.write(ch);           // echo only what we actually buffer
+        if (echo) cdc_byte(ch);           // echo only what we actually buffer
     }
 }
 
@@ -326,16 +345,19 @@ static void pump_usb_to_tcp() {
 // host); telnet negotiation handled inline. Negotiation replies go to the
 // socket, only payload bytes go to USB.
 static void pump_tcp_to_usb() {
-    while (client.available() && Serial.availableForWrite() > 4) {
+    /* Bypass USBCDC::availableForWrite too — that gates on connected. Talk to
+     * TinyUSB's TX FIFO directly so backpressure works even when the host
+     * hasn't sent SET_CONTROL_LINE_STATE (DOSBox directserial case). */
+    while (client.available() && tud_cdc_n_write_available(0) > 4) {
         int ci = client.read(); if (ci < 0) break;
         uint8_t ch = (uint8_t)ci;
-        if (!telnet) { Serial.write(ch); continue; }
+        if (!telnet) { cdc_byte(ch); continue; }
         switch (tstate) {
             case T_DATA:
-                if (ch == TN_IAC) tstate = T_IAC; else Serial.write(ch);
+                if (ch == TN_IAC) tstate = T_IAC; else cdc_byte(ch);
                 break;
             case T_IAC:
-                if (ch == TN_IAC) { Serial.write((uint8_t)TN_IAC); tstate = T_DATA; }
+                if (ch == TN_IAC) { cdc_byte((uint8_t)TN_IAC); tstate = T_DATA; }
                 else if (ch == TN_WILL || ch == TN_WONT || ch == TN_DO || ch == TN_DONT) {
                     tcmd = ch; tstate = T_OPT;
                 } else if (ch == TN_SB) tstate = T_SB_OPT;
