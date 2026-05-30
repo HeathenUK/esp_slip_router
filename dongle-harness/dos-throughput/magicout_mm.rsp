@@ -1,0 +1,5 @@
+option quiet
+format dos
+file magicout.obj
+library crtmm
+name magicout.exe

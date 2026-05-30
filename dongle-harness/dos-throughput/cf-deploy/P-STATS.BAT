@@ -1,0 +1,9 @@
+@ECHO OFF
+REM Read dongle counters via USBTERM -s scripted AT session.
+C:
+CD \TDONGLE
+ECHO Started at %TIME% > P-STATS.LOG
+USBTERM.EXE -s STAT-RD.TXT -l STATS-RX.LOG COM1 9600
+TYPE STATS-RX.LOG >> P-STATS.LOG
+ECHO Ended at %TIME% >> P-STATS.LOG
+TYPE P-STATS.LOG

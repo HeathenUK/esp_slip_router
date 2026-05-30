@@ -63,6 +63,7 @@ cp "$CRTMM" ./crtmm.lib
 build_one throughput.c
 build_one httpget.c
 build_one timer.c
+build_one magicout.c
 
 echo "build: ok"
-ls -l throughput.exe httpget.exe timer.exe
+ls -l throughput.exe httpget.exe timer.exe magicout.exe
