@@ -1,0 +1,5 @@
+option quiet
+format dos
+file throughput.obj
+library crtmm
+name throughput.exe
