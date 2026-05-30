@@ -375,8 +375,8 @@ static const char *INDEX_HTML =
     "<li><a href=/status>/status</a> &mdash; JSON: WiFi, MSC, mount, partition</li>"
     "<li><a href=/list>/list</a> &mdash; files on the FAT partition</li>"
     "<li><code>GET /fs/&lt;path&gt;</code> &mdash; download a file</li>"
-    "<li><code>PUT /fs/&lt;path&gt;</code> &mdash; not available in this raw FAT build</li>"
-    "<li><code>DELETE /fs/&lt;path&gt;</code> &mdash; not available in this raw FAT build</li>"
+    "<li><code>PUT /fs/&lt;path&gt;</code> &mdash; upload root 8.3 file in device-write</li>"
+    "<li><code>DELETE /fs/&lt;path&gt;</code> &mdash; delete root 8.3 file in device-write</li>"
     "<li><code>POST /device-write</code> &mdash; device owns the disk; MSC medium not ready</li>"
     "<li><code>POST /host-write</code> &mdash; USB MSC owns the disk; host may mount/write it</li>"
     "<li><code>POST /format</code> &mdash; start explicit 512-byte-sector FAT format</li>"
@@ -389,7 +389,7 @@ static const char *INDEX_HTML =
     "<li><code>POST /reset</code> &mdash; reboot dongle</li>"
     "</ul>"
     "<p><code>GET /fs</code> and <code>/list</code> read raw FAT blocks in either "
-    "ownership mode. HTTP writes are disabled until the raw FAT writer exists.</p>";
+    "ownership mode. HTTP writes require device-write.</p>";
 
 static esp_err_t h_root(httpd_req_t *req) { return send_text(req, "200 OK", "text/html; charset=utf-8", INDEX_HTML); }
 
@@ -430,12 +430,21 @@ struct raw_fat_info_t {
     uint32_t root_start;
     uint32_t root_bytes;
     uint32_t data_start;
+    uint32_t cluster_count;
     bool     fat12;
 };
 
 static uint32_t le32(const uint8_t *p);
 static esp_err_t raw_read_bytes(uint32_t off, void *buf, size_t len);
 static bool raw_fat_mount_info(raw_fat_info_t *fi, char *why, size_t whysz);
+static bool raw_fat_get_cluster(const raw_fat_info_t *fi, uint16_t cluster, uint16_t *value);
+static esp_err_t raw_fat_set_cluster(const raw_fat_info_t *fi, uint16_t cluster, uint16_t value);
+static esp_err_t raw_fat_free_chain(const raw_fat_info_t *fi, uint16_t first);
+static bool raw_fat_find_dir_entry(const raw_fat_info_t *fi, const char name83[11],
+                                   uint8_t *ent, uint32_t *entry_off);
+static bool raw_fat_find_free_dir_entry(const raw_fat_info_t *fi, uint32_t *entry_off);
+static esp_err_t raw_fat_write_dir_entry(const raw_fat_info_t *fi, uint32_t entry_off,
+                                         const uint8_t ent[32]);
 
 static esp_err_t h_list(httpd_req_t *req) {
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(HTTP_DISK_LOCK_MS)) != pdTRUE)
@@ -652,6 +661,7 @@ static bool raw_fat_mount_info(raw_fat_info_t *fi, char *why, size_t whysz) {
     fi->data_start = (uint32_t)(reserved + fi->fats * fi->sectors_per_fat + root_sectors) * fi->bps;
     uint32_t data_sectors = fi->total_sectors - (reserved + fi->fats * fi->sectors_per_fat + root_sectors);
     uint32_t clusters = data_sectors / fi->spc;
+    fi->cluster_count = clusters;
     fi->fat12 = clusters < 4085;
 
     uint8_t sig[2];
@@ -666,35 +676,140 @@ static bool raw_fat_mount_info(raw_fat_info_t *fi, char *why, size_t whysz) {
     return true;
 }
 
-static bool raw_fat_next_cluster(const raw_fat_info_t *fi, uint16_t cluster, uint16_t *next) {
-    if (cluster < 2) return false;
+static uint32_t raw_fat_cluster_bytes(const raw_fat_info_t *fi) {
+    return (uint32_t)fi->spc * fi->bps;
+}
+
+static uint32_t raw_fat_cluster_offset(const raw_fat_info_t *fi, uint16_t cluster) {
+    return fi->data_start + (uint32_t)(cluster - 2) * raw_fat_cluster_bytes(fi);
+}
+
+static uint16_t raw_fat_eoc(const raw_fat_info_t *fi) {
+    return fi->fat12 ? 0x0FFF : 0xFFFF;
+}
+
+static bool raw_fat_valid_cluster(const raw_fat_info_t *fi, uint16_t cluster) {
+    return cluster >= 2 && (uint32_t)(cluster - 2) < fi->cluster_count;
+}
+
+static bool raw_fat_get_cluster(const raw_fat_info_t *fi, uint16_t cluster, uint16_t *value) {
+    if (!raw_fat_valid_cluster(fi, cluster)) return false;
     if (fi->fat12) {
         uint32_t off = fi->fat_start + cluster + (cluster / 2);
         uint8_t pair[2];
         if (raw_read_bytes(off, pair, sizeof pair) != ESP_OK) return false;
         uint16_t v = (uint16_t)pair[0] | ((uint16_t)pair[1] << 8);
-        *next = (cluster & 1) ? (v >> 4) : (v & 0x0FFF);
+        *value = (cluster & 1) ? (v >> 4) : (v & 0x0FFF);
     } else {
         uint8_t pair[2];
         if (raw_read_bytes(fi->fat_start + (uint32_t)cluster * 2U, pair, sizeof pair) != ESP_OK) return false;
-        *next = le16(pair);
+        *value = le16(pair);
     }
     return true;
 }
 
-static bool raw_fat_find_file(const raw_fat_info_t *fi, const char name83[11], uint16_t *cluster, uint32_t *size) {
-    uint8_t ent[32];
+static esp_err_t raw_fat_set_one(const raw_fat_info_t *fi, uint32_t fat_start, uint16_t cluster, uint16_t value) {
+    if (!raw_fat_valid_cluster(fi, cluster)) return ESP_ERR_INVALID_ARG;
+    if (fi->fat12) {
+        uint32_t off = fat_start + cluster + (cluster / 2);
+        uint8_t pair[2];
+        esp_err_t err = raw_read_bytes(off, pair, sizeof pair);
+        if (err != ESP_OK) return err;
+        uint16_t v = (uint16_t)pair[0] | ((uint16_t)pair[1] << 8);
+        value &= 0x0FFF;
+        if (cluster & 1) v = (uint16_t)((v & 0x000F) | (value << 4));
+        else v = (uint16_t)((v & 0xF000) | value);
+        pair[0] = (uint8_t)v;
+        pair[1] = (uint8_t)(v >> 8);
+        return raw_write_bytes(off, pair, sizeof pair);
+    }
+    uint8_t pair[2];
+    put16(pair, value);
+    return raw_write_bytes(fat_start + (uint32_t)cluster * 2U, pair, sizeof pair);
+}
+
+static esp_err_t raw_fat_set_cluster(const raw_fat_info_t *fi, uint16_t cluster, uint16_t value) {
+    esp_err_t err = ESP_OK;
+    for (uint8_t f = 0; f < fi->fats; ++f) {
+        uint32_t fat_start = fi->fat_start + (uint32_t)f * fi->sectors_per_fat * fi->bps;
+        err = raw_fat_set_one(fi, fat_start, cluster, value);
+        if (err != ESP_OK) return err;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t raw_fat_free_chain(const raw_fat_info_t *fi, uint16_t first) {
+    uint16_t cluster = first;
+    uint32_t guard = 0;
+    while (raw_fat_valid_cluster(fi, cluster) && guard++ < fi->cluster_count) {
+        uint16_t next = 0;
+        if (!raw_fat_get_cluster(fi, cluster, &next)) return ESP_FAIL;
+        esp_err_t err = raw_fat_set_cluster(fi, cluster, 0);
+        if (err != ESP_OK) return err;
+        if (fi->fat12 ? (next >= 0x0FF8) : (next >= 0xFFF8)) break;
+        cluster = next;
+    }
+    return ESP_OK;
+}
+
+static bool raw_fat_next_cluster(const raw_fat_info_t *fi, uint16_t cluster, uint16_t *next) {
+    if (cluster < 2) return false;
+    return raw_fat_get_cluster(fi, cluster, next);
+}
+
+static bool raw_fat_find_dir_entry(const raw_fat_info_t *fi, const char name83[11],
+                                   uint8_t *ent, uint32_t *entry_off) {
+    uint8_t tmp[32];
     for (uint32_t off = 0; off < fi->root_bytes; off += 32) {
-        if (raw_read_bytes(fi->root_start + off, ent, sizeof ent) != ESP_OK) return false;
-        if (ent[0] == 0x00) break;
-        if (ent[0] == 0xE5) continue;
-        uint8_t attr = ent[11];
-        if (attr == 0x0F || (attr & 0x18)) continue; // LFN, volume label, dirs
-        if (!memcmp(ent, name83, 11)) {
-            *cluster = le16(ent + 26);
-            *size = le32(ent + 28);
+        if (raw_read_bytes(fi->root_start + off, tmp, sizeof tmp) != ESP_OK) return false;
+        if (tmp[0] == 0x00) break;
+        if (tmp[0] == 0xE5) continue;
+        uint8_t attr = tmp[11];
+        if (attr == 0x0F || (attr & 0x18)) continue;
+        if (!memcmp(tmp, name83, 11)) {
+            if (ent) memcpy(ent, tmp, sizeof tmp);
+            if (entry_off) *entry_off = fi->root_start + off;
             return true;
         }
+    }
+    return false;
+}
+
+static bool raw_fat_find_free_dir_entry(const raw_fat_info_t *fi, uint32_t *entry_off) {
+    uint8_t ent[32];
+    uint32_t deleted_off = 0;
+    bool have_deleted = false;
+    for (uint32_t off = 0; off < fi->root_bytes; off += 32) {
+        if (raw_read_bytes(fi->root_start + off, ent, sizeof ent) != ESP_OK) return false;
+        if (ent[0] == 0xE5 && !have_deleted) {
+            deleted_off = fi->root_start + off;
+            have_deleted = true;
+        }
+        if (ent[0] == 0x00) {
+            *entry_off = have_deleted ? deleted_off : fi->root_start + off;
+            return true;
+        }
+    }
+    if (have_deleted) {
+        *entry_off = deleted_off;
+        return true;
+    }
+    return false;
+}
+
+static esp_err_t raw_fat_write_dir_entry(const raw_fat_info_t *fi, uint32_t entry_off,
+                                         const uint8_t ent[32]) {
+    if (entry_off < fi->root_start || entry_off + 32 > fi->root_start + fi->root_bytes)
+        return ESP_ERR_INVALID_ARG;
+    return raw_write_bytes(entry_off, ent, 32);
+}
+
+static bool raw_fat_find_file(const raw_fat_info_t *fi, const char name83[11], uint16_t *cluster, uint32_t *size) {
+    uint8_t ent[32];
+    if (raw_fat_find_dir_entry(fi, name83, ent, nullptr)) {
+        *cluster = le16(ent + 26);
+        *size = le32(ent + 28);
+        return true;
     }
     return false;
 }
@@ -770,19 +885,191 @@ static esp_err_t h_fs_get(httpd_req_t *req) {
     return raw_err;
 }
 
+static bool raw_fat_find_free_clusters(const raw_fat_info_t *fi, uint16_t *clusters, uint32_t need) {
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < fi->cluster_count && found < need; ++i) {
+        uint16_t cluster = (uint16_t)(i + 2);
+        uint16_t value = 0;
+        if (!raw_fat_get_cluster(fi, cluster, &value)) return false;
+        if (value == 0) clusters[found++] = cluster;
+    }
+    return found == need;
+}
+
+static esp_err_t raw_fat_write_file_data(httpd_req_t *req, const raw_fat_info_t *fi,
+                                         const uint16_t *clusters, uint32_t nclusters,
+                                         uint32_t total) {
+    uint8_t *buf = (uint8_t *)malloc(1024);
+    if (!buf) return ESP_ERR_NO_MEM;
+    uint32_t cluster_bytes = raw_fat_cluster_bytes(fi);
+    uint32_t got = 0;
+    esp_err_t err = ESP_OK;
+
+    for (uint32_t ci = 0; ci < nclusters && err == ESP_OK; ++ci) {
+        uint32_t base = raw_fat_cluster_offset(fi, clusters[ci]);
+        uint32_t in_cluster = 0;
+        while (in_cluster < cluster_bytes && got < total) {
+            int want = (int)(cluster_bytes - in_cluster);
+            if (want > 1024) want = 1024;
+            if ((uint32_t)want > total - got) want = (int)(total - got);
+            int r = httpd_req_recv(req, (char *)buf, want);
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            if (r <= 0) {
+                err = ESP_FAIL;
+                break;
+            }
+            err = raw_write_bytes(base + in_cluster, buf, (size_t)r);
+            if (err != ESP_OK) break;
+            in_cluster += (uint32_t)r;
+            got += (uint32_t)r;
+        }
+        if (err == ESP_OK && in_cluster < cluster_bytes) {
+            err = raw_zero_bytes(base + in_cluster, cluster_bytes - in_cluster);
+        }
+    }
+    free(buf);
+    if (err != ESP_OK) return err;
+    return got == total ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t raw_fat_link_clusters(const raw_fat_info_t *fi, const uint16_t *clusters, uint32_t nclusters) {
+    for (uint32_t i = 0; i < nclusters; ++i) {
+        uint16_t next = (i + 1 < nclusters) ? clusters[i + 1] : raw_fat_eoc(fi);
+        esp_err_t err = raw_fat_set_cluster(fi, clusters[i], next);
+        if (err != ESP_OK) return err;
+    }
+    return ESP_OK;
+}
+
+static void raw_fat_make_file_entry(uint8_t ent[32], const char name83[11], uint16_t first_cluster, uint32_t size) {
+    memset(ent, 0, 32);
+    memcpy(ent, name83, 11);
+    ent[11] = 0x20;          // archive
+    put16(ent + 14, 0);      // create time
+    put16(ent + 16, 0x0021); // create date: 1980-01-01
+    put16(ent + 18, 0x0021); // access date
+    put16(ent + 22, 0);      // write time
+    put16(ent + 24, 0x0021); // write date
+    put16(ent + 26, first_cluster);
+    put32(ent + 28, size);
+}
+
 static esp_err_t h_fs_put(httpd_req_t *req) {
     char name83[11];
     if (!uri_to_83_name(req->uri, name83))
         return send_text(req, "400 Bad Request", "text/plain", "bad path\n");
+    if (!s_dongle_owns)
+        return send_text(req, "409 Conflict", "text/plain", "PUT requires device-write\n");
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(OWNER_LOCK_MS)) != pdTRUE)
+        return send_text(req, "503 Service Unavailable", "text/plain", "lock failed\n");
+    if (!s_dongle_owns) {
+        xSemaphoreGive(s_lock);
+        return send_text(req, "409 Conflict", "text/plain", "PUT requires device-write\n");
+    }
 
-    return send_text(req, "409 Conflict", "text/plain", "raw DOS FAT write not implemented in this firmware\n");
+    esp_err_t err = ESP_OK;
+    raw_fat_info_t fi;
+    char why[96];
+    if (!raw_fat_mount_info(&fi, why, sizeof why)) {
+        xSemaphoreGive(s_lock);
+        char rsp[128];
+        snprintf(rsp, sizeof rsp, "raw FAT parse failed: %s\n", why);
+        return send_text(req, "500 Internal Server Error", "text/plain", rsp);
+    }
+
+    uint8_t old_ent[32];
+    uint32_t entry_off = 0;
+    uint16_t old_first = 0;
+    bool replacing = raw_fat_find_dir_entry(&fi, name83, old_ent, &entry_off);
+    if (replacing) {
+        old_first = le16(old_ent + 26);
+    } else if (!raw_fat_find_free_dir_entry(&fi, &entry_off)) {
+        xSemaphoreGive(s_lock);
+        return send_text(req, "507 Insufficient Storage", "text/plain", "root directory full\n");
+    }
+
+    uint32_t size = (uint32_t)req->content_len;
+    uint32_t cluster_bytes = raw_fat_cluster_bytes(&fi);
+    uint32_t nclusters = size ? ((size + cluster_bytes - 1U) / cluster_bytes) : 0;
+    uint16_t *clusters = nullptr;
+    if (nclusters) {
+        clusters = (uint16_t *)malloc(nclusters * sizeof(uint16_t));
+        if (!clusters) {
+            xSemaphoreGive(s_lock);
+            return send_text(req, "500 Internal Server Error", "text/plain", "oom\n");
+        }
+        if (!raw_fat_find_free_clusters(&fi, clusters, nclusters)) {
+            free(clusters);
+            xSemaphoreGive(s_lock);
+            return send_text(req, "507 Insufficient Storage", "text/plain", "not enough free clusters\n");
+        }
+        err = raw_fat_write_file_data(req, &fi, clusters, nclusters, size);
+        if (err == ESP_OK) err = raw_fat_link_clusters(&fi, clusters, nclusters);
+    }
+
+    if (err == ESP_OK) {
+        uint8_t ent[32];
+        raw_fat_make_file_entry(ent, name83, nclusters ? clusters[0] : 0, size);
+        err = raw_fat_write_dir_entry(&fi, entry_off, ent);
+    }
+    if (err == ESP_OK && replacing && raw_fat_valid_cluster(&fi, old_first)) {
+        err = raw_fat_free_chain(&fi, old_first);
+    }
+
+    if (err != ESP_OK && clusters) {
+        for (uint32_t i = 0; i < nclusters; ++i) {
+            raw_fat_set_cluster(&fi, clusters[i], 0);
+        }
+    }
+    free(clusters);
+    xSemaphoreGive(s_lock);
+
+    if (err != ESP_OK)
+        return send_text(req, "500 Internal Server Error", "text/plain", "PUT failed\n");
+    char rsp[64];
+    snprintf(rsp, sizeof rsp, "wrote %lu bytes\n", (unsigned long)size);
+    return send_text(req, "200 OK", "text/plain", rsp);
 }
 
 static esp_err_t h_fs_delete(httpd_req_t *req) {
     char name83[11];
     if (!uri_to_83_name(req->uri, name83))
         return send_text(req, "400 Bad Request", "text/plain", "bad path\n");
-    return send_text(req, "409 Conflict", "text/plain", "raw DOS FAT delete not implemented in this firmware\n");
+    if (!s_dongle_owns)
+        return send_text(req, "409 Conflict", "text/plain", "DELETE requires device-write\n");
+
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(OWNER_LOCK_MS)) != pdTRUE)
+        return send_text(req, "503 Service Unavailable", "text/plain", "lock failed\n");
+    if (!s_dongle_owns) {
+        xSemaphoreGive(s_lock);
+        return send_text(req, "409 Conflict", "text/plain", "DELETE requires device-write\n");
+    }
+
+    raw_fat_info_t fi;
+    char why[96];
+    if (!raw_fat_mount_info(&fi, why, sizeof why)) {
+        xSemaphoreGive(s_lock);
+        char rsp[128];
+        snprintf(rsp, sizeof rsp, "raw FAT parse failed: %s\n", why);
+        return send_text(req, "500 Internal Server Error", "text/plain", rsp);
+    }
+
+    uint8_t ent[32];
+    uint32_t entry_off = 0;
+    if (!raw_fat_find_dir_entry(&fi, name83, ent, &entry_off)) {
+        xSemaphoreGive(s_lock);
+        return send_text(req, "404 Not Found", "text/plain", "no such file\n");
+    }
+    uint16_t first = le16(ent + 26);
+    ent[0] = 0xE5;
+    esp_err_t err = raw_fat_write_dir_entry(&fi, entry_off, ent);
+    if (err == ESP_OK && raw_fat_valid_cluster(&fi, first)) {
+        err = raw_fat_free_chain(&fi, first);
+    }
+    xSemaphoreGive(s_lock);
+    if (err != ESP_OK)
+        return send_text(req, "500 Internal Server Error", "text/plain", "DELETE failed\n");
+    return send_text(req, "200 OK", "text/plain", "deleted\n");
 }
 
 static esp_err_t h_owner_device(httpd_req_t *req) {
