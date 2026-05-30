@@ -65,7 +65,23 @@ WiFi.
 
 ## The four planes
 
-### 1. OTA (USB CDC)
+### 1. OTA
+
+HTTP OTA is the preferred path when the dongle is plugged into a DOS
+machine rather than the Mac:
+
+```sh
+pio run -e dos
+curl -X POST --data-binary @../tdongle-s3/.pio/build/dos/firmware.bin \
+  http://dosongle.local/ota
+```
+
+The endpoint accepts the raw app `firmware.bin` with `Content-Length`,
+writes the inactive OTA slot, sets it as boot, replies `OTA OK`, then
+reboots. It does not accept `firmware.factory.bin`; OTA cannot replace
+the bootloader or partition table.
+
+USB CDC OTA remains available when the dongle is attached locally:
 
 ```sh
 ./flash.sh                              # ../tdongle-s3/.pio/build/dos/firmware.bin
@@ -195,6 +211,8 @@ POST /host-write        USB MSC owns the block device; host may mount/write it
 POST /format            starts explicit FAT format; poll /status
 POST /eject             alias for /device-write
 POST /present           alias for /host-write
+GET  /type-log          recent parsed HID typing events
+POST /ota               HTTP OTA upload of firmware.bin; reboots on success
 POST /reset             esp_restart
 ```
 

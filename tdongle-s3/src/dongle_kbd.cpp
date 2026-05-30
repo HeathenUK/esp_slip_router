@@ -9,11 +9,37 @@
 #include <USBHIDKeyboard.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdarg.h>
 
 #define DBG(...) do { Serial0.printf(__VA_ARGS__); } while (0)
 
 static USBHIDKeyboard s_kbd;
 static bool s_kbd_ready = false;
+
+#define KBD_LOG_LINES 48
+#define KBD_LOG_LINE_LEN 96
+
+static portMUX_TYPE s_log_mux = portMUX_INITIALIZER_UNLOCKED;
+static char s_log[KBD_LOG_LINES][KBD_LOG_LINE_LEN];
+static uint32_t s_log_seq = 0;
+
+static void kbd_logf(const char *fmt, ...) {
+    char line[KBD_LOG_LINE_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+
+    portENTER_CRITICAL(&s_log_mux);
+    uint32_t seq = ++s_log_seq;
+    snprintf(s_log[seq % KBD_LOG_LINES], KBD_LOG_LINE_LEN, "%lu %s",
+             (unsigned long)seq, line);
+    portEXIT_CRITICAL(&s_log_mux);
+}
+
+static char printable_char(uint8_t c) {
+    return (c >= 32 && c < 127) ? (char)c : '.';
+}
 
 void dongle_kbd_init(void) {
     s_kbd.begin();
@@ -21,6 +47,7 @@ void dongle_kbd_init(void) {
     // attaches to the same composite. arduino-esp32 manages descriptors.
     USB.begin();
     s_kbd_ready = true;
+    kbd_logf("init ready");
     DBG("[kbd] HID keyboard up\n");
 }
 
@@ -70,6 +97,7 @@ static bool keyname_lookup(const char *name, size_t namelen, uint8_t *out) {
 // Emit one keystroke. `key` is either an ASCII byte (write() through the
 // layout map) or a USBHIDKeyboard KEY_* macro (press/release).
 static void emit_key(uint8_t key) {
+    kbd_logf("emit key=0x%02x '%c'", key, printable_char(key));
     if (key < 0x80) {
         s_kbd.write(key);
     } else {
@@ -81,6 +109,7 @@ static void emit_key(uint8_t key) {
 // Emit one keystroke with a modifier held down. `mod` is one of
 // KEY_LEFT_CTRL/SHIFT/ALT.
 static void emit_combo(uint8_t mod, uint8_t key) {
+    kbd_logf("emit combo mod=0x%02x key=0x%02x '%c'", mod, key, printable_char(key));
     s_kbd.press(mod);
     if (key < 0x80) {
         // Lowercase the ASCII so Ctrl+x doesn't get a shift implicitly;
@@ -102,17 +131,23 @@ static void emit_combo(uint8_t mod, uint8_t key) {
 }
 
 int dongle_kbd_type(const char *s, int len) {
-    if (!s_kbd_ready) return -1;
+    if (!s_kbd_ready) {
+        kbd_logf("type rejected not-ready len=%d", len);
+        return -1;
+    }
+    kbd_logf("type begin len=%d", len);
     int i = 0;
     while (i < len) {
         char c = s[i];
         if (c == '<' && i + 1 < len && s[i + 1] == '<') {
             // "<<" -> literal '<'
+            kbd_logf("literal escaped '<' at=%d", i);
             s_kbd.write('<');
             i += 2;
             continue;
         }
         if (c != '<') {
+            kbd_logf("literal at=%d ch=0x%02x '%c'", i, (uint8_t)c, printable_char((uint8_t)c));
             s_kbd.write((uint8_t)c);
             i++;
             continue;
@@ -120,15 +155,20 @@ int dongle_kbd_type(const char *s, int len) {
         // <TOKEN>
         int end = i + 1;
         while (end < len && s[end] != '>') end++;
-        if (end >= len) return -1;       // unterminated <...>
+        if (end >= len) {
+            kbd_logf("parse error unterminated token at=%d", i);
+            return -1;
+        }
         const char *body = s + i + 1;
         size_t bodylen = end - (i + 1);
+        kbd_logf("token at=%d '%.*s'", i, (int)bodylen, body);
 
         // <DELAY=ms>
         if (bodylen > 6 && strncasecmp(body, "DELAY=", 6) == 0) {
             int ms = atoi(body + 6);
             if (ms < 1) ms = 1;
             if (ms > 5000) ms = 5000;
+            kbd_logf("delay ms=%d", ms);
             delay(ms);
             i = end + 1;
             continue;
@@ -146,14 +186,43 @@ int dongle_kbd_type(const char *s, int len) {
             const char *kname = plus + 1;
             size_t klen = (body + bodylen) - kname;
             uint8_t key;
-            if (!keyname_lookup(kname, klen, &key)) return -1;
+            if (!keyname_lookup(kname, klen, &key)) {
+                kbd_logf("parse error unknown combo key '%.*s'", (int)klen, kname);
+                return -1;
+            }
             emit_combo(mod, key);
         } else {
             uint8_t key;
-            if (!keyname_lookup(body, bodylen, &key)) return -1;
+            if (!keyname_lookup(body, bodylen, &key)) {
+                kbd_logf("parse error unknown token '%.*s'", (int)bodylen, body);
+                return -1;
+            }
             emit_key(key);
         }
         i = end + 1;
     }
+    kbd_logf("type end len=%d", len);
     return len;
+}
+
+int dongle_kbd_log_dump(char *out, int outsz) {
+    if (!out || outsz <= 0) return 0;
+
+    portENTER_CRITICAL(&s_log_mux);
+    uint32_t seq = s_log_seq;
+    uint32_t first = (seq > KBD_LOG_LINES) ? (seq - KBD_LOG_LINES + 1) : 1;
+    int n = 0;
+    for (uint32_t cur = first; cur <= seq && n < outsz - 1; ++cur) {
+        const char *line = s_log[cur % KBD_LOG_LINES];
+        int wrote = snprintf(out + n, outsz - n, "%s\n", line);
+        if (wrote < 0) break;
+        if (wrote >= outsz - n) {
+            n = outsz - 1;
+            break;
+        }
+        n += wrote;
+    }
+    portEXIT_CRITICAL(&s_log_mux);
+    out[n] = 0;
+    return n;
 }

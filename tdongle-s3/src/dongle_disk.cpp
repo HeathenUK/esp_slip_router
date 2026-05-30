@@ -21,6 +21,7 @@
 #include "wear_levelling.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 
 extern "C" {
 #include "class/msc/msc.h"
@@ -60,6 +61,8 @@ static httpd_handle_t  s_httpd = nullptr;
 static volatile bool   s_mdns_up = false;
 static volatile bool   s_format_running = false;
 static volatile bool   s_format_ok = false;
+static volatile bool   s_ota_running = false;
+static volatile bool   s_ota_ok = false;
 
 static void put16(uint8_t *p, uint16_t v);
 static void put32(uint8_t *p, uint32_t v);
@@ -381,6 +384,8 @@ static const char *INDEX_HTML =
     "<li><code>POST /type</code> &mdash; HID keyboard input (body is text, "
     "tokens like <code>&lt;ENTER&gt;</code>, <code>&lt;F1&gt;</code>, "
     "<code>&lt;CTRL+C&gt;</code>, <code>&lt;DELAY=200&gt;</code>)</li>"
+    "<li><a href=/type-log>/type-log</a> &mdash; recent parsed keyboard events</li>"
+    "<li><code>POST /ota</code> &mdash; HTTP OTA upload of firmware.bin</li>"
     "<li><code>POST /reset</code> &mdash; reboot dongle</li>"
     "</ul>"
     "<p><code>GET /fs</code> and <code>/list</code> read raw FAT blocks in either "
@@ -396,6 +401,7 @@ static esp_err_t h_status(httpd_req_t *req) {
         "\"mode\":\"%s\","
         "\"msc\":{\"present\":%s,\"writable\":%s,\"block_size\":%u,\"block_count\":%u},"
         "\"format\":{\"running\":%s,\"last_ok\":%s},"
+        "\"ota\":{\"running\":%s,\"last_ok\":%s},"
         "\"fs\":{\"mounted\":false,\"info_valid\":false,\"total\":0,\"free\":0}}",
         MDNS_HOSTNAME,
         WiFi.status() == WL_CONNECTED ? "true" : "false",
@@ -406,7 +412,9 @@ static esp_err_t h_status(httpd_req_t *req) {
         s_msc_writable ? "true" : "false",
         (unsigned)s_block_size, (unsigned)s_block_count,
         s_format_running ? "true" : "false",
-        s_format_ok ? "true" : "false");
+        s_format_ok ? "true" : "false",
+        s_ota_running ? "true" : "false",
+        s_ota_ok ? "true" : "false");
     if (n < 0) n = 0;
     return send_text(req, "200 OK", "application/json", buf);
 }
@@ -841,6 +849,98 @@ static esp_err_t h_type(httpd_req_t *req) {
     return send_text(req, "200 OK", "text/plain", rsp);
 }
 
+static esp_err_t h_type_log(httpd_req_t *req) {
+    char *buf = (char *)malloc(6144);
+    if (!buf) return send_text(req, "500 Internal Server Error", "text/plain", "oom\n");
+    int n = dongle_kbd_log_dump(buf, 6144);
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    esp_err_t err = httpd_resp_send(req, buf, n);
+    free(buf);
+    return err;
+}
+
+static esp_err_t h_ota(httpd_req_t *req) {
+    int total = req->content_len;
+    if (total <= 0)
+        return send_text(req, "411 Length Required", "text/plain", "need Content-Length firmware.bin body\n");
+
+    portENTER_CRITICAL(&s_io_mux);
+    bool busy = s_ota_running;
+    if (!busy) {
+        s_ota_running = true;
+        s_ota_ok = false;
+    }
+    portEXIT_CRITICAL(&s_io_mux);
+    if (busy)
+        return send_text(req, "409 Conflict", "text/plain", "OTA already running\n");
+
+    const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+    if (!next) {
+        s_ota_running = false;
+        return send_text(req, "500 Internal Server Error", "text/plain", "no OTA partition\n");
+    }
+    if ((size_t)total > next->size) {
+        s_ota_running = false;
+        return send_text(req, "413 Payload Too Large", "text/plain", "firmware too large for OTA slot\n");
+    }
+
+    esp_ota_handle_t h = 0;
+    esp_err_t err = esp_ota_begin(next, (size_t)total, &h);
+    if (err != ESP_OK) {
+        s_ota_running = false;
+        return send_text(req, "500 Internal Server Error", "text/plain", "OTA begin failed\n");
+    }
+
+    uint8_t *buf = (uint8_t *)malloc(2048);
+    if (!buf) {
+        esp_ota_abort(h);
+        s_ota_running = false;
+        return send_text(req, "500 Internal Server Error", "text/plain", "oom\n");
+    }
+
+    int got = 0;
+    bool ok = true;
+    while (got < total) {
+        int want = total - got;
+        if (want > 2048) want = 2048;
+        int r = httpd_req_recv(req, (char *)buf, want);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0) {
+            ok = false;
+            break;
+        }
+        if (esp_ota_write(h, buf, (size_t)r) != ESP_OK) {
+            ok = false;
+            break;
+        }
+        got += r;
+    }
+    free(buf);
+
+    if (!ok || got != total) {
+        esp_ota_abort(h);
+        s_ota_running = false;
+        return send_text(req, "500 Internal Server Error", "text/plain", "OTA receive/write failed\n");
+    }
+    if (esp_ota_end(h) != ESP_OK) {
+        s_ota_running = false;
+        return send_text(req, "400 Bad Request", "text/plain", "OTA end failed; bad image?\n");
+    }
+    if (esp_ota_set_boot_partition(next) != ESP_OK) {
+        s_ota_running = false;
+        return send_text(req, "500 Internal Server Error", "text/plain", "OTA set boot failed\n");
+    }
+
+    s_ota_ok = true;
+    s_ota_running = false;
+    send_text(req, "200 OK", "text/plain", "OTA OK; rebooting\n");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
+    return ESP_OK;
+}
+
 static esp_err_t h_reset(httpd_req_t *req) {
     send_text(req, "200 OK", "text/plain", "rebooting\n");
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -853,7 +953,7 @@ static void httpd_start_once(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 18;
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 2;
     cfg.send_wait_timeout = 2;
@@ -877,6 +977,8 @@ static void httpd_start_once(void) {
         { "/eject",     HTTP_POST,   h_owner_device, nullptr },
         { "/present",   HTTP_POST,   h_owner_usb,    nullptr },
         { "/type",      HTTP_POST,   h_type,      nullptr },
+        { "/type-log",  HTTP_GET,    h_type_log,  nullptr },
+        { "/ota",       HTTP_POST,   h_ota,       nullptr },
         { "/reset",     HTTP_POST,   h_reset,     nullptr },
     };
     for (auto &r : routes) httpd_register_uri_handler(s_httpd, &r);

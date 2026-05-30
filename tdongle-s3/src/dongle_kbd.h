@@ -31,6 +31,10 @@ void dongle_kbd_init(void);
 // a negative value on parse error.
 int dongle_kbd_type(const char *s, int len);
 
+// Copy the recent in-memory typing debug log into `out` as plain text.
+// Returns the number of bytes written, excluding the terminating NUL.
+int dongle_kbd_log_dump(char *out, int outsz);
+
 #ifdef __cplusplus
 }
 #endif
