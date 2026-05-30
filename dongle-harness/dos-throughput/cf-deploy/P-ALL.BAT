@@ -57,6 +57,7 @@ ATQ.EXE AT$STATS > P-MTCP-L-S.LOG
 
 ECHO === phase 4: T-MTCP via INTERNET =================================
 ECHO Started %TIME%
+MAGICOUT.EXE COM1
 ATQ.EXE AT$STATS=0
 ATQ.EXE AT$MODE=SLIP
 ECHO Started %TIME% > P-MTCP-N.LOG

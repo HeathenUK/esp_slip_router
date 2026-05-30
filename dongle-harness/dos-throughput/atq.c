@@ -138,18 +138,23 @@ int main(int argc, char **argv)
      * sit in the AT input buffer until the next CR commits the line, so an
      * ATQ command right after a MAGICOUT would prepend that garbage to our
      * command and parse as one invalid line. A bare CR triggers an ERROR
-     * (or OK) reply that we then drain along with the RX. */
+     * (or OK) reply that we then drain (silently -- not printed) so it
+     * doesn't contaminate the real command's reply output. */
     send_byte((unsigned)port, '\r');
     {
         unsigned long t = bios_ticks();
         unsigned long lastByte = t;
+        int got_any = 0;
         for (;;) {
             c = recv_byte_nowait((unsigned)port);
-            if (c >= 0) lastByte = bios_ticks();
-            else        dos_yield();
-            /* ~200 ms of silence after last drained byte, or 1 s cap */
-            if ((bios_ticks() - lastByte) > 3UL) break;
-            if ((bios_ticks() - t) > 18UL) break;
+            if (c >= 0) { got_any = 1; lastByte = bios_ticks(); }
+            else          dos_yield();
+            /* Wait for the bare-CR's OK/ERROR to drain. 500 ms of silence
+             * after the LAST drained byte is enough on a healthy dongle.
+             * 2 s overall cap so we don't wedge if dongle is broken. */
+            if (got_any && (bios_ticks() - lastByte) > 9UL) break;
+            if (!got_any && (bios_ticks() - t) > 18UL) break;
+            if ((bios_ticks() - t) > 36UL) break;
         }
     }
 

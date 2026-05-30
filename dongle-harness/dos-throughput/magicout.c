@@ -42,6 +42,12 @@ static int autodetect_com(void)
     return -1;
 }
 
+/* BIOS tick counter at BDA 0040:006C, 18.2065 Hz. */
+static unsigned long bios_ticks(void)
+{
+    return *(unsigned long __far *)MK_FP(0x0040U, 0x006CU);
+}
+
 /* Send one byte via FOSSIL AH=01 (blocking). FOSSIL AH=01 returns AH bit 7
  * set on failure -- retry. */
 static void send_byte(unsigned port, unsigned char ch)
@@ -81,7 +87,48 @@ int main(int argc, char **argv)
 
     printf("MAGICOUT: COM%d -> SLIP escape frame\n", port_index + 1);
     for (i = 0; i < sizeof(frame); ++i) send_byte((unsigned)port_index, frame[i]);
-    printf("MAGICOUT: sent %u bytes; dongle should be in MODEM mode now\n",
-           (unsigned)sizeof(frame));
-    return 0;
+
+    /* Give the dongle a few BIOS ticks to receive + process the frame.
+     * Without this, an immediate ATQ that follows would race the SLIP
+     * decoder and arrive while the dongle is still in SLIP. */
+    {
+        unsigned long t = bios_ticks();
+        while ((bios_ticks() - t) < 6UL) {        /* ~330 ms */
+            union REGS r;
+            int86(0x28, &r, &r);                  /* DOS yield */
+        }
+    }
+
+    /* Verify the dongle is responsive in MODEM mode. Bare CR -> OK or
+     * ERROR; either way the AT engine is running. Silent for 1s = stuck
+     * in SLIP (frame didn't take). */
+    {
+        int seen_at_response = 0;
+        unsigned long t = bios_ticks();
+        /* Drain anything pending first */
+        while ((bios_ticks() - t) < 2UL) {
+            union REGS r;
+            r.h.ah = 0x03U; r.x.dx = (unsigned)port_index;
+            int86(0x14, &r, &r);
+            if (r.h.ah & 0x01U) { r.h.ah = 0x02U; int86(0x14, &r, &r); }
+            else                { union REGS y; int86(0x28, &y, &y); }
+        }
+        /* Send CR, wait for any response byte */
+        send_byte((unsigned)port_index, '\r');
+        t = bios_ticks();
+        while ((bios_ticks() - t) < 18UL) {       /* ~1 s */
+            union REGS r;
+            r.h.ah = 0x03U; r.x.dx = (unsigned)port_index;
+            int86(0x14, &r, &r);
+            if (r.h.ah & 0x01U) { seen_at_response = 1; break; }
+            { union REGS y; int86(0x28, &y, &y); }
+        }
+        if (seen_at_response) {
+            printf("MAGICOUT: dongle responsive in MODEM mode (OK)\n");
+            return 0;
+        } else {
+            printf("MAGICOUT: warning -- no AT response in 1s; dongle may be stuck in SLIP\n");
+            return 2;
+        }
+    }
 }

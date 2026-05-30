@@ -28,17 +28,14 @@ extern "C" {
 // gated Serial.write and being silently dropped on hosts that don't propagate
 // DTR (DOSBox directserial, anything that didn't pass SET_CONTROL_LINE_STATE).
 //
-// THROUGHPUT NOTE: previous version slept delay(1) (one FreeRTOS tick) per
-// FIFO refill. For a 1500-byte SLIP frame on a 64-byte CDC TX FIFO that's
-// 23+ ms of pure sleep, all of it inside lwIP's tcpip thread, blocking
-// every other lwIP job (incoming WiFi packets, NAPT translations, etc.)
-// while we wait for the host to drain a USB bulk-IN packet. Now we yield
-// to TinyUSB only when FIFO is actually full, via taskYIELD(), so the USB
-// task gets cycles immediately without paying a 1ms minimum.
-extern "C" {
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-}
+// Why delay(1) and not taskYIELD: the tcpip thread (this function's caller
+// during SLIP-mode slip_output) is priority 18, while TinyUSB / arduino USB
+// management runs at a lower priority. taskYIELD only switches to equal-or-
+// higher priority, so a yield from tcpip wouldn't let TinyUSB drain the
+// FIFO. delay(1) blocks for one FreeRTOS tick, which is what lets lower-
+// priority tasks (including any TinyUSB-side processing of TX completions)
+// actually get cycles. The 500 ms deadline guards against a host that
+// never drains.
 static size_t cdc_write_raw(const uint8_t *buf, size_t n) {
     size_t total = 0;
     uint32_t start = millis();
@@ -50,14 +47,12 @@ static size_t cdc_write_raw(const uint8_t *buf, size_t n) {
             size_t w = tud_cdc_n_write(0, buf + total, want);
             total += w;
             // Push a partial-FIFO worth out as soon as we have something,
-            // so the USB IN endpoint sees a packet to send rather than
-            // waiting for the FIFO to fill to 64 bytes naturally.
+            // so the USB IN endpoint ships immediately rather than waiting
+            // to accumulate a full wMaxPacketSize=64 worth.
             if (total < n) tud_cdc_n_write_flush(0);
         } else {
-            // FIFO full -- let TinyUSB run and drain. taskYIELD wakes
-            // other tasks but doesn't burn a full FreeRTOS tick.
             tud_cdc_n_write_flush(0);
-            taskYIELD();
+            delay(1);
             if (millis() - start > 500U) break;
         }
     }
