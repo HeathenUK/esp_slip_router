@@ -318,13 +318,21 @@ int main(int argc, char **argv)
     /* Send a bare CR to flush whatever line the AT engine was assembling,
      * then ATH to hang up any prior call. No +++ / no magic-frame here --
      * the harness is responsible for ensuring the dongle is in MODEM
-     * command mode before invocation (run-httpget.sh's recovery does this). */
+     * command mode before invocation. */
     drain_rx((unsigned)port_index, 100);
     fossil_send((unsigned)port_index, '\r');
     wait_ms(200);
     drain_rx((unsigned)port_index, 100);
     fossil_send_str((unsigned)port_index, "ATH\r");
     wait_ms(400);
+    drain_rx((unsigned)port_index, 100);
+    /* CRITICAL for HTTP: turn off the dongle's Telnet IAC negotiation.
+     * Default ATNET1 makes the dongle send IAC WILL/DO bytes to the peer
+     * the instant TCP connects (BBS-style behaviour). To an HTTP server
+     * those bytes arrive BEFORE our GET line and trigger 400 Bad Request.
+     * ATNET0 = transparent byte pipe -- which is what HTTP needs. */
+    fossil_send_str((unsigned)port_index, "ATNET0\r");
+    wait_ms(300);
     drain_rx((unsigned)port_index, 100);
 
     /* PHASE A: dial. Time ATDT -> CONNECT separately. */
