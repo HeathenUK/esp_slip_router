@@ -63,13 +63,19 @@ static void dos_yield(void)
     int86(0x28, &r, &r);
 }
 
+static int g_has_block_read = 0;   /* set by probe_fossil from AH=04h BL */
+
 static int probe_fossil(unsigned dx)
 {
     union REGS r;
     r.h.ah = 0x04U; r.h.al = 0xFFU;
     r.x.bx = 0x4F50U; r.x.dx = dx;
     int86(0x14, &r, &r);
-    return (r.x.ax == 0x1954U);
+    if (r.x.ax != 0x1954U) return 0;
+    /* BL = highest supported function number. AH=18h is block-read; if
+     * advertised we use it for fast bulk RX (CHUSB does, BNU doesn't). */
+    g_has_block_read = (r.h.bl >= 0x18U);
+    return 1;
 }
 
 /* BIOS ticks @ 18.2 Hz from BDA 0040:006C. */
@@ -109,11 +115,29 @@ static unsigned fossil_send_block(unsigned port,
     return r.x.ax;
 }
 
-/* Read one byte non-blocking via FOSSIL status + read. AH=03h returns
- * line status in AH (bit 0 = data ready); if set we then call AH=02h
- * to actually consume the byte. (Tried AH=18h block-read and AH=0Ch
- * peek; AH=18h appears unimplemented in BNU 2.02 -- always returns 0 --
- * and AH=0Ch ambiguity made empty look like data.) */
+/* Set above by probe_fossil from AH=04h BL (highest supported function).
+ * When the FOSSIL supports AH=18h block-read we use it (CHUSB does;
+ * BNU 2.02 does not). One AH=18h call moves a whole buffer; without it
+ * the body-read loop has to do two INT 14h per byte and 1 MB takes
+ * minutes. */
+
+/* FOSSIL AH=18h non-blocking block-read. ES:DI=buf, CX=requested count.
+ * Returns bytes actually copied (0 if FIFO empty). */
+static unsigned fossil_block_read(unsigned port,
+                                  unsigned char __far *buf, unsigned count)
+{
+    struct SREGS s; union REGS r;
+    segread(&s);
+    s.es = FP_SEG(buf);
+    r.x.di = FP_OFF(buf);
+    r.h.ah = 0x18U;
+    r.x.cx = count;
+    r.x.dx = port;
+    int86x(0x14, &r, &r, &s);
+    return r.x.ax;
+}
+
+/* Read one byte non-blocking via AH=03h status + AH=02h read. */
 static int fossil_recv_nowait(unsigned port)
 {
     union REGS r;
@@ -125,19 +149,24 @@ static int fossil_recv_nowait(unsigned port)
     return (int)(unsigned)r.h.al;
 }
 
-/* Bulk receive: drain the FIFO via repeated AH=03h+AH=02h. Returns count.
- * For BNU + DOSBox nullmodem the FOSSIL bulk-read (AH=18h) doesn't work,
- * so this loop is the best we can do. Stops at count or when FIFO empties. */
+/* Bulk receive into buf. Uses AH=18h block-read when supported, else
+ * falls back to per-byte AH=03+02. Returns bytes actually read; 0 if
+ * FIFO empty. */
 static unsigned fossil_recv_block(unsigned port,
                                   unsigned char __far *buf, unsigned count)
 {
-    unsigned n = 0;
-    while (n < count) {
-        int c = fossil_recv_nowait(port);
-        if (c < 0) break;
-        buf[n++] = (unsigned char)c;
+    if (g_has_block_read) {
+        return fossil_block_read(port, buf, count);
     }
-    return n;
+    {
+        unsigned n = 0;
+        while (n < count) {
+            int c = fossil_recv_nowait(port);
+            if (c < 0) break;
+            buf[n++] = (unsigned char)c;
+        }
+        return n;
+    }
 }
 
 static void wait_ms(unsigned ms)
@@ -435,11 +464,16 @@ int main(int argc, char **argv)
         {
             unsigned long got = 0UL;
             unsigned long last_byte_ticks;
-            /* End-of-stream heuristic: 90 ticks (~5s) without any byte.
-             * For very slow links bump this. */
-            const unsigned long silence_ticks = 90UL;
+            unsigned long last_progress_ticks;
+            /* End conditions: Content-Length reached, OR no byte for 5s
+             * (server closed cleanly without Content-Length / link dead),
+             * OR 5 minutes total (sanity backstop -- a 1 MB download at
+             * even 5 KB/s finishes in 3.5 min). */
+            const unsigned long silence_ticks = 90UL;          /* ~5s   */
+            const unsigned long max_ticks     = 5460UL;        /* ~300s */
             t_body_start = bios_ticks();
             last_byte_ticks = t_body_start;
+            last_progress_ticks = t_body_start;
             for (;;) {
                 unsigned r = fossil_recv_block((unsigned)port_index,
                     (unsigned char __far *)buf, sizeof(buf));
@@ -451,7 +485,20 @@ int main(int argc, char **argv)
                     if ((bios_ticks() - last_byte_ticks) > silence_ticks) break;
                     dos_yield();
                 }
+                /* Progress beat every ~2s so the user knows it's alive
+                 * (and to surface the issue if it's trickling impossibly
+                 * slowly through per-byte FOSSIL). */
+                if ((bios_ticks() - last_progress_ticks) > 36UL) {
+                    last_progress_ticks = bios_ticks();
+                    printf("         ... %lu bytes\r", got);
+                    fflush(stdout);
+                }
+                if ((bios_ticks() - t_body_start) > max_ticks) {
+                    printf("\n         (5 min wall-clock cap hit)\n");
+                    break;
+                }
             }
+            printf("\n");
             t_done = bios_ticks();
             {
                 unsigned long body_ticks    = t_done - t_body_start;

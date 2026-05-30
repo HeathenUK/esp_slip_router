@@ -1,0 +1,5 @@
+option quiet
+format dos
+file timer.obj
+library crtmm
+name timer.exe
