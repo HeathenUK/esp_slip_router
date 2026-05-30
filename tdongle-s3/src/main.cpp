@@ -24,6 +24,7 @@ extern "C" {
 }
 
 #include "dongle_disk.h"
+#include "dongle_kbd.h"
 
 // Direct TinyUSB CDC write that bypasses USBCDC's `connected` gate -- same
 // rationale as modem.cpp's cdc_write. SLIP-mode lwIP traffic was hitting the
@@ -248,6 +249,18 @@ static void slip_deliver(const uint8_t *data, size_t len) {
         apply_mode();
         return;
     }
+    static const char DISK_USB[] = "DISK=USB";
+    if (len == sizeof(DISK_USB) - 1 && memcmp(data, DISK_USB, sizeof(DISK_USB) - 1) == 0) {
+        DBG("[slip] magic disk owner -> USB\n");
+        dongle_disk_set_owner(DONGLE_DISK_OWNER_USB);
+        return;
+    }
+    static const char DISK_DEVICE[] = "DISK=DEVICE";
+    if (len == sizeof(DISK_DEVICE) - 1 && memcmp(data, DISK_DEVICE, sizeof(DISK_DEVICE) - 1) == 0) {
+        DBG("[slip] magic disk owner -> DEVICE\n");
+        dongle_disk_set_owner(DONGLE_DISK_OWNER_DEVICE);
+        return;
+    }
     // PBUF_IP reserves headroom for an L2 header below the IP layer. Critical
     // when the packet is FORWARDED to an Ethernet netif (WiFi STA via NAPT):
     // etharp_output prepends 14 bytes of L2 via pbuf_header(-14), which fails
@@ -436,6 +449,9 @@ void setup() {
     // dongle_disk_init hooks WiFi events and starts HTTP/mDNS when STA
     // gets an IP.
     dongle_disk_init();
+    // HID keyboard composed onto the same USB device. Lets WiFi /type
+    // (and AT$TYPE) drive the host as if a human were typing.
+    dongle_kbd_init();
 
     DBG("[boot] setup complete, mode=%s\n", g_mode == MODE_SLIP ? "SLIP" : "MODEM");
 }

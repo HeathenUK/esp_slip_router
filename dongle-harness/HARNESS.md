@@ -175,23 +175,26 @@ command lands on the AT engine instead of the SLIP decoder.
 
 ### 4. USB MSC + WiFi HTTP (dev disk)
 
-The dongle exposes the new `ffat` partition (8 MB FAT12) as a USB Mass
-Storage device. macOS / Windows / Linux mount it natively; CHUSB on
-the DOS side already implements INT 13h MSC, so the same drive appears
-in DOS without any extra driver work.
+The dongle exposes the new `ffat` partition (8 MB FAT12, 512-byte
+logical sectors) as a USB Mass Storage device. macOS / Windows / Linux
+mount it natively; CHUSB on the DOS side already implements INT 13h
+MSC, so the same drive appears in DOS without any extra driver work.
 
 The same FAT is served on WiFi by an HTTP file server, with mDNS
 registered as `dosongle.local`:
 
 ```
 GET  /                  index (links to the JSON + the file endpoints)
-GET  /status            JSON: WiFi, MSC, FS total/free
-GET  /list              root-directory listing (size + name)
-GET  /fs/<NAME>         download the file (8.3-uppercased server side)
-PUT  /fs/<NAME>         upload (raw body, use curl -T <file>)
-DELETE /fs/<NAME>       delete
-POST /eject             tell the host MSC is gone
-POST /present           re-present (mediaPresent true + UNIT ATTENTION)
+GET  /status            JSON: WiFi, MSC, format state, logical block size
+GET  /list              root-directory listing (also works in host-write)
+GET  /fs/<NAME>         download a root 8.3 file (also works in host-write)
+PUT  /fs/<NAME>         disabled in the raw 512-byte FAT build
+DELETE /fs/<NAME>       disabled in the raw 512-byte FAT build
+POST /device-write      device owns the block device; MSC medium not ready
+POST /host-write        USB MSC owns the block device; host may mount/write it
+POST /format            starts explicit FAT format; poll /status
+POST /eject             alias for /device-write
+POST /present           alias for /host-write
 POST /reset             esp_restart
 ```
 
@@ -199,29 +202,86 @@ Examples:
 
 ```sh
 curl http://dosongle.local/status
+curl -X POST http://dosongle.local/device-write
 curl http://dosongle.local/list
 curl http://dosongle.local/fs/PROFILE.LOG > local-profile.log
-curl -T new-PROFILE.EXE http://dosongle.local/fs/PROFILE.EXE
-curl -X DELETE http://dosongle.local/fs/STALE.TXT
+curl -X POST http://dosongle.local/host-write
 ```
 
 **Coordination model.** The FAT partition has one writer at a time.
-USB MSC owns the disk by default. Each `/fs` or `/list` request
-briefly takes ownership: the dongle sends `mediaPresent(false)` to
-the host (the disk appears to eject), mounts FATFS internally, does
-the op, `fsync`s, unmounts, and sends `mediaPresent(true)` again.
-The host sees a brief eject-and-remount around each WiFi op. macOS
-won't auto-mount after the re-present — `diskutil mount /dev/disk4`
-or click the icon in Finder, or just work entirely through HTTP.
-DOS-side CHUSB notices via UNIT ATTENTION and reads the fresh dir on
-next access.
+`host-write` is the normal host-visible state: USB MSC owns the block
+device. HTTP `GET /list` and `GET /fs/<NAME>` can read the root
+directory and root 8.3 files directly from the raw FAT blocks in this
+mode, so the common harness path can fetch `SCREEN.TXT` after DOS has
+closed/flushed it without taking write ownership. In the current raw
+512-byte FAT build, HTTP `PUT` and `DELETE` return 409 in all modes.
+
+Before switching to `device-write`, unmount/eject the host filesystem
+view first (`diskutil unmount /Volumes/DOSONGLE` on macOS, or
+finish/eject the drive on DOS). Then switch to `device-write`; the
+firmware marks the MSC LUN not-ready so no host can write the FAT while
+device-side raw FAT operations are active:
+
+```sh
+diskutil unmount /Volumes/DOSONGLE
+curl -X POST http://dosongle.local/device-write
+curl http://dosongle.local/list
+curl -X POST http://dosongle.local/host-write
+diskutil mount disk4    # if macOS does not auto-mount it
+```
+
+While `device-write` is active, do not use any stale host mountpoint
+that macOS may keep around; it is no longer the authoritative view and
+may return cached directory entries or I/O errors. Switch back to
+`host-write` after device-side writes so the device marks the MSC
+medium ready again. The host then mounts/re-reads the FAT as the
+authoritative view.
+
+Do not mutate the FAT over HTTP while Finder, DOS, or any host OS has
+the MSC filesystem mounted. macOS and DOS can cache FAT and directory
+sectors, and later host writes can overwrite device-side changes. The
+safe invariant is: host mounted means host owns writes; device-owned
+mode is the only place firmware may mutate the FAT. In the current raw
+512-byte FAT build, HTTP mutation endpoints intentionally return 409
+until a raw FAT writer is implemented.
+
+Host-owned `GET /fs/<NAME>` is read-only and does not mount FATFS or
+modify metadata. It is safe against FAT corruption, but it only sees
+what the host has actually committed to the block device. For DOS screen
+capture, run `SNAP`, wait for it to return to the prompt, then fetch:
+
+```sh
+curl http://dosongle.local/fs/SCREEN.TXT
+```
+
+Formatting is explicit only. Use `/format` or `AT$DISK=FORMAT` when
+you deliberately want to create or rebuild the FAT volume; there is no
+implicit format-on-mount anymore. HTTP `/format` returns immediately
+with `202 Accepted`; poll `/status` until `format.running` is false and
+`format.last_ok` is true. `AT$DISK=FORMAT` performs the same format from
+CDC and returns when it is complete.
+
+```sh
+curl -X POST http://dosongle.local/format
+curl http://dosongle.local/status
+curl -X POST http://dosongle.local/host-write
+```
+
+`AT$DISK=DEVICE-WRITE`, `AT$DISK=HOST-WRITE`, and `AT$DISK=FORMAT`
+perform the same operations from the CDC modem side. In SLIP mode,
+magic frames with payload `DISK=DEVICE` or `DISK=USB` do the
+ownership switch without leaving SLIP.
 
 `AT$DISK?` shows status from the CDC side:
 
 ```
-mdns=dosongle.local  http=up  msc_present=yes  fs_locked=no
+mdns=dosongle.local  http=up  mode=host-write  msc_present=yes  msc_writable=yes  fs_mounted=no
 partition=8306688 bytes
 ```
+
+If the FAT was never created, use `POST /format` or `AT$DISK=FORMAT`
+once. Those commands take device ownership and then create the 512-byte
+sector FAT12 volume; that is the only path that formats the partition.
 
 The 8 MB partition came out of the OTA slots (shrunk to 3.94 MB each
 from the stock 6.25 MB; still 3.5× headroom over the current 1.2 MB

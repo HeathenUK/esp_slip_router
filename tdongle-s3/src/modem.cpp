@@ -10,6 +10,7 @@ extern "C" {
 #include "esp_ota_ops.h"          /* OTA partition write API (USB-CDC OTA) */
 #include "esp_system.h"           /* esp_restart() for AT$RESET */
 #include "dongle_disk.h"          /* AT$DISK status */
+#include "dongle_kbd.h"           /* AT$TYPE -- HID keyboard out */
 #include "lwip/netif.h"           /* AT$NETIF dump */
 #include "ping/ping_sock.h"       /* AT$PING -- WiFi outbound smoke test */
 size_t cdc_read_raw(uint8_t *buf, size_t max);   /* defined in main.cpp */
@@ -469,17 +470,53 @@ static void handle_dollar(char *s) {
             cdc_print(b);
             r_ok();
         }
+    } else if (!strcmp(key, "TYPE")) {
+        // AT$TYPE=<string> -- send <string> via the USB HID keyboard. See
+        // dongle_kbd.h for the token DSL (<ENTER>, <F1>, <CTRL+C>, etc).
+        if (op != '=') { r_error(); return; }
+        int n = dongle_kbd_type(val, (int)strlen(val));
+        if (n < 0) { cdc_print("\r\nTYPE PARSE-ERR\r\n"); r_error(); return; }
+        r_ok();
     } else if (!strcmp(key, "DISK")) {
-        // AT$DISK? -- USB MSC / HTTP dev-disk status. See dongle_disk.cpp.
+        // AT$DISK? / AT$DISK=HOST-WRITE|DEVICE-WRITE|FORMAT -- USB MSC / HTTP dev-disk.
+        if (op == '=') {
+            dongle_disk_owner_t owner;
+            if (!strcasecmp(val, "FORMAT")) {
+                if (!dongle_disk_format()) {
+                    cdc_print("\r\nDISK FORMAT-ERR\r\n");
+                    r_error();
+                    return;
+                }
+                r_ok();
+                return;
+            } else if (!strcasecmp(val, "HOST-WRITE") || !strcasecmp(val, "USB") || !strcasecmp(val, "HOST")) {
+                owner = DONGLE_DISK_OWNER_USB;
+            } else if (!strcasecmp(val, "DEVICE-WRITE") || !strcasecmp(val, "DEVICE") || !strcasecmp(val, "DONGLE")) {
+                owner = DONGLE_DISK_OWNER_DEVICE;
+            } else {
+                r_error();
+                return;
+            }
+            if (!dongle_disk_set_owner(owner)) {
+                cdc_print("\r\nDISK OWNER-ERR\r\n");
+                r_error();
+                return;
+            }
+            r_ok();
+            return;
+        }
+        if (op && op != '?') { r_error(); return; }
         dongle_disk_status_t st;
         dongle_disk_get_status(&st);
-        char b[200];
+        char b[240];
         snprintf(b, sizeof(b),
-                 "\r\nmdns=%s.local  http=%s  msc_present=%s  fs_locked=%s\r\n"
+                 "\r\nmdns=%s.local  http=%s  mode=%s  msc_present=%s  msc_writable=%s  fs_mounted=%s\r\n"
                  "partition=%lu bytes\r\n",
                  st.mdns_host,
                  st.http_ready ? "up" : "down",
+                 dongle_disk_owner_name(st.owner),
                  st.msc_present ? "yes" : "no",
+                 st.msc_writable ? "yes" : "no",
                  st.mounted ? "yes" : "no",
                  (unsigned long)st.partition_bytes);
         cdc_print(b);
@@ -531,7 +568,9 @@ static void handle_dollar(char *s) {
                      "AT$RSSI?             just the dBm value (scriptable)\r\n"
                      "AT$SCAN              list WiFi networks (~3-5 s)\r\n"
                      "AT$STATS  / =0       SLIP byte+pkt counters / clear\r\n"
-                     "AT$DISK?             USB MSC + HTTP dev-disk status\r\n"
+                     "AT$DISK? / =HOST-WRITE|DEVICE-WRITE|FORMAT  USB MSC / HTTP disk ownership\r\n"
+                     "AT$TYPE=<str>        send keystrokes via HID keyboard\r\n"
+                     "                     (tokens: <ENTER> <F1> <CTRL+C> etc.)\r\n"
                      "AT$RESET             software reboot (esp_restart)\r\n"
                      "AT$OTASTART=<size>   USB-CDC OTA: stream <size> B fw.bin\r\n"
                      "AT$BOOT              fallback: reboot into ROM bootloader\r\n"

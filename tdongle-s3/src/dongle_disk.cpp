@@ -2,15 +2,9 @@
 // internal flash. See dongle_disk.h for the architecture summary.
 //
 // Coordination: the FAT partition is owned EITHER by the USB MSC side
-// (host sees the drive) OR by the dongle's FATFS mount (HTTP can list,
-// read, write). Switching ownership cycles mediaPresent on MSC so the
-// host re-reads after a write -- never both sides on the same wear-
-// levelling handle at once.
-//
-// HTTP transactions self-arbitrate: each request that touches the disk
-// briefly takes OWNER_DONGLE, runs, then returns to OWNER_USB. The
-// host sees the disk eject and re-mount around each WiFi op; for the
-// dev loop (occasional log fetch / binary push) that's acceptable.
+// (host sees the drive and can write it) OR by device-side raw FAT
+// operations. Ownership is explicit and persistent; never let the host
+// and device write the same FAT at once.
 
 #include "dongle_disk.h"
 
@@ -22,23 +16,27 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/unistd.h>
 
 #include "esp_partition.h"
 #include "wear_levelling.h"
-#include "esp_vfs_fat.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
-#include "ff.h"          /* f_setlabel for the FAT volume name */
+
+extern "C" {
+#include "class/msc/msc.h"
+#include "class/msc/msc_device.h"
+}
+
+#include "dongle_kbd.h"  /* POST /type -> HID keyboard */
 
 #define TAG               "disk"
 #define FAT_PART_LABEL    "ffat"
-#define MOUNT_POINT       "/dongle"
 #define MDNS_HOSTNAME     "dosongle"
-#define VOLUME_LABEL      "DOSONGLE"      /* shown as the disk name on the host */
+#define HTTP_DISK_LOCK_MS 250
+#define OWNER_LOCK_MS     1000
+#define MSC_BLOCK_SIZE    512U
+#define FAT_CLUSTER_SECS  8U
+#define FAT_ROOT_ENTRIES  512U
 
 // Debug to the hardware UART (Serial0) so we don't pollute the USB CDC
 // data link. Match the DBG macro style used elsewhere in this firmware.
@@ -47,45 +45,121 @@
 static USBMSC          s_msc;
 static wl_handle_t     s_wl = WL_INVALID_HANDLE;
 static const esp_partition_t *s_part = nullptr;
-// MSC logical block size = WL physical sector size (4 KB on this SDK
-// build). Matching the two means:
-//   - read/write callbacks are sector-aligned -- no RMW needed
-//   - the FAT BPB (also formatted at WL sector size) agrees with what
-//     the MSC layer reports to the host, so macOS / DOS see a valid FS
-static uint32_t        s_block_size = 4096;
+// USB MSC must expose 512-byte logical sectors for DOS. The ESP wear-levelled
+// flash sector remains 4 KB, so writes RMW the enclosing WL sector below.
+static uint32_t        s_block_size = MSC_BLOCK_SIZE;
 static uint32_t        s_block_count = 0;
 static SemaphoreHandle_t s_lock = nullptr;     // owner mutex
-static volatile bool   s_dongle_owns = false;  // false = USB owns, true = FATFS owns
+static portMUX_TYPE    s_io_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t          s_msc_io_active = 0;
+static volatile bool   s_raw_http_read_active = false;
+static volatile bool   s_dongle_owns = false;  // false = USB owns, true = device-side raw FAT ops own it
 static volatile bool   s_msc_present = true;   // current mediaPresent flag
+static volatile bool   s_msc_writable = true;  // current host-side writable flag
 static httpd_handle_t  s_httpd = nullptr;
 static volatile bool   s_mdns_up = false;
+static volatile bool   s_format_running = false;
+static volatile bool   s_format_ok = false;
+
+static void put16(uint8_t *p, uint16_t v);
+static void put32(uint8_t *p, uint32_t v);
+static esp_err_t raw_write_bytes(uint32_t off, const void *buf, size_t len);
+static esp_err_t raw_zero_bytes(uint32_t off, size_t len);
 
 // ---- low-level: raw flash via WL, 512-byte logical blocks ----
 
+static bool msc_read_begin(void) {
+    portENTER_CRITICAL(&s_io_mux);
+    bool ok = s_msc_present && s_wl != WL_INVALID_HANDLE;
+    if (ok) s_msc_io_active++;
+    portEXIT_CRITICAL(&s_io_mux);
+    return ok;
+}
+
+static bool msc_write_begin(void) {
+    portENTER_CRITICAL(&s_io_mux);
+    bool ok = !s_dongle_owns && !s_raw_http_read_active && s_msc_present && s_wl != WL_INVALID_HANDLE;
+    if (ok) s_msc_io_active++;
+    portEXIT_CRITICAL(&s_io_mux);
+    return ok;
+}
+
+static void msc_io_end(void) {
+    portENTER_CRITICAL(&s_io_mux);
+    if (s_msc_io_active) s_msc_io_active--;
+    portEXIT_CRITICAL(&s_io_mux);
+}
+
+static bool msc_io_idle(void) {
+    portENTER_CRITICAL(&s_io_mux);
+    bool idle = s_msc_io_active == 0;
+    portEXIT_CRITICAL(&s_io_mux);
+    return idle;
+}
+
+static void wait_for_msc_idle(void) {
+    uint32_t start = millis();
+    while (!msc_io_idle() && millis() - start < 1000U) delay(1);
+}
+
+static void raw_http_read_set(bool active) {
+    portENTER_CRITICAL(&s_io_mux);
+    s_raw_http_read_active = active;
+    portEXIT_CRITICAL(&s_io_mux);
+}
+
+static void owner_set_device_side(bool owns) {
+    portENTER_CRITICAL(&s_io_mux);
+    s_dongle_owns = owns;
+    portEXIT_CRITICAL(&s_io_mux);
+}
+
 static int32_t msc_on_read(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
-    if (s_dongle_owns || s_wl == WL_INVALID_HANDLE) return -1;
+    if (!msc_read_begin()) return -1;
     size_t addr = (size_t)lba * s_block_size + offset;
-    if (wl_read(s_wl, addr, buffer, bufsize) != ESP_OK) return -1;
+    if ((uint64_t)addr + bufsize > (uint64_t)s_block_count * s_block_size) {
+        msc_io_end();
+        return -1;
+    }
+    if (wl_read(s_wl, addr, buffer, bufsize) != ESP_OK) {
+        msc_io_end();
+        return -1;
+    }
+    msc_io_end();
     return (int32_t)bufsize;
 }
 
-// Block size matches WL sector size, so writes arrive 4 KB-aligned at
-// offset 0. Erase the sector, write it. (If the host ever issues a
-// partial-sector write we fall back to RMW.)
+// Hosts see 512-byte logical sectors. Flash writes still happen in the
+// enclosing WL erase sector, so only a full aligned WL-sector write can skip
+// the read/modify/write path.
 static int32_t msc_on_write(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
-    if (s_dongle_owns || s_wl == WL_INVALID_HANDLE) return -1;
+    if (!msc_write_begin()) return -1;
     size_t sect = wl_sector_size(s_wl);
     size_t addr = (size_t)lba * s_block_size + offset;
+    if ((uint64_t)addr + bufsize > (uint64_t)s_block_count * s_block_size) {
+        msc_io_end();
+        return -1;
+    }
 
-    if (offset == 0 && bufsize == sect) {
-        if (wl_erase_range(s_wl, addr, sect) != ESP_OK) return -1;
-        if (wl_write(s_wl, addr, buffer, sect) != ESP_OK) return -1;
+    if (offset == 0 && (addr & (sect - 1)) == 0 && bufsize == sect) {
+        if (wl_erase_range(s_wl, addr, sect) != ESP_OK) {
+            msc_io_end();
+            return -1;
+        }
+        if (wl_write(s_wl, addr, buffer, sect) != ESP_OK) {
+            msc_io_end();
+            return -1;
+        }
+        msc_io_end();
         return (int32_t)bufsize;
     }
 
     // Partial-sector path: read whole sector, splice in, erase+write back.
     static uint8_t sbuf[4096];
-    if (sect > sizeof sbuf) return -1;
+    if (sect > sizeof sbuf) {
+        msc_io_end();
+        return -1;
+    }
     size_t remaining = bufsize;
     uint8_t *src = buffer;
     while (remaining > 0) {
@@ -93,12 +167,22 @@ static int32_t msc_on_write(uint32_t lba, uint32_t offset, uint8_t *buffer, uint
         size_t sect_base = addr - sect_off;
         size_t chunk = sect - sect_off;
         if (chunk > remaining) chunk = remaining;
-        if (wl_read(s_wl, sect_base, sbuf, sect) != ESP_OK) return -1;
+        if (wl_read(s_wl, sect_base, sbuf, sect) != ESP_OK) {
+            msc_io_end();
+            return -1;
+        }
         memcpy(sbuf + sect_off, src, chunk);
-        if (wl_erase_range(s_wl, sect_base, sect) != ESP_OK) return -1;
-        if (wl_write(s_wl, sect_base, sbuf, sect) != ESP_OK) return -1;
+        if (wl_erase_range(s_wl, sect_base, sect) != ESP_OK) {
+            msc_io_end();
+            return -1;
+        }
+        if (wl_write(s_wl, sect_base, sbuf, sect) != ESP_OK) {
+            msc_io_end();
+            return -1;
+        }
         addr += chunk; src += chunk; remaining -= chunk;
     }
+    msc_io_end();
     return (int32_t)bufsize;
 }
 
@@ -108,70 +192,163 @@ static bool msc_on_start_stop(uint8_t power_condition, bool start, bool load_eje
     if (load_eject && !start) {
         s_msc.mediaPresent(false);
         s_msc_present = false;
+        s_msc.isWritable(false);
+        s_msc_writable = false;
     }
     return true;
 }
 
-// ---- ownership: flip USB <-> FATFS atomically ----
+// ---- ownership: flip USB <-> device-side raw FAT operations atomically ----
 
-// Mount FATFS for our use; before calling this the caller MUST hold s_lock
-// and have flipped mediaPresent(false) so the host stops touching wl.
-static esp_err_t mount_for_dongle(void) {
-    if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
-    esp_vfs_fat_mount_config_t cfg = {};
-    cfg.format_if_mount_failed = true;
-    cfg.max_files = 4;
-    cfg.allocation_unit_size = 0;        // default cluster size
-    cfg.disk_status_check_enable = false;
-    cfg.use_one_fat = false;
-    // unmount the wl handle first so esp_vfs_fat_spiflash_mount_rw_wl can
-    // mount it itself. wl_unmount, then re-handed via the mount helper.
-    wl_unmount(s_wl);
-    s_wl = WL_INVALID_HANDLE;
-    esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(MOUNT_POINT, FAT_PART_LABEL, &cfg, &s_wl);
-    if (err != ESP_OK) {
-        DBG("[disk] mount_for_dongle: vfs_fat_mount err=0x%x\n", err);
-        // try to recover the raw wl handle so MSC keeps working
-        wl_mount(s_part, &s_wl);
+static esp_err_t format_for_device_locked(void) {
+    if (!s_dongle_owns || s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
+    uint32_t total_secs = s_block_count;
+    uint16_t reserved = 1;
+    uint8_t fats = 2;
+    uint16_t root_entries = FAT_ROOT_ENTRIES;
+    uint32_t root_secs = (root_entries * 32U + MSC_BLOCK_SIZE - 1U) / MSC_BLOCK_SIZE;
+    uint8_t spc = FAT_CLUSTER_SECS;
+    uint16_t spf = 1;
+
+    for (;;) {
+        uint32_t data_secs = total_secs - reserved - root_secs - (uint32_t)fats * spf;
+        uint32_t clusters = data_secs / spc;
+        uint32_t fat_bytes = ((clusters + 2U) * 3U + 1U) / 2U;
+        uint16_t need_spf = (uint16_t)((fat_bytes + MSC_BLOCK_SIZE - 1U) / MSC_BLOCK_SIZE);
+        if (need_spf == spf) break;
+        spf = need_spf;
     }
-    return err;
+
+    uint8_t sec[MSC_BLOCK_SIZE];
+    memset(sec, 0, sizeof sec);
+    sec[0] = 0xEB; sec[1] = 0x3C; sec[2] = 0x90;
+    memcpy(sec + 3, "MSDOS5.0", 8);
+    put16(sec + 11, MSC_BLOCK_SIZE);
+    sec[13] = spc;
+    put16(sec + 14, reserved);
+    sec[16] = fats;
+    put16(sec + 17, root_entries);
+    if (total_secs <= 0xFFFFU) put16(sec + 19, (uint16_t)total_secs);
+    else put32(sec + 32, total_secs);
+    sec[21] = 0xF8;
+    put16(sec + 22, spf);
+    put16(sec + 24, 32);      // sectors/track, conventional geometry only
+    put16(sec + 26, 64);      // heads
+    sec[36] = 0x80;
+    sec[38] = 0x29;
+    put32(sec + 39, 0x444F5301UL);
+    memcpy(sec + 43, "DOSONGLE   ", 11);
+    memcpy(sec + 54, "FAT12   ", 8);
+    sec[510] = 0x55; sec[511] = 0xAA;
+    esp_err_t err = raw_write_bytes(0, sec, sizeof sec);
+    if (err != ESP_OK) return err;
+
+    memset(sec, 0, sizeof sec);
+    sec[0] = 0xF8; sec[1] = 0xFF; sec[2] = 0xFF;
+    uint32_t fat0 = (uint32_t)reserved * MSC_BLOCK_SIZE;
+    for (uint8_t f = 0; f < fats; ++f) {
+        uint32_t base = fat0 + (uint32_t)f * spf * MSC_BLOCK_SIZE;
+        err = raw_write_bytes(base, sec, sizeof sec);
+        if (err != ESP_OK) return err;
+        if (spf > 1) {
+            err = raw_zero_bytes(base + MSC_BLOCK_SIZE, (uint32_t)(spf - 1U) * MSC_BLOCK_SIZE);
+            if (err != ESP_OK) return err;
+        }
+    }
+
+    uint32_t root = fat0 + (uint32_t)fats * spf * MSC_BLOCK_SIZE;
+    err = raw_zero_bytes(root, root_secs * MSC_BLOCK_SIZE);
+    if (err != ESP_OK) return err;
+
+    uint8_t label[32];
+    memset(label, 0, sizeof label);
+    memcpy(label, "DOSONGLE   ", 11);
+    label[11] = 0x08;
+    return raw_write_bytes(root, label, sizeof label);
 }
 
-static void unmount_from_dongle(void) {
-    esp_vfs_fat_spiflash_unmount_rw_wl(MOUNT_POINT, s_wl);
-    s_wl = WL_INVALID_HANDLE;
-    // re-attach raw WL handle for MSC
-    wl_mount(s_part, &s_wl);
+static void msc_signal_medium_changed(void) {
+    // Only one MSC LUN is created in this firmware, so LUN 0 is the disk.
+    // 0x28/0x00 is "not ready to ready change, medium may have changed".
+    tud_msc_set_sense(0, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
 }
 
-// Take ownership for an HTTP transaction. Returns ESP_OK on success.
-static esp_err_t lock_for_dongle(void) {
-    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(8000)) != pdTRUE) return ESP_ERR_TIMEOUT;
-    // 1) tell host the medium is gone so it stops issuing READ_10/WRITE_10
-    s_msc.mediaPresent(false);
-    s_msc_present = false;
-    // 2) wait briefly for any in-flight bulk to drain
+static void set_msc_present(bool present) {
+    s_msc.mediaPresent(present);
+    s_msc_present = present;
+}
+
+static void set_msc_writable(bool writable) {
+    s_msc.isWritable(writable);
+    s_msc_writable = writable;
+}
+
+static void msc_take_offline(bool writable_when_back) {
+    set_msc_writable(false);
+    // Make REQUEST SENSE report "medium not present" while TEST UNIT READY
+    // is false. The Arduino USBMSC wrapper returns false for TUR when
+    // mediaPresent is false, but does not populate a NOT READY sense itself.
+    tud_msc_set_sense(0, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+    set_msc_present(false);
     vTaskDelay(pdMS_TO_TICKS(150));
-    // 3) flip ownership flag (MSC callbacks now refuse with -1)
-    s_dongle_owns = true;
-    // 4) mount FATFS
-    esp_err_t err = mount_for_dongle();
-    if (err != ESP_OK) {
-        s_dongle_owns = false;
-        s_msc.mediaPresent(true);
-        s_msc_present = true;
-        xSemaphoreGive(s_lock);
-        return err;
-    }
+    wait_for_msc_idle();
+    set_msc_writable(writable_when_back);
+}
+
+static void msc_bring_online(bool writable) {
+    set_msc_writable(writable);
+    set_msc_present(true);
+    msc_signal_medium_changed();
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+static esp_err_t take_for_device_locked(void) {
+    if (s_dongle_owns) return ESP_OK;
+    msc_take_offline(false);
+    owner_set_device_side(true);
     return ESP_OK;
 }
 
-static void unlock_from_dongle(void) {
-    unmount_from_dongle();
-    s_dongle_owns = false;
-    s_msc.mediaPresent(true);
-    s_msc_present = true;
+bool dongle_disk_format(void) {
+    if (!s_lock) return false;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(OWNER_LOCK_MS)) != pdTRUE) return false;
+    esp_err_t err = s_dongle_owns ? ESP_OK : take_for_device_locked();
+    if (err == ESP_OK) {
+        err = format_for_device_locked();
+    }
     xSemaphoreGive(s_lock);
+    return err == ESP_OK;
+}
+
+static esp_err_t give_to_usb_locked(void) {
+    msc_take_offline(true);
+    if (s_dongle_owns) {
+        owner_set_device_side(false);
+    }
+    msc_bring_online(true);
+    return ESP_OK;
+}
+
+static esp_err_t set_owner(dongle_disk_owner_t owner) {
+    if (!s_lock) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(OWNER_LOCK_MS)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t err = (owner == DONGLE_DISK_OWNER_DEVICE)
+                    ? take_for_device_locked()
+                    : give_to_usb_locked();
+    xSemaphoreGive(s_lock);
+    return err;
+}
+
+bool dongle_disk_set_owner(dongle_disk_owner_t owner) {
+    return set_owner(owner) == ESP_OK;
+}
+
+dongle_disk_owner_t dongle_disk_get_owner(void) {
+    return s_dongle_owns ? DONGLE_DISK_OWNER_DEVICE : DONGLE_DISK_OWNER_USB;
+}
+
+const char *dongle_disk_owner_name(dongle_disk_owner_t owner) {
+    return owner == DONGLE_DISK_OWNER_DEVICE ? "device-write" : "host-write";
 }
 
 // ---- HTTP helpers ----
@@ -195,102 +372,346 @@ static const char *INDEX_HTML =
     "<li><a href=/status>/status</a> &mdash; JSON: WiFi, MSC, mount, partition</li>"
     "<li><a href=/list>/list</a> &mdash; files on the FAT partition</li>"
     "<li><code>GET /fs/&lt;path&gt;</code> &mdash; download a file</li>"
-    "<li><code>PUT /fs/&lt;path&gt;</code> &mdash; upload a file (raw body)</li>"
-    "<li><code>DELETE /fs/&lt;path&gt;</code> &mdash; delete</li>"
-    "<li><code>POST /eject</code> &mdash; eject from host</li>"
+    "<li><code>PUT /fs/&lt;path&gt;</code> &mdash; not available in this raw FAT build</li>"
+    "<li><code>DELETE /fs/&lt;path&gt;</code> &mdash; not available in this raw FAT build</li>"
+    "<li><code>POST /device-write</code> &mdash; device owns the disk; MSC medium not ready</li>"
+    "<li><code>POST /host-write</code> &mdash; USB MSC owns the disk; host may mount/write it</li>"
+    "<li><code>POST /format</code> &mdash; start explicit 512-byte-sector FAT format</li>"
+    "<li><code>POST /eject</code> / <code>/present</code> &mdash; aliases for device / host write</li>"
+    "<li><code>POST /type</code> &mdash; HID keyboard input (body is text, "
+    "tokens like <code>&lt;ENTER&gt;</code>, <code>&lt;F1&gt;</code>, "
+    "<code>&lt;CTRL+C&gt;</code>, <code>&lt;DELAY=200&gt;</code>)</li>"
     "<li><code>POST /reset</code> &mdash; reboot dongle</li>"
     "</ul>"
-    "<p>Each <code>/fs</code> and <code>/list</code> request briefly ejects the "
-    "disk from USB while it runs, then re-presents it.</p>";
+    "<p><code>GET /fs</code> and <code>/list</code> read raw FAT blocks in either "
+    "ownership mode. HTTP writes are disabled until the raw FAT writer exists.</p>";
 
 static esp_err_t h_root(httpd_req_t *req) { return send_text(req, "200 OK", "text/html; charset=utf-8", INDEX_HTML); }
 
 static esp_err_t h_status(httpd_req_t *req) {
     char buf[512];
-    uint64_t total = 0, freeb = 0;
-    bool got_fs = false;
-    if (lock_for_dongle() == ESP_OK) {
-        if (esp_vfs_fat_info(MOUNT_POINT, &total, &freeb) == ESP_OK) got_fs = true;
-        unlock_from_dongle();
-    }
+    dongle_disk_owner_t owner = dongle_disk_get_owner();
     int n = snprintf(buf, sizeof buf,
         "{\"mdns\":\"%s.local\",\"wifi\":{\"connected\":%s,\"ip\":\"%s\",\"rssi\":%d},"
-        "\"msc\":{\"present\":%s,\"block_size\":%u,\"block_count\":%u},"
-        "\"fs\":{\"total\":%llu,\"free\":%llu}}",
+        "\"mode\":\"%s\","
+        "\"msc\":{\"present\":%s,\"writable\":%s,\"block_size\":%u,\"block_count\":%u},"
+        "\"format\":{\"running\":%s,\"last_ok\":%s},"
+        "\"fs\":{\"mounted\":false,\"info_valid\":false,\"total\":0,\"free\":0}}",
         MDNS_HOSTNAME,
         WiFi.status() == WL_CONNECTED ? "true" : "false",
         WiFi.localIP().toString().c_str(),
         (int)WiFi.RSSI(),
+        dongle_disk_owner_name(owner),
         s_msc_present ? "true" : "false",
+        s_msc_writable ? "true" : "false",
         (unsigned)s_block_size, (unsigned)s_block_count,
-        (unsigned long long)total, (unsigned long long)freeb);
-    (void)got_fs;
+        s_format_running ? "true" : "false",
+        s_format_ok ? "true" : "false");
     if (n < 0) n = 0;
     return send_text(req, "200 OK", "application/json", buf);
 }
 
+struct raw_fat_info_t {
+    uint16_t bps;
+    uint8_t  spc;
+    uint8_t  fats;
+    uint16_t root_entries;
+    uint32_t total_sectors;
+    uint32_t sectors_per_fat;
+    uint32_t fat_start;
+    uint32_t root_start;
+    uint32_t root_bytes;
+    uint32_t data_start;
+    bool     fat12;
+};
+
+static uint32_t le32(const uint8_t *p);
+static esp_err_t raw_read_bytes(uint32_t off, void *buf, size_t len);
+static bool raw_fat_mount_info(raw_fat_info_t *fi, char *why, size_t whysz);
+
 static esp_err_t h_list(httpd_req_t *req) {
-    esp_err_t err = lock_for_dongle();
-    if (err != ESP_OK) return send_text(req, "503 Service Unavailable", "text/plain", "lock failed\n");
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(HTTP_DISK_LOCK_MS)) != pdTRUE)
+        return send_text(req, "503 Service Unavailable", "text/plain", "lock failed\n");
+
+    raw_http_read_set(true);
+    wait_for_msc_idle();
+
+    raw_fat_info_t fi;
+    char why[96];
+    if (!raw_fat_mount_info(&fi, why, sizeof why)) {
+        raw_http_read_set(false);
+        xSemaphoreGive(s_lock);
+        char rsp[128];
+        snprintf(rsp, sizeof rsp, "raw FAT parse failed: %s\n", why);
+        return send_text(req, "500 Internal Server Error", "text/plain", rsp);
+    }
 
     httpd_resp_set_status(req, "200 OK");
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Connection", "close");
 
-    DIR *d = opendir(MOUNT_POINT);
-    if (!d) {
-        unlock_from_dongle();
-        return httpd_resp_send(req, "(opendir failed)\n", HTTPD_RESP_USE_STRLEN);
-    }
+    uint8_t ent[32];
     char line[160];
-    struct dirent *e;
-    while ((e = readdir(d)) != nullptr) {
-        struct stat st;
-        char path[256];
-        snprintf(path, sizeof path, "%s/%s", MOUNT_POINT, e->d_name);
-        if (stat(path, &st) != 0) continue;
-        int n = snprintf(line, sizeof line, "%10ld  %s%s\n",
-                         (long)st.st_size, e->d_name,
-                         S_ISDIR(st.st_mode) ? "/" : "");
-        if (n > 0) httpd_resp_send_chunk(req, line, n);
+    bool ok = true;
+    for (uint32_t off = 0; off < fi.root_bytes; off += 32) {
+        if (raw_read_bytes(fi.root_start + off, ent, sizeof ent) != ESP_OK) {
+            ok = false;
+            break;
+        }
+        if (ent[0] == 0x00) break;
+        if (ent[0] == 0xE5) continue;
+        uint8_t attr = ent[11];
+        if (attr == 0x0F || (attr & 0x08)) continue; // LFN or volume label
+
+        char name[13];
+        int ni = 0;
+        for (int i = 0; i < 8 && ent[i] != ' '; ++i) name[ni++] = (char)ent[i];
+        if (!(attr & 0x10)) {
+            int has_ext = 0;
+            for (int i = 8; i < 11; ++i) if (ent[i] != ' ') has_ext = 1;
+            if (has_ext) {
+                name[ni++] = '.';
+                for (int i = 8; i < 11 && ent[i] != ' '; ++i) name[ni++] = (char)ent[i];
+            }
+        }
+        name[ni] = 0;
+
+        uint32_t sz = (attr & 0x10) ? 0 : le32(ent + 28);
+        int n = snprintf(line, sizeof line, "%10lu  %s%s\n",
+                         (unsigned long)sz, name, (attr & 0x10) ? "/" : "");
+        if (n > 0 && httpd_resp_send_chunk(req, line, n) != ESP_OK) {
+            ok = false;
+            break;
+        }
     }
-    closedir(d);
+    raw_http_read_set(false);
     httpd_resp_send_chunk(req, nullptr, 0);
-    unlock_from_dongle();
+    xSemaphoreGive(s_lock);
+    return ok ? ESP_OK : ESP_FAIL;
+}
+
+static uint16_t le16(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void put16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static void put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static bool uri_to_83_name(const char *uri, char out[11]) {
+    if (strncmp(uri, "/fs/", 4) != 0) return false;
+    const char *p = uri + 4;
+    if (!*p || strchr(p, '/') || strstr(p, "..")) return false;
+    memset(out, ' ', 11);
+
+    int base = 0, ext = 0;
+    bool in_ext = false;
+    for (; *p; ++p) {
+        char c = *p;
+        if (c == '.') {
+            if (in_ext) return false;
+            in_ext = true;
+            continue;
+        }
+        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+        if ((unsigned char)c <= ' ' || strchr("\"*+,/:;<=>?[\\]|", c)) return false;
+        if (!in_ext) {
+            if (base >= 8) return false;
+            out[base++] = c;
+        } else {
+            if (ext >= 3) return false;
+            out[8 + ext++] = c;
+        }
+    }
+    return base > 0;
+}
+
+static esp_err_t raw_read_bytes(uint32_t off, void *buf, size_t len) {
+    if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
+    if ((uint64_t)off + len > (uint64_t)s_block_count * s_block_size) return ESP_ERR_INVALID_SIZE;
+    uint8_t sector[4096];
+    if (s_block_size > sizeof sector) return ESP_ERR_INVALID_SIZE;
+    uint8_t *dst = (uint8_t *)buf;
+    while (len > 0) {
+        uint32_t base = off - (off % s_block_size);
+        uint32_t pos = off - base;
+        size_t n = s_block_size - pos;
+        if (n > len) n = len;
+        esp_err_t err = wl_read(s_wl, base, sector, s_block_size);
+        if (err != ESP_OK) return err;
+        memcpy(dst, sector + pos, n);
+        off += n;
+        dst += n;
+        len -= n;
+    }
     return ESP_OK;
 }
 
-// Translate URI /fs/<path> -> MOUNT_POINT/<UPPER(path)>. Reject ".." and
-// any subdirs (FAT root only, keeps things simple). Caller-provided buf
-// must be >= 256.
-static bool resolve_fs_path(const char *uri, char *out, size_t outsz) {
-    const char *p = uri;
-    if (strncmp(p, "/fs/", 4) != 0) return false;
-    p += 4;
-    if (!*p) return false;
-    if (strchr(p, '/')) return false;          // root-only
-    if (strstr(p, "..")) return false;
-    size_t n = snprintf(out, outsz, "%s/", MOUNT_POINT);
-    for (; *p && n + 1 < outsz; ++p) {
-        char c = *p;
-        if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';     // DOS 8.3 likes upper
-        out[n++] = c;
+static esp_err_t raw_write_bytes(uint32_t off, const void *buf, size_t len) {
+    if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
+    if ((uint64_t)off + len > (uint64_t)s_block_count * s_block_size) return ESP_ERR_INVALID_SIZE;
+    size_t sect = wl_sector_size(s_wl);
+    static uint8_t sbuf[4096];
+    if (sect > sizeof sbuf || (sect & (sect - 1)) != 0) return ESP_ERR_INVALID_SIZE;
+
+    const uint8_t *src = (const uint8_t *)buf;
+    while (len > 0) {
+        size_t sect_off = off & (sect - 1);
+        size_t sect_base = off - sect_off;
+        size_t chunk = sect - sect_off;
+        if (chunk > len) chunk = len;
+        if (wl_read(s_wl, sect_base, sbuf, sect) != ESP_OK) return ESP_FAIL;
+        memcpy(sbuf + sect_off, src, chunk);
+        if (wl_erase_range(s_wl, sect_base, sect) != ESP_OK) return ESP_FAIL;
+        if (wl_write(s_wl, sect_base, sbuf, sect) != ESP_OK) return ESP_FAIL;
+        off += chunk;
+        src += chunk;
+        len -= chunk;
     }
-    out[n] = 0;
+    return ESP_OK;
+}
+
+static esp_err_t raw_zero_bytes(uint32_t off, size_t len) {
+    static uint8_t zero[4096];
+    size_t sect = wl_sector_size(s_wl);
+    if (sect > sizeof zero || (sect & (sect - 1)) != 0) return ESP_ERR_INVALID_SIZE;
+
+    while (len > 0) {
+        if ((off & (sect - 1)) == 0 && len >= sect) {
+            if (wl_erase_range(s_wl, off, sect) != ESP_OK) return ESP_FAIL;
+            if (wl_write(s_wl, off, zero, sect) != ESP_OK) return ESP_FAIL;
+            off += sect;
+            len -= sect;
+            continue;
+        }
+
+        size_t align = sect - (off & (sect - 1));
+        size_t n = len < align ? len : align;
+        esp_err_t err = raw_write_bytes(off, zero, n);
+        if (err != ESP_OK) return err;
+        off += n;
+        len -= n;
+    }
+    return ESP_OK;
+}
+
+static bool raw_fat_mount_info(raw_fat_info_t *fi, char *why, size_t whysz) {
+    uint8_t bpb[64];
+    if (raw_read_bytes(0, bpb, sizeof bpb) != ESP_OK) {
+        snprintf(why, whysz, "boot read failed");
+        return false;
+    }
+    if (bpb[510 % sizeof bpb] == 0) {
+        // The signature is outside this small BPB read when bytes/sector > 512;
+        // validate below after parsing the sector size.
+    }
+    memset(fi, 0, sizeof *fi);
+    fi->bps = le16(bpb + 11);
+    fi->spc = bpb[13];
+    uint16_t reserved = le16(bpb + 14);
+    fi->fats = bpb[16];
+    fi->root_entries = le16(bpb + 17);
+    uint16_t total16 = le16(bpb + 19);
+    uint16_t spf16 = le16(bpb + 22);
+    uint32_t total32 = le32(bpb + 32);
+    if (fi->bps == 0 || fi->spc == 0 || fi->fats == 0 || reserved == 0 || spf16 == 0) {
+        snprintf(why, whysz, "bad bpb bps=%u spc=%u fats=%u reserved=%u spf=%u",
+                 fi->bps, fi->spc, fi->fats, reserved, spf16);
+        return false;
+    }
+    if (fi->bps > 4096 || (fi->bps & (fi->bps - 1)) != 0) {
+        snprintf(why, whysz, "bad sector size %u", fi->bps);
+        return false;
+    }
+    fi->total_sectors = total16 ? total16 : total32;
+    fi->sectors_per_fat = spf16;
+    fi->fat_start = (uint32_t)reserved * fi->bps;
+    fi->root_start = (uint32_t)(reserved + fi->fats * fi->sectors_per_fat) * fi->bps;
+    fi->root_bytes = (uint32_t)fi->root_entries * 32U;
+    uint32_t root_sectors = (fi->root_bytes + fi->bps - 1) / fi->bps;
+    fi->data_start = (uint32_t)(reserved + fi->fats * fi->sectors_per_fat + root_sectors) * fi->bps;
+    uint32_t data_sectors = fi->total_sectors - (reserved + fi->fats * fi->sectors_per_fat + root_sectors);
+    uint32_t clusters = data_sectors / fi->spc;
+    fi->fat12 = clusters < 4085;
+
+    uint8_t sig[2];
+    if (raw_read_bytes(510, sig, sizeof sig) != ESP_OK) {
+        snprintf(why, whysz, "signature read failed bps=%u", fi->bps);
+        return false;
+    }
+    if (sig[0] != 0x55 || sig[1] != 0xAA) {
+        snprintf(why, whysz, "bad signature %02x %02x bps=%u", sig[0], sig[1], fi->bps);
+        return false;
+    }
     return true;
 }
 
-static esp_err_t h_fs_get(httpd_req_t *req) {
-    char path[256];
-    if (!resolve_fs_path(req->uri, path, sizeof path))
-        return send_text(req, "400 Bad Request", "text/plain", "bad path\n");
+static bool raw_fat_next_cluster(const raw_fat_info_t *fi, uint16_t cluster, uint16_t *next) {
+    if (cluster < 2) return false;
+    if (fi->fat12) {
+        uint32_t off = fi->fat_start + cluster + (cluster / 2);
+        uint8_t pair[2];
+        if (raw_read_bytes(off, pair, sizeof pair) != ESP_OK) return false;
+        uint16_t v = (uint16_t)pair[0] | ((uint16_t)pair[1] << 8);
+        *next = (cluster & 1) ? (v >> 4) : (v & 0x0FFF);
+    } else {
+        uint8_t pair[2];
+        if (raw_read_bytes(fi->fat_start + (uint32_t)cluster * 2U, pair, sizeof pair) != ESP_OK) return false;
+        *next = le16(pair);
+    }
+    return true;
+}
 
-    if (lock_for_dongle() != ESP_OK)
-        return send_text(req, "503 Service Unavailable", "text/plain", "lock failed\n");
+static bool raw_fat_find_file(const raw_fat_info_t *fi, const char name83[11], uint16_t *cluster, uint32_t *size) {
+    uint8_t ent[32];
+    for (uint32_t off = 0; off < fi->root_bytes; off += 32) {
+        if (raw_read_bytes(fi->root_start + off, ent, sizeof ent) != ESP_OK) return false;
+        if (ent[0] == 0x00) break;
+        if (ent[0] == 0xE5) continue;
+        uint8_t attr = ent[11];
+        if (attr == 0x0F || (attr & 0x18)) continue; // LFN, volume label, dirs
+        if (!memcmp(ent, name83, 11)) {
+            *cluster = le16(ent + 26);
+            *size = le32(ent + 28);
+            return true;
+        }
+    }
+    return false;
+}
 
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        unlock_from_dongle();
+static esp_err_t h_fs_get_raw_host(httpd_req_t *req) {
+    char name83[11];
+    if (!uri_to_83_name(req->uri, name83))
+        return send_text(req, "400 Bad Request", "text/plain", "bad 8.3 path\n");
+
+    raw_http_read_set(true);
+    wait_for_msc_idle();
+
+    raw_fat_info_t fi;
+    char why[96];
+    if (!raw_fat_mount_info(&fi, why, sizeof why)) {
+        raw_http_read_set(false);
+        char rsp[128];
+        snprintf(rsp, sizeof rsp, "raw FAT parse failed: %s\n", why);
+        return send_text(req, "500 Internal Server Error", "text/plain", rsp);
+    }
+
+    uint16_t cluster = 0;
+    uint32_t remaining = 0;
+    if (!raw_fat_find_file(&fi, name83, &cluster, &remaining)) {
+        raw_http_read_set(false);
         return send_text(req, "404 Not Found", "text/plain", "no such file\n");
     }
 
@@ -298,82 +719,126 @@ static esp_err_t h_fs_get(httpd_req_t *req) {
     httpd_resp_set_type(req, "application/octet-stream");
     httpd_resp_set_hdr(req, "Connection", "close");
 
-    char buf[1024];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
-        if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) break;
+    uint8_t buf[1024];
+    bool ok = true;
+    while (remaining > 0 && cluster >= 2) {
+        uint32_t cluster_bytes = (uint32_t)fi.spc * fi.bps;
+        uint32_t base = fi.data_start + (uint32_t)(cluster - 2) * cluster_bytes;
+        uint32_t in_cluster = remaining < cluster_bytes ? remaining : cluster_bytes;
+        for (uint32_t pos = 0; pos < in_cluster; ) {
+            uint32_t n = in_cluster - pos;
+            if (n > sizeof buf) n = sizeof buf;
+            if (raw_read_bytes(base + pos, buf, n) != ESP_OK ||
+                httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) {
+                ok = false;
+                break;
+            }
+            pos += n;
+            remaining -= n;
+        }
+        if (!ok || remaining == 0) break;
+        uint16_t next = 0;
+        if (!raw_fat_next_cluster(&fi, cluster, &next)) {
+            ok = false;
+            break;
+        }
+        if (fi.fat12 ? (next >= 0x0FF8) : (next >= 0xFFF8)) break;
+        cluster = next;
     }
-    fclose(f);
+    raw_http_read_set(false);
     httpd_resp_send_chunk(req, nullptr, 0);
-    unlock_from_dongle();
-    return ESP_OK;
+    return ok ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t h_fs_get(httpd_req_t *req) {
+    char name83[11];
+    if (!uri_to_83_name(req->uri, name83))
+        return send_text(req, "400 Bad Request", "text/plain", "bad path\n");
+
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(HTTP_DISK_LOCK_MS)) != pdTRUE)
+        return send_text(req, "503 Service Unavailable", "text/plain", "lock failed\n");
+    esp_err_t raw_err = h_fs_get_raw_host(req);
+    xSemaphoreGive(s_lock);
+    return raw_err;
 }
 
 static esp_err_t h_fs_put(httpd_req_t *req) {
-    char path[256];
-    if (!resolve_fs_path(req->uri, path, sizeof path))
+    char name83[11];
+    if (!uri_to_83_name(req->uri, name83))
         return send_text(req, "400 Bad Request", "text/plain", "bad path\n");
 
-    if (lock_for_dongle() != ESP_OK)
-        return send_text(req, "503 Service Unavailable", "text/plain", "lock failed\n");
-
-    FILE *f = fopen(path, "wb");
-    if (!f) {
-        unlock_from_dongle();
-        return send_text(req, "500 Internal Server Error", "text/plain", "fopen failed\n");
-    }
-
-    char buf[1024];
-    int remaining = req->content_len;
-    int got_total = 0;
-    while (remaining > 0) {
-        int want = remaining > (int)sizeof buf ? (int)sizeof buf : remaining;
-        int r = httpd_req_recv(req, buf, want);
-        if (r <= 0) {
-            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
-            break;
-        }
-        if (fwrite(buf, 1, r, f) != (size_t)r) {
-            fclose(f);
-            unlock_from_dongle();
-            return send_text(req, "500 Internal Server Error", "text/plain", "fwrite failed\n");
-        }
-        got_total += r;
-        remaining -= r;
-    }
-    fflush(f);
-    fsync(fileno(f));            // FATFS f_sync via the VFS layer -- forces
-                                 // the dir entry + FAT chain out to wear_levelling
-    fclose(f);
-    unlock_from_dongle();
-
-    char rsp[96];
-    snprintf(rsp, sizeof rsp, "wrote %d bytes\n", got_total);
-    return send_text(req, "200 OK", "text/plain", rsp);
+    return send_text(req, "409 Conflict", "text/plain", "raw DOS FAT write not implemented in this firmware\n");
 }
 
 static esp_err_t h_fs_delete(httpd_req_t *req) {
-    char path[256];
-    if (!resolve_fs_path(req->uri, path, sizeof path))
+    char name83[11];
+    if (!uri_to_83_name(req->uri, name83))
         return send_text(req, "400 Bad Request", "text/plain", "bad path\n");
-    if (lock_for_dongle() != ESP_OK)
-        return send_text(req, "503 Service Unavailable", "text/plain", "lock failed\n");
-    int rc = unlink(path);
-    unlock_from_dongle();
-    return send_text(req, rc == 0 ? "200 OK" : "404 Not Found",
-                     "text/plain", rc == 0 ? "deleted\n" : "no such file\n");
+    return send_text(req, "409 Conflict", "text/plain", "raw DOS FAT delete not implemented in this firmware\n");
 }
 
-static esp_err_t h_eject(httpd_req_t *req) {
-    s_msc.mediaPresent(false);
-    s_msc_present = false;
-    return send_text(req, "200 OK", "text/plain", "ejected\n");
+static esp_err_t h_owner_device(httpd_req_t *req) {
+    esp_err_t err = set_owner(DONGLE_DISK_OWNER_DEVICE);
+    if (err != ESP_OK)
+        return send_text(req, "503 Service Unavailable", "text/plain", "could not take disk for device\n");
+    return send_text(req, "200 OK", "text/plain", "mode=device-write; MSC medium not ready\n");
 }
 
-static esp_err_t h_present(httpd_req_t *req) {
-    s_msc.mediaPresent(true);
-    s_msc_present = true;
-    return send_text(req, "200 OK", "text/plain", "presented\n");
+static esp_err_t h_owner_usb(httpd_req_t *req) {
+    esp_err_t err = set_owner(DONGLE_DISK_OWNER_USB);
+    if (err != ESP_OK)
+        return send_text(req, "503 Service Unavailable", "text/plain", "could not present disk to usb\n");
+    return send_text(req, "200 OK", "text/plain", "mode=host-write; MSC medium ready and writable\n");
+}
+
+static void format_task(void *arg) {
+    (void)arg;
+    bool ok = dongle_disk_format();
+    s_format_ok = ok;
+    s_format_running = false;
+    vTaskDelete(nullptr);
+}
+
+static esp_err_t h_format(httpd_req_t *req) {
+    portENTER_CRITICAL(&s_io_mux);
+    bool busy = s_format_running;
+    if (!busy) {
+        s_format_running = true;
+        s_format_ok = false;
+    }
+    portEXIT_CRITICAL(&s_io_mux);
+
+    if (busy)
+        return send_text(req, "409 Conflict", "text/plain", "format already running\n");
+
+    if (xTaskCreate(format_task, "disk_format", 4096, nullptr, 1, nullptr) != pdPASS) {
+        s_format_running = false;
+        return send_text(req, "503 Service Unavailable", "text/plain", "could not start format task\n");
+    }
+    return send_text(req, "202 Accepted", "text/plain", "format started; poll /status\n");
+}
+
+static esp_err_t h_type(httpd_req_t *req) {
+    // Body is the typing string (see dongle_kbd.h DSL). Use Content-Length;
+    // chunked encoding isn't supported here.
+    int total = req->content_len;
+    if (total <= 0 || total > 4096)
+        return send_text(req, "400 Bad Request", "text/plain", "need Content-Length 1..4096\n");
+    char *body = (char *)malloc(total + 1);
+    if (!body) return send_text(req, "500 Internal Server Error", "text/plain", "oom\n");
+    int got = 0;
+    while (got < total) {
+        int r = httpd_req_recv(req, body + got, total - got);
+        if (r <= 0) { if (r == HTTPD_SOCK_ERR_TIMEOUT) continue; break; }
+        got += r;
+    }
+    body[got] = 0;
+    int n = dongle_kbd_type(body, got);
+    free(body);
+    if (n < 0) return send_text(req, "400 Bad Request", "text/plain", "parse error\n");
+    char rsp[64];
+    snprintf(rsp, sizeof rsp, "typed %d bytes\n", n);
+    return send_text(req, "200 OK", "text/plain", rsp);
 }
 
 static esp_err_t h_reset(httpd_req_t *req) {
@@ -390,6 +855,8 @@ static void httpd_start_once(void) {
     cfg.stack_size = 8192;
     cfg.max_uri_handlers = 16;
     cfg.lru_purge_enable = true;
+    cfg.recv_wait_timeout = 2;
+    cfg.send_wait_timeout = 2;
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         DBG("[disk] httpd_start failed\n");
         s_httpd = nullptr;
@@ -402,8 +869,14 @@ static void httpd_start_once(void) {
         { "/fs/*",      HTTP_GET,    h_fs_get,    nullptr },
         { "/fs/*",      HTTP_PUT,    h_fs_put,    nullptr },
         { "/fs/*",      HTTP_DELETE, h_fs_delete, nullptr },
-        { "/eject",     HTTP_POST,   h_eject,     nullptr },
-        { "/present",   HTTP_POST,   h_present,   nullptr },
+        { "/device-write", HTTP_POST, h_owner_device, nullptr },
+        { "/host-write", HTTP_POST,    h_owner_usb,    nullptr },
+        { "/owner/device", HTTP_POST, h_owner_device, nullptr },
+        { "/owner/usb", HTTP_POST,    h_owner_usb,    nullptr },
+        { "/format",    HTTP_POST,   h_format,      nullptr },
+        { "/eject",     HTTP_POST,   h_owner_device, nullptr },
+        { "/present",   HTTP_POST,   h_owner_usb,    nullptr },
+        { "/type",      HTTP_POST,   h_type,      nullptr },
         { "/reset",     HTTP_POST,   h_reset,     nullptr },
     };
     for (auto &r : routes) httpd_register_uri_handler(s_httpd, &r);
@@ -444,29 +917,6 @@ void dongle_disk_init(void) {
         return;
     }
 
-    // First boot: format the partition if it has no valid FAT. Easiest way
-    // is to mount with format_if_mount_failed=true, then unmount and grab
-    // the raw WL handle.
-    esp_vfs_fat_mount_config_t cfg = {};
-    cfg.format_if_mount_failed = true;
-    cfg.max_files = 4;
-    cfg.allocation_unit_size = 0;
-    cfg.disk_status_check_enable = false;
-    cfg.use_one_fat = false;
-    wl_handle_t wl;
-    esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(MOUNT_POINT, FAT_PART_LABEL, &cfg, &wl);
-    if (err != ESP_OK) {
-        DBG("[disk] initial FAT mount failed: 0x%x\n", err);
-        return;
-    }
-    // Set the volume label so the host sees "DOSONGLE" instead of "NO NAME".
-    // FF_STR_VOLUME_ID=0 in this build, so no "label:" prefix -- f_setlabel
-    // targets the currently-mounted FATFS drive (the only one we have).
-    {
-        FRESULT fr = f_setlabel(VOLUME_LABEL);
-        if (fr != FR_OK) DBG("[disk] f_setlabel: %d\n", fr);
-    }
-    esp_vfs_fat_spiflash_unmount_rw_wl(MOUNT_POINT, wl);
     if (wl_mount(s_part, &s_wl) != ESP_OK) {
         DBG("[disk] wl_mount failed\n");
         return;
@@ -484,6 +934,8 @@ void dongle_disk_init(void) {
     s_msc.isWritable(true);
     s_msc.begin(s_block_count, s_block_size);
     s_msc_present = true;
+    s_msc_writable = true;
+    owner_set_device_side(false);
 
     WiFi.onEvent(wifi_event_cb);
     // If WiFi happens to already be up by the time we get here, kick it
@@ -502,6 +954,8 @@ void dongle_disk_get_status(dongle_disk_status_t *out) {
     if (!out) return;
     out->mounted        = s_dongle_owns;
     out->msc_present    = s_msc_present;
+    out->msc_writable   = s_msc_writable;
+    out->owner          = dongle_disk_get_owner();
     out->partition_bytes = s_block_count * s_block_size;
     out->used_bytes     = 0;            // not cheap to compute -- skip for AT
     out->http_ready     = s_httpd != nullptr;
