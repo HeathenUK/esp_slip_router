@@ -80,11 +80,13 @@ static inline void pumpMtcp( )
 static void cleanup( int rc )
 {
     if ( OutFile ) { fclose( OutFile ); OutFile = NULL; }
-    if ( Sock ) {
-        Sock->close( );
-        TcpSocketMgr::freeSocket( Sock );
-        Sock = NULL;
-    }
+    /* Don't call Sock->close() / TcpSocketMgr::freeSocket() here -- mTCP's
+     * Utils::endStack() handles socket teardown internally, and explicitly
+     * freeing a socket while its TCP state machine still has pending
+     * sends/receives corrupts the heap allocator (the classic
+     * "heap is corrupted" CRT message you get on exit). Stock HTGET's
+     * shutdown is just endStack + exit; we mirror that. */
+    Sock = NULL;
     Utils::endStack( );
     exit( rc );
 }

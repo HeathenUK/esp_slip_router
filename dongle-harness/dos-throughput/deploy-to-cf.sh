@@ -15,6 +15,7 @@ cp $SRC/timer.exe     $DEST/TIMER.EXE
 cp $SRC/atq.exe       $DEST/ATQ.EXE
 cp $SRC/magicout.exe  $DEST/MAGICOUT.EXE
 cp $SRC/../mtcpget-src/MTCPGET.EXE $DEST/MTCPGET.EXE
+cp $SRC/../mtcpget-src/PROFILE.EXE $DEST/PROFILE.EXE
 cp $HOME/FOSSLIP/FOSSLIP.EXE $DEST/FOSSLIP.EXE
 cp $HOME/Downloads/bnu202/BNU.COM $DEST/BNU.COM
 # scripts + configs (already CRLF / CR-only in cf-deploy/)
