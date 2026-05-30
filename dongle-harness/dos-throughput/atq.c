@@ -133,12 +133,23 @@ int main(int argc, char **argv)
     }
     cmd[cmdlen] = '\0';
 
-    /* drain any stale RX (e.g. from a prior incomplete reply) */
+    /* Flush whatever line the AT engine was partway through assembling.
+     * Critical after MAGICOUT in MODEM mode: those 0xC0 / "MODE=MODEM" bytes
+     * sit in the AT input buffer until the next CR commits the line, so an
+     * ATQ command right after a MAGICOUT would prepend that garbage to our
+     * command and parse as one invalid line. A bare CR triggers an ERROR
+     * (or OK) reply that we then drain along with the RX. */
+    send_byte((unsigned)port, '\r');
     {
         unsigned long t = bios_ticks();
-        while ((bios_ticks() - t) < 2UL) {
+        unsigned long lastByte = t;
+        for (;;) {
             c = recv_byte_nowait((unsigned)port);
-            if (c < 0) dos_yield();
+            if (c >= 0) lastByte = bios_ticks();
+            else        dos_yield();
+            /* ~200 ms of silence after last drained byte, or 1 s cap */
+            if ((bios_ticks() - lastByte) > 3UL) break;
+            if ((bios_ticks() - t) > 18UL) break;
         }
     }
 
