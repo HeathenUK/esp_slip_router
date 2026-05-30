@@ -27,16 +27,38 @@ extern "C" {
 // rationale as modem.cpp's cdc_write. SLIP-mode lwIP traffic was hitting the
 // gated Serial.write and being silently dropped on hosts that don't propagate
 // DTR (DOSBox directserial, anything that didn't pass SET_CONTROL_LINE_STATE).
+//
+// THROUGHPUT NOTE: previous version slept delay(1) (one FreeRTOS tick) per
+// FIFO refill. For a 1500-byte SLIP frame on a 64-byte CDC TX FIFO that's
+// 23+ ms of pure sleep, all of it inside lwIP's tcpip thread, blocking
+// every other lwIP job (incoming WiFi packets, NAPT translations, etc.)
+// while we wait for the host to drain a USB bulk-IN packet. Now we yield
+// to TinyUSB only when FIFO is actually full, via taskYIELD(), so the USB
+// task gets cycles immediately without paying a 1ms minimum.
+extern "C" {
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+}
 static size_t cdc_write_raw(const uint8_t *buf, size_t n) {
     size_t total = 0;
     uint32_t start = millis();
     while (total < n) {
-        size_t w = tud_cdc_n_write(0, buf + total, n - total);
-        total += w;
-        if (total < n) {
+        size_t avail = tud_cdc_n_write_available(0);
+        if (avail) {
+            size_t want = n - total;
+            if (want > avail) want = avail;
+            size_t w = tud_cdc_n_write(0, buf + total, want);
+            total += w;
+            // Push a partial-FIFO worth out as soon as we have something,
+            // so the USB IN endpoint sees a packet to send rather than
+            // waiting for the FIFO to fill to 64 bytes naturally.
+            if (total < n) tud_cdc_n_write_flush(0);
+        } else {
+            // FIFO full -- let TinyUSB run and drain. taskYIELD wakes
+            // other tasks but doesn't burn a full FreeRTOS tick.
             tud_cdc_n_write_flush(0);
+            taskYIELD();
             if (millis() - start > 500U) break;
-            delay(1);
         }
     }
     tud_cdc_n_write_flush(0);
