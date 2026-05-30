@@ -8,6 +8,9 @@
 extern "C" {
 #include "esp32-hal-tinyusb.h"   /* tud_cdc_n_write / tud_cdc_n_write_flush */
 #include "esp_ota_ops.h"          /* OTA partition write API (USB-CDC OTA) */
+#include "esp_system.h"           /* esp_restart() for AT$RESET */
+#include "lwip/netif.h"           /* AT$NETIF dump */
+#include "ping/ping_sock.h"       /* AT$PING -- WiFi outbound smoke test */
 }
 
 // Debug to the hardware UART only — USB CDC is the data link.
@@ -164,7 +167,12 @@ static void r_error()     { cdc_print(verbose ? "\r\nERROR\r\n"      : "4\r\n");
 static void r_connect()   { cdc_print(verbose ? "\r\nCONNECT\r\n"    : "1\r\n"); }
 static void r_nocarrier() { cdc_print(verbose ? "\r\nNO CARRIER\r\n" : "3\r\n"); }
 
-void modem_begin() {}
+void modem_begin() {
+    // Restore AT&W'd settings from NVS (defaults to all-on if never saved).
+    bool e, v, t;
+    wifi_load_modem_settings(&e, &v, &t);
+    echo = e; verbose = v; telnet = t;
+}
 
 void modem_enter() {
     cmdlen = 0; plus_count = 0; tstate = T_DATA;
@@ -350,14 +358,170 @@ static void handle_dollar(char *s) {
         delay(150);                          // let the bytes drain to host
         usb_persist_restart(RESTART_BOOTLOADER);
         /* unreachable — esp_restart() above */
+    } else if (!strcmp(key, "MODE")) {
+        // AT$MODE?  -- report current personality
+        // AT$MODE=SLIP / AT$MODE=MODEM  -- switch (persists to NVS)
+        // Once switched to SLIP the modem AT engine stops being called; the
+        // device starts framing SLIP on the same CDC link. Reverse the switch
+        // by a long BOOT-button press (host-side AT is unreachable in SLIP).
+        const char *result = modem_set_personality(op == '=' ? val : NULL);
+        if (!result) { r_error(); return; }
+        cdc_print("\r\n"); cdc_print(result); cdc_print("\r\n");
+        r_ok();
+    } else if (!strcmp(key, "PING") && op == '=') {
+        // AT$PING=<ip> -- one ICMP echo from the dongle itself (not via SLIP).
+        // Smoke test for the WiFi-out path. If this works but the SLIP NAPT
+        // path doesn't, the bug is in forwarding, not in WiFi.
+        ip_addr_t target;
+        if (!ipaddr_aton(val, &target)) { r_error(); return; }
+        esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+        cfg.count = 1; cfg.timeout_ms = 2000; cfg.target_addr = target;
+        static volatile int s_ok, s_done;
+        s_ok = 0; s_done = 0;
+        esp_ping_callbacks_t cbs = {};
+        cbs.on_ping_success = [](esp_ping_handle_t, void *)  { s_ok = 1; };
+        cbs.on_ping_end     = [](esp_ping_handle_t, void *)  { s_done = 1; };
+        esp_ping_handle_t h;
+        if (esp_ping_new_session(&cfg, &cbs, &h) != ESP_OK) { r_error(); return; }
+        esp_ping_start(h);
+        uint32_t until = millis() + 3000;
+        while (!s_done && (int32_t)(millis() - until) < 0) delay(20);
+        esp_ping_delete_session(h);
+        cdc_print(s_ok ? "\r\nreply\r\n" : "\r\ntimeout\r\n");
+        s_ok ? r_ok() : r_error();
+    } else if (!strcmp(key, "NETIF")) {
+        // AT$NETIF -- dump every lwIP netif (admin/link state, addr, napt bit).
+        // Diagnostic for the SLIP->WiFi forwarding path. Note: in SLIP mode
+        // the AT engine isn't running, so this only reports the state seen
+        // from MODEM mode (slip_nif will read DN). Toggle in/out via AT$MODE
+        // to see SLIP-mode state would need a different path -- not built.
+        cdc_print("\r\n");
+        struct netif *n;
+        char line[160];
+        char a[20], nm[20], gw[20];
+        NETIF_FOREACH(n) {
+            ip4addr_ntoa_r(netif_ip4_addr(n),    a,  sizeof(a));
+            ip4addr_ntoa_r(netif_ip4_netmask(n), nm, sizeof(nm));
+            ip4addr_ntoa_r(netif_ip4_gw(n),      gw, sizeof(gw));
+            int is_default = (n == netif_default) ? 1 : 0;
+            snprintf(line, sizeof(line),
+                     "%c%c%d %s%s%s napt=%d %s/%s gw=%s\r\n",
+                     n->name[0], n->name[1], n->num,
+                     netif_is_up(n) ? "UP" : "DN",
+                     netif_is_link_up(n) ? "+L" : "-L",
+                     is_default ? " DEF" : "",
+                     n->napt, a, nm, gw);
+            cdc_print(line);
+        }
+        r_ok();
+    } else if (!strcmp(key, "RSSI")) {
+        // AT$RSSI? -- just the dBm of the current association, scriptable.
+        char b[32];
+        if (WiFi.status() == WL_CONNECTED) snprintf(b, sizeof(b), "\r\n%d\r\n", (int)WiFi.RSSI());
+        else                               snprintf(b, sizeof(b), "\r\nnoconn\r\n");
+        cdc_print(b); r_ok();
+    } else if (!strcmp(key, "STATS")) {
+        // AT$STATS  -- print SLIP byte/pkt counters (also valid in modem mode --
+        // they accumulate across both personalities). AT$STATS=0 clears.
+        if (op == '=' && val[0] == '0') {
+            modem_clear_slip_stats();
+            r_ok();
+        } else {
+            struct slip_stats s;
+            modem_get_slip_stats(&s);
+            char b[160];
+            snprintf(b, sizeof(b),
+                     "\r\nhost->net: %u pkts / %u bytes"
+                     "\r\nnet->host: %u pkts / %u bytes\r\n",
+                     (unsigned)s.pkts_in,  (unsigned)s.bytes_in,
+                     (unsigned)s.pkts_out, (unsigned)s.bytes_out);
+            cdc_print(b);
+            r_ok();
+        }
+    } else if (!strcmp(key, "RESET")) {
+        // AT$RESET -- software reboot. Differs from AT$BOOT (which jumps into the
+        // ROM bootloader for esptool) -- this just esp_restarts, which boots the
+        // currently-active OTA partition. Useful for "kick the firmware" without
+        // re-flashing.
+        cdc_print("\r\nRESETTING\r\n");
+        delay(150);
+        esp_restart();
+        /* unreachable */
+    } else if (!strcmp(key, "SCAN")) {
+        // AT$SCAN -- synchronous WiFi network scan. Blocks ~3-5s while scanning.
+        cdc_print("\r\nscanning...\r\n");
+        int n = WiFi.scanNetworks(false /*async*/, true /*show hidden*/);
+        if (n < 0) {
+            cdc_print("\r\nscan failed\r\n"); r_error(); return;
+        }
+        char b[120];
+        snprintf(b, sizeof(b), "\r\n%d networks:\r\n", n); cdc_print(b);
+        for (int i = 0; i < n; i++) {
+            // SSID | RSSI(dBm) | channel | encryption | BSSID
+            const char *enc = "open";
+            switch (WiFi.encryptionType(i)) {
+                case WIFI_AUTH_WEP:            enc = "WEP"; break;
+                case WIFI_AUTH_WPA_PSK:        enc = "WPA"; break;
+                case WIFI_AUTH_WPA2_PSK:       enc = "WPA2"; break;
+                case WIFI_AUTH_WPA_WPA2_PSK:   enc = "WPA/2"; break;
+                case WIFI_AUTH_WPA2_ENTERPRISE:enc = "WPA2-EAP"; break;
+                case WIFI_AUTH_WPA3_PSK:       enc = "WPA3"; break;
+                default: break;
+            }
+            snprintf(b, sizeof(b), "  %3d dBm  ch %2d  %-9s  %s  %s\r\n",
+                     (int)WiFi.RSSI(i), (int)WiFi.channel(i), enc,
+                     WiFi.BSSIDstr(i).c_str(), WiFi.SSID(i).c_str());
+            cdc_print(b);
+        }
+        WiFi.scanDelete();
+        r_ok();
     } else if (!strcmp(key, "HELP")) {
         cdc_print("\r\nAT$WIFI=<ssid>,<pw>  set both + connect (auto)\r\n"
                      "AT$SSID=<ssid>       set SSID  (auto-connects)\r\n"
                      "AT$PASS=<pw>         set pass  (auto-connects)\r\n"
                      "AT$WIFI              reconnect with stored creds\r\n"
                      "AT$WIFI?             status   AT$SSID?  AT$PASS?\r\n"
+                     "AT$MODE? / =SLIP|MODEM   personality   (NVS-persisted)\r\n"
+                     "AT$RSSI?             just the dBm value (scriptable)\r\n"
+                     "AT$SCAN              list WiFi networks (~3-5 s)\r\n"
+                     "AT$STATS  / =0       SLIP byte+pkt counters / clear\r\n"
+                     "AT$RESET             software reboot (esp_restart)\r\n"
                      "AT$OTASTART=<size>   USB-CDC OTA: stream <size> B fw.bin\r\n"
-                     "AT$BOOT              fallback: reboot into ROM bootloader\r\n");
+                     "AT$BOOT              fallback: reboot into ROM bootloader\r\n"
+                     "AT&V / AT&W / AT&F   view config / save E,V,N / factory reset\r\n");
+        r_ok();
+    } else {
+        r_error();
+    }
+}
+
+static void handle_ampersand(char *s) {
+    // AT&V -- view config.  AT&W -- save E/V/N to NVS.  AT&F -- factory defaults.
+    char c = (char)toupper((unsigned char)s[0]);
+    if (c == 'V') {
+        char b[220];
+        struct slip_stats st; modem_get_slip_stats(&st);
+        snprintf(b, sizeof(b),
+                 "\r\nATE%d  ATV%d  ATNET%d"
+                 "\r\nWiFi: %s @ %s  RSSI %d dBm"
+                 "\r\npeer: %s%s"
+                 "\r\nstats: h->n %u pkts/%u B   n->h %u pkts/%u B\r\n",
+                 echo?1:0, verbose?1:0, telnet?1:0,
+                 wifi_ssid()[0] ? wifi_ssid() : "(none)",
+                 WiFi.status()==WL_CONNECTED ? WiFi.localIP().toString().c_str() : "no ip",
+                 WiFi.status()==WL_CONNECTED ? (int)WiFi.RSSI() : 0,
+                 peer[0] ? peer : "(none)",
+                 online ? "  [online]" : "",
+                 (unsigned)st.pkts_in,  (unsigned)st.bytes_in,
+                 (unsigned)st.pkts_out, (unsigned)st.bytes_out);
+        cdc_print(b);
+        r_ok();
+    } else if (c == 'W') {
+        wifi_save_modem_settings(echo, verbose, telnet);
+        r_ok();
+    } else if (c == 'F') {
+        echo = true; verbose = true; telnet = true;
+        wifi_save_modem_settings(echo, verbose, telnet);
         r_ok();
     } else {
         r_error();
@@ -370,6 +534,7 @@ static void exec(char *line) {
     char *rest = line + 1;
     switch (c) {
         case '$': handle_dollar(rest); return;
+        case '&': handle_ampersand(rest); return;
         case 'D': dial(rest); return;
         case 'H': modem_leave(); r_ok(); return;
         case 'O': if (client.connected()) { online = true; r_connect(); }

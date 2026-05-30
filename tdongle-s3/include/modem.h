@@ -13,3 +13,12 @@ void modem_poll();           // pump USB<->TCP / parse AT; call each loop in mod
 
 bool modem_is_online();      // true while a call is connected and in data mode
 const char *modem_peer();    // "host:port" of the current/last call, or ""
+
+// AT$STATS / AT&V need access to the SLIP byte/pkt counters that live in main.cpp.
+struct slip_stats { uint32_t pkts_in, bytes_in, pkts_out, bytes_out; };
+void modem_get_slip_stats(struct slip_stats *s);
+void modem_clear_slip_stats();
+
+// AT$MODE host-side personality switch. NULL `want` = query only. Returns the
+// resulting mode name ("SLIP"/"MODEM") or NULL on bad arg.
+const char *modem_set_personality(const char *want);

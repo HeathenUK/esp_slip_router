@@ -19,6 +19,30 @@
 #include <Preferences.h>
 #include <string.h>
 
+extern "C" {
+#include "esp32-hal-tinyusb.h"   /* tud_cdc_n_write / tud_cdc_n_write_flush */
+}
+
+// Direct TinyUSB CDC write that bypasses USBCDC's `connected` gate -- same
+// rationale as modem.cpp's cdc_write. SLIP-mode lwIP traffic was hitting the
+// gated Serial.write and being silently dropped on hosts that don't propagate
+// DTR (DOSBox directserial, anything that didn't pass SET_CONTROL_LINE_STATE).
+static size_t cdc_write_raw(const uint8_t *buf, size_t n) {
+    size_t total = 0;
+    uint32_t start = millis();
+    while (total < n) {
+        size_t w = tud_cdc_n_write(0, buf + total, n - total);
+        total += w;
+        if (total < n) {
+            tud_cdc_n_write_flush(0);
+            if (millis() - start > 500U) break;
+            delay(1);
+        }
+    }
+    tud_cdc_n_write_flush(0);
+    return total;
+}
+
 #include "config.h"
 #include "display.h"
 #include "modem.h"
@@ -106,6 +130,19 @@ void wifi_reconnect() {
 
 void wifi_apply_soon() { g_wifi_apply_at = millis() + 2500; }
 
+// AT&W -- persist modem E/V/N flags. Stored as a single byte for compactness.
+void wifi_save_modem_settings(bool echo, bool verbose, bool telnet) {
+    uint8_t b = (echo ? 1 : 0) | (verbose ? 2 : 0) | (telnet ? 4 : 0);
+    g_prefs.putUChar("evn", b);
+}
+void wifi_load_modem_settings(bool *echo, bool *verbose, bool *telnet) {
+    // Default is all-on (echo=verbose=telnet=true), matching the boot defaults.
+    uint8_t b = g_prefs.getUChar("evn", 0x07);
+    *echo    = (b & 1) != 0;
+    *verbose = (b & 2) != 0;
+    *telnet  = (b & 4) != 0;
+}
+
 // ---------------------------------------------------------------------------
 // SLIP: outbound (lwIP -> SLIP-encode -> USB CDC). tcpip-thread context.
 // ---------------------------------------------------------------------------
@@ -113,6 +150,9 @@ static uint8_t txbuf[2 * (SLIP_MTU + 64) + 2];
 
 static err_t slip_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ipaddr) {
     (void)nif; (void)ipaddr;
+    // Belt-and-braces: even if apply_mode missed bringing the netif fully down,
+    // we MUST NOT emit SLIP-framed bytes onto a modem CDC stream. Quietly drop.
+    if (g_mode != MODE_SLIP) return ERR_OK;
     size_t n = 0;
     txbuf[n++] = SLIP_END;
     for (struct pbuf *q = p; q != NULL; q = q->next) {
@@ -126,7 +166,8 @@ static err_t slip_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ip
         }
     }
     txbuf[n++] = SLIP_END;
-    Serial.write(txbuf, n);
+    // cdc_write_raw bypasses USBCDC's `connected` gate (same reason as modem.cpp).
+    cdc_write_raw(txbuf, n);
     pkts_to_host++;
     bytes_to_host += p->tot_len;   // count IP payload, not SLIP-encoded size
     return ERR_OK;
@@ -159,9 +200,29 @@ static uint8_t rxbuf[SLIP_MTU + 64];
 static size_t rxlen = 0;
 static bool in_esc = false;
 
+static void apply_mode();    // fwd-decl: slip_deliver's magic-frame uses it
+
 static void slip_deliver(const uint8_t *data, size_t len) {
     if (len == 0) return;
-    struct pbuf *p = pbuf_alloc(PBUF_RAW, len, PBUF_POOL);
+    // SLIP-mode escape hatch: a frame whose payload is exactly the ASCII
+    // sentinel below flips the personality back to MODEM. No valid IPv4
+    // packet matches (first byte would have to be 'M' = 0x4D, version nibble
+    // 4 -- but the rest of the header bytes wouldn't be ASCII). Lets a host
+    // get out of SLIP without holding BOOT or pulling power.
+    static const char MAGIC[] = "MODE=MODEM";
+    if (len == sizeof(MAGIC) - 1 && memcmp(data, MAGIC, sizeof(MAGIC) - 1) == 0) {
+        DBG("[slip] magic escape frame -> MODEM\n");
+        g_mode = MODE_MODEM;
+        g_prefs.putUChar("mode", (uint8_t)g_mode);
+        apply_mode();
+        return;
+    }
+    // PBUF_IP reserves headroom for an L2 header below the IP layer. Critical
+    // when the packet is FORWARDED to an Ethernet netif (WiFi STA via NAPT):
+    // etharp_output prepends 14 bytes of L2 via pbuf_header(-14), which fails
+    // silently on PBUF_RAW (zero headroom). Symptom: SLIP local-delivery works
+    // but anything-via-NAPT vanishes without a trace.
+    struct pbuf *p = pbuf_alloc(PBUF_IP, len, PBUF_POOL);
     if (!p) { DBG("[slip] pbuf alloc fail (%u)\n", (unsigned)len); return; }
     pbuf_take(p, data, len);
     if (slip_nif.input(p, &slip_nif) != ERR_OK) {
@@ -173,7 +234,11 @@ static void slip_deliver(const uint8_t *data, size_t len) {
 }
 
 static void slip_poll() {
-    while (Serial.available() > 0) {
+    // Bound the drain so a sustained host flood can't starve loop() (button
+    // polling, WiFi events, display refresh). 1024 bytes/iter @ ~1kHz loop
+    // sustains > 1 MB/s of SLIP throughput -- well above USB CDC line rate.
+    int budget = 1024;
+    while (budget-- > 0 && Serial.available() > 0) {
         int ci = Serial.read(); if (ci < 0) break;
         uint8_t c = (uint8_t)ci;
         if (in_esc) {
@@ -192,27 +257,28 @@ static void slip_poll() {
     }
 }
 
-// ---- NAPT on the WiFi STA interface ----
+// ---- NAPT on the SLIP (internal) netif ----
+// The ESP-IDF NAPT API is inverted vs typical NAT: ip_napt_forward() only
+// translates when the INPUT netif has napt=1, then rewrites source to the
+// OUTPUT netif's address. So napt belongs on the *internal* side (where
+// our clients live), not on the WAN-side STA. Symptom of getting this
+// backwards: SLIP packets to public IPs vanish silently — forwarded with
+// source 192.168.240.2 unchanged, dropped by the upstream router.
 static void enable_napt() {
-    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (!sta) { DBG("[napt] no STA netif handle\n"); return; }
-    struct netif *lwip_sta = (struct netif *)esp_netif_get_netif_impl(sta);
-    if (!lwip_sta) { DBG("[napt] no lwip netif\n"); return; }
     LOCK_TCPIP_CORE();
-    ip_napt_enable_netif(lwip_sta, 1);
+    int ok = ip_napt_enable_netif(&slip_nif, 1);
     UNLOCK_TCPIP_CORE();
-    napt_enabled = true;
-    DBG("[napt] enabled on STA\n");
+    napt_enabled = (ok == 1);
+    DBG("[napt] enable on SLIP -> %s\n", ok ? "ok" : "FAILED");
 }
 
 static void on_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_STA_GOT_IP:
             DBG("[wifi] got IP %s\n", WiFi.localIP().toString().c_str());
-            enable_napt();
+            // NAPT lives on the SLIP netif (enabled at boot) -- nothing to do here.
             break;
         case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-            napt_enabled = false;
             if (!g_wifi_reconfig) {       // a real drop, not an intentional reconfigure
                 DBG("[wifi] disconnected, reconnecting\n");
                 WiFi.reconnect();
@@ -226,11 +292,20 @@ static void on_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info) {
 static void apply_mode() {
     if (g_mode == MODE_SLIP) {
         modem_leave();
-        LOCK_TCPIP_CORE(); netif_set_link_up(&slip_nif); UNLOCK_TCPIP_CORE();
+        LOCK_TCPIP_CORE();
+        netif_set_up(&slip_nif);       // admin up + link up so lwIP routes here
+        netif_set_link_up(&slip_nif);
+        UNLOCK_TCPIP_CORE();
         DBG("[mode] SLIP\n");
     } else {
-        // Drop the SLIP link so lwIP never emits SLIP bytes onto a modem stream.
-        LOCK_TCPIP_CORE(); netif_set_link_down(&slip_nif); UNLOCK_TCPIP_CORE();
+        // Take the SLIP netif fully out of lwIP routing in modem mode -- both
+        // link_down and admin_down. slip_output also has a g_mode check as
+        // defense in depth, but a properly down netif means lwIP never picks
+        // it for output in the first place.
+        LOCK_TCPIP_CORE();
+        netif_set_link_down(&slip_nif);
+        netif_set_down(&slip_nif);
+        UNLOCK_TCPIP_CORE();
         modem_enter();
         DBG("[mode] MODEM\n");
     }
@@ -242,11 +317,46 @@ static void toggle_mode() {
     apply_mode();
 }
 
+// AT$MODE=SLIP|MODEM -- host-side personality switch (vs the 1.5s BOOT-button
+// long-press). Persists to NVS just like toggle_mode does. Returns the new
+// mode name. AT$MODE? reports the current one.
+const char *modem_set_personality(const char *want) {
+    LinkMode requested = g_mode;
+    if (want) {
+        if (!strcasecmp(want, "SLIP"))       requested = MODE_SLIP;
+        else if (!strcasecmp(want, "MODEM")) requested = MODE_MODEM;
+        else                                  return NULL;   // bad arg
+    }
+    if (requested != g_mode) {
+        g_mode = requested;
+        g_prefs.putUChar("mode", (uint8_t)g_mode);
+        apply_mode();
+    }
+    return g_mode == MODE_SLIP ? "SLIP" : "MODEM";
+}
+
+// ---- SLIP stats exposed for AT$STATS / AT&V ----
+void modem_get_slip_stats(struct slip_stats *s) {
+    s->pkts_in   = pkts_from_host;
+    s->bytes_in  = bytes_from_host;
+    s->pkts_out  = pkts_to_host;
+    s->bytes_out = bytes_to_host;
+}
+void modem_clear_slip_stats() {
+    pkts_from_host = pkts_to_host = 0;
+    bytes_from_host = bytes_to_host = 0;
+}
+
 static void poll_button() {
     static bool prev = false;
     static uint32_t t0 = 0;
     static bool handled = false;
+    static bool armed = false;        // require release-from-boot before any toggle
     bool down = (digitalRead(BTN_PIN) == LOW);
+    if (!armed) {                     // user might be holding BOOT from power-on
+        if (!down) armed = true;       // released -> arm
+        prev = down; return;
+    }
     if (down && !prev) { t0 = millis(); handled = false; }
     if (down && !handled && (millis() - t0) > 1500) { toggle_mode(); handled = true; }
     prev = down;
@@ -286,6 +396,7 @@ void setup() {
 
     display_init();
     slip_start();
+    enable_napt();   // SLIP netif is up now; flip the napt bit once at boot
     modem_begin();
 
     g_mode = (LinkMode)g_prefs.getUChar("mode", MODE_MODEM);  // default: modem
