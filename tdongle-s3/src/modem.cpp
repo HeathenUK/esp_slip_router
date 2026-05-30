@@ -192,13 +192,14 @@ const char *modem_peer() { return peer; }
 
 static void dial(const char *a) {
     while (*a == ' ' || *a == '\t') a++;
-    // Optional single dial-type modifier (T/P/R) — only strip it when it's
-    // clearly standalone (followed by space/digit/end), so a hostname that
-    // starts with t/p/r (e.g. "telehack.com") isn't truncated.
-    if (*a == 'T' || *a == 't' || *a == 'P' || *a == 'p' || *a == 'R' || *a == 'r') {
-        char n = a[1];
-        if (n == ' ' || n == '\t' || n == 0 || isdigit((unsigned char)n)) a++;
-    }
+    // Hayes dial-type modifier (T=tone, P=pulse, R=originate-only): the
+    // standard says one optional letter right after the D. Strip
+    // unconditionally -- a hostname that genuinely starts with T/P/R can
+    // be dialled as "ATD<host>" (no modifier), but a hostname *after* a
+    // modifier ("ATDTipv4.download...") was being mis-parsed as
+    // "Tipv4.download..." which then NXDOMAIN'd into NO CARRIER.
+    if (*a == 'T' || *a == 't' || *a == 'P' || *a == 'p' || *a == 'R' || *a == 'r')
+        a++;
     while (*a == ' ' || *a == '\t') a++;
     if (*a == 0) { r_error(); return; }
 
@@ -217,7 +218,24 @@ static void dial(const char *a) {
 
     if (WiFi.status() != WL_CONNECTED) { r_nocarrier(); return; }
     DBG("[modem] dial %s:%u\n", host, port);
-    if (client.connect(host, port)) {
+    // 3s default is too short -- DNS over a poor WiFi link via NAPT, plus
+    // the TCP handshake, easily exceeds it. 20s matches a typical dial-up
+    // modem's "dial then timeout" behaviour.
+    client.setConnectionTimeout(20000);
+
+    // Resolve manually then connect by IP -- cleaner error semantics than
+    // letting NetworkClient::connect(host,...) eat both failure modes.
+    IPAddress resolved;
+    if (!resolved.fromString(host)) {
+        if (WiFi.hostByName(host, resolved) != 1) {
+            DBG("[modem] dial DNS-fail '%s'\n", host);
+            peer[0] = 0;
+            r_nocarrier();
+            return;
+        }
+        DBG("[modem] dial %s -> %s\n", host, resolved.toString().c_str());
+    }
+    if (client.connect(resolved, port)) {
         client.setNoDelay(true);
         snprintf(peer, sizeof(peer), "%s:%u", host, port);
         online = true; plus_count = 0; last_tx_ms = millis();
@@ -235,6 +253,10 @@ static void print_wifi_status() {
     if (WiFi.status() == WL_CONNECTED) {
         cdc_print("\r\nIP: "); cdc_print(WiFi.localIP().toString().c_str());
         cdc_print("\r\nGW: "); cdc_print(WiFi.gatewayIP().toString().c_str());
+        cdc_print("\r\nDNS: "); cdc_print(WiFi.dnsIP(0).toString().c_str());
+        if ((uint32_t)WiFi.dnsIP(1) != 0) {
+            cdc_print(", "); cdc_print(WiFi.dnsIP(1).toString().c_str());
+        }
         snprintf(line, sizeof(line), "\r\nRSSI: %d dBm   ch: %d   BSSID: %s",
                  (int)WiFi.RSSI(), (int)WiFi.channel(),
                  WiFi.BSSIDstr().c_str());
@@ -366,6 +388,16 @@ static void handle_dollar(char *s) {
         if (!result) { r_error(); return; }
         cdc_print("\r\n"); cdc_print(result); cdc_print("\r\n");
         r_ok();
+    } else if (!strcmp(key, "DNS") && op == '=') {
+        // AT$DNS=<host>  --  resolve via lwIP (same path WiFi.hostByName uses).
+        // Returns the IP or "NXDOMAIN".
+        IPAddress ip;
+        cdc_print("\r\n");
+        if (WiFi.hostByName(val, ip) == 1) {
+            cdc_print(ip.toString().c_str()); cdc_print("\r\n"); r_ok();
+        } else {
+            cdc_print("NXDOMAIN\r\n"); r_error();
+        }
     } else if (!strcmp(key, "PING") && op == '=') {
         // AT$PING=<ip> -- one ICMP echo from the dongle itself (not via SLIP).
         // Smoke test for the WiFi-out path. If this works but the SLIP NAPT
