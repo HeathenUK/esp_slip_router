@@ -43,6 +43,18 @@ static size_t cdc_write_raw(const uint8_t *buf, size_t n) {
     return total;
 }
 
+// Direct TinyUSB CDC bulk read. setup() calls Serial.end() to detach the
+// arduino-esp32 USBCDC layer's per-byte rx_queue drain (xQueueSend in a
+// 64-byte loop on every USB OUT, then xQueueReceive per byte on Serial.read --
+// that pair was the dominant cost on the SLIP intake path). With USBCDC
+// detached, bytes accumulate in TinyUSB's CDC FIFO (CFG_TUD_CDC_RX_BUFSIZE =
+// 64) until we drain them here in a single memcpy. The cost goes from
+// ~2 syscalls per byte to ~0 -- this is what gets SLIP throughput from
+// ~50 KB/s to several hundred.
+extern "C" size_t cdc_read_raw(uint8_t *buf, size_t max) {
+    return tud_cdc_n_read(0, buf, max);
+}
+
 #include "config.h"
 #include "display.h"
 #include "modem.h"
@@ -234,13 +246,14 @@ static void slip_deliver(const uint8_t *data, size_t len) {
 }
 
 static void slip_poll() {
-    // Bound the drain so a sustained host flood can't starve loop() (button
-    // polling, WiFi events, display refresh). 1024 bytes/iter @ ~1kHz loop
-    // sustains > 1 MB/s of SLIP throughput -- well above USB CDC line rate.
-    int budget = 1024;
-    while (budget-- > 0 && Serial.available() > 0) {
-        int ci = Serial.read(); if (ci < 0) break;
-        uint8_t c = (uint8_t)ci;
+    // Drain TinyUSB's CDC FIFO (CFG_TUD_CDC_RX_BUFSIZE = 64 bytes, so this
+    // never returns more than ~64 per call) and decode SLIP in one tight loop.
+    // The loop runs again next iteration; with arduino-esp32 USBCDC detached
+    // there is no per-byte queue overhead.
+    uint8_t ibuf[128];
+    size_t n = cdc_read_raw(ibuf, sizeof(ibuf));
+    for (size_t k = 0; k < n; k++) {
+        uint8_t c = ibuf[k];
         if (in_esc) {
             if (c == SLIP_ESC_END) c = SLIP_END;
             else if (c == SLIP_ESC_ESC) c = SLIP_ESC;
@@ -364,18 +377,15 @@ static void poll_button() {
 
 void setup() {
     Serial.begin(115200);
-    Serial.setRxBufferSize(2048);
-    // NOTE: was Serial.setTxTimeoutMs(0) here — intended to make Serial.write
-    // fire-and-forget, but USBCDC interprets a 0 timeout as "timeout expires
-    // immediately = send nothing", so every write was silently dropped. Default
-    // (250 ms) is fine for the modem path; SLIP throughput is well below it.
-
-    // T-Dongle S3 has no auto-reset circuit, so the esptool DTR/RTS state
-    // machine inside USBCDC::_onLineState can't do its job here — it can only
-    // get in the way by gating `connected` on a specific 4-step DTR/RTS pattern
-    // that some hosts (DOSBox directserial, USB-Serial-JTAG) don't replicate.
-    // Disable it so connected = (dtr && rts) cleanly, unblocking those hosts.
-    Serial.enableReboot(false);
+    Serial.enableReboot(false);    // suppress the esptool DTR/RTS state machine
+    Serial.end();
+    // After Serial.end(), arduino-esp32's USBCDC layer is detached: its
+    // tud_cdc_rx_cb hook (devices[itf]->_onRX) is skipped, so bytes pile up in
+    // TinyUSB's CDC FIFO instead of being copied byte-by-byte through a
+    // FreeRTOS queue. We drain that FIFO directly via tud_cdc_n_read in
+    // cdc_read_raw() — Serial.read/.available no longer work, but everywhere
+    // in this firmware uses cdc_read_raw instead. TX is unaffected because we
+    // already write via tud_cdc_n_write.
 
     Serial0.begin(115200);      // human-readable debug, off the USB data link
     pinMode(BTN_PIN, INPUT);    // GPIO0 has an external pull-up; pressed = LOW

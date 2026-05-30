@@ -11,6 +11,7 @@ extern "C" {
 #include "esp_system.h"           /* esp_restart() for AT$RESET */
 #include "lwip/netif.h"           /* AT$NETIF dump */
 #include "ping/ping_sock.h"       /* AT$PING -- WiFi outbound smoke test */
+size_t cdc_read_raw(uint8_t *buf, size_t max);   /* defined in main.cpp */
 }
 
 // Debug to the hardware UART only — USB CDC is the data link.
@@ -310,20 +311,17 @@ static void handle_dollar(char *s) {
         unsigned long last_yield = millis();
         uint8_t buf[2048];                       // bigger chunk -> fewer syscalls
         while (got < (unsigned long)sz) {
-            int avail = Serial.available();
-            if (avail > 0) {
-                int want = (avail > (int)sizeof(buf)) ? (int)sizeof(buf) : avail;
-                if ((unsigned long)want > (unsigned long)sz - got)
-                    want = (int)((unsigned long)sz - got);
-                int n = Serial.read(buf, want);
-                if (n > 0) {
-                    if (esp_ota_write(h, buf, (size_t)n) != ESP_OK) {
-                        esp_ota_abort(h);
-                        cdc_print("\r\nOTA WRITE-FAIL\r\n"); r_error(); return;
-                    }
-                    got += (unsigned long)n;
-                    last_rx = millis();
+            int want = (int)sizeof(buf);
+            if ((unsigned long)want > (unsigned long)sz - got)
+                want = (int)((unsigned long)sz - got);
+            int n = (int)cdc_read_raw(buf, (size_t)want);
+            if (n > 0) {
+                if (esp_ota_write(h, buf, (size_t)n) != ESP_OK) {
+                    esp_ota_abort(h);
+                    cdc_print("\r\nOTA WRITE-FAIL\r\n"); r_error(); return;
                 }
+                got += (unsigned long)n;
+                last_rx = millis();
             } else {
                 if (millis() - last_rx > 8000UL) {
                     esp_ota_abort(h);
@@ -603,10 +601,8 @@ static void pump_usb_to_tcp() {
     size_t  txlen = 0;
     uint32_t now = millis();
 
-    while (Serial.available() && client.connected()) {
-        int avail = Serial.available();
-        int want  = avail > (int)sizeof(inbuf) ? (int)sizeof(inbuf) : avail;
-        int n = Serial.read(inbuf, want);
+    while (client.connected()) {
+        int n = (int)cdc_read_raw(inbuf, sizeof(inbuf));
         if (n <= 0) break;
         for (int i = 0; i < n; ++i) {
             uint8_t ch = inbuf[i];
@@ -645,7 +641,11 @@ static void pump_tcp_to_usb() {
     uint8_t outbuf[512];
     size_t  outlen = 0;
 
-    while (client.available() && tud_cdc_n_write_available(0) > 64) {
+    // No tud_cdc_n_write_available gate here: the FIFO is 64 bytes total, so
+    // any "> 64" check is permanently false; "> 0" would be wrong because
+    // cdc_write blocks anyway and we'd just burn CPU when the host is slow.
+    // cdc_write's own ~500ms-deadline loop is the right place for backpressure.
+    while (client.available()) {
         int avail = client.available();
         int want  = avail > (int)sizeof(inbuf) ? (int)sizeof(inbuf) : avail;
         int n = client.read(inbuf, want);
@@ -700,14 +700,12 @@ static void pump_tcp_to_usb() {
 
 void modem_poll() {
     if (!online) {
-        // Cap per-poll so a sustained host flood can't starve button polling,
-        // WiFi events, display refresh, etc. 512 chars/iter @ ~1kHz loop()
-        // sustains > 500 kB/s of AT chatter — well above keyboard speed.
-        int budget = 512;
-        while (budget-- > 0 && Serial.available()) {
-            int ci = Serial.read(); if (ci < 0) break;
-            feed_cmd((uint8_t)ci);
-        }
+        // Bulk-read up to 256 chars/iter from TinyUSB CDC FIFO (max real depth
+        // is CFG_TUD_CDC_RX_BUFSIZE=64), feed them through the AT parser. The
+        // FIFO refills next iter; no per-byte queue traffic.
+        uint8_t ibuf[256];
+        size_t n = cdc_read_raw(ibuf, sizeof(ibuf));
+        for (size_t i = 0; i < n; i++) feed_cmd(ibuf[i]);
         return;
     }
     pump_usb_to_tcp();

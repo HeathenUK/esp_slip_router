@@ -5,6 +5,10 @@
 #include <Arduino_GFX_Library.h>
 #include "config.h"
 
+extern "C" {
+#include "esp32-hal-tinyusb.h"   // tud_cdc_n_connected (Serial detached at boot)
+}
+
 // --- T-Dongle S3 0.96" ST7735 (from LilyGO factory esp_lcd init) ---
 #define LCD_DC    2
 #define LCD_CS    4
@@ -85,11 +89,11 @@ void display_slip(bool wifi_up, IPAddress sta_ip, bool napt,
 }
 
 void display_modem(bool wifi_up, IPAddress sta_ip, bool online, const char *peer) {
-    // `(bool)Serial` returns USBCDC's `connected` flag — i.e. whether the host
-    // has asserted DTR (post-enableReboot(false), just dtr && rts). When this
-    // shows N, the dongle can't echo: Serial.write is gated false at the
-    // framework level. Critical for diagnosing host-side enumeration issues.
-    bool cdc_up = (bool)Serial;
+    // tud_cdc_n_connected: TinyUSB-level "host has opened the CDC port".
+    // Was (bool)Serial when arduino-esp32's USBCDC layer was active; that's
+    // now detached (main.cpp does Serial.end() right after begin to bypass
+    // its per-byte queue drain), so go direct to TinyUSB. Same signal.
+    bool cdc_up = tud_cdc_n_connected(0);
     draw_line(0, cdc_up ? "WiFi Modem H+" : "WiFi Modem H?",
               cdc_up ? C_MAGENTA : C_RED);
     draw_line(1, String("WiFi: ") + (wifi_up ? "up" : "..."),
