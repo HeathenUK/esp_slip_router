@@ -12,6 +12,7 @@ mkdir -p $DEST
 cp $SRC/throughput.exe $DEST/THRPUT.EXE
 cp $SRC/httpget.exe   $DEST/HTTPGET.EXE
 cp $SRC/timer.exe     $DEST/TIMER.EXE
+cp $SRC/atq.exe       $DEST/ATQ.EXE
 cp $SRC/magicout.exe  $DEST/MAGICOUT.EXE
 cp $SRC/../mtcpget-src/MTCPGET.EXE $DEST/MTCPGET.EXE
 cp $HOME/FOSSLIP/FOSSLIP.EXE $DEST/FOSSLIP.EXE

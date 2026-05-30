@@ -1,5 +1,5 @@
 @ECHO OFF
-REM Zero dongle SLIP counters before a run.
+REM Zero dongle SLIP counters.
 C:
 CD \TDONGLE
-USBTERM.EXE -s STAT-CLR.TXT -l STAT-CLR-RX.LOG COM1 9600
+ATQ.EXE AT$STATS=0
