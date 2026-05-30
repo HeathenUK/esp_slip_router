@@ -43,13 +43,13 @@ cp "$THRPUT" "$WORK/THRPUT.EXE"
 cat > "$WORK/dosbox.conf" <<EOF
 [sdl]
 fullscreen=false
-output=opengl
+output=texture
 [cpu]
 core=dynamic
 cputype=pentium_slow
-cycles=fixed 100000
+cycles=500000
 [serial]
-serial1=nullmodem server:127.0.0.1 port:5555 transparent:1 rxdelay:0 txdelay:0 bps:115200
+serial1=nullmodem server:127.0.0.1 port:5555 transparent:1 rxdelay:0 txdelay:0
 [autoexec]
 mount c $WORK
 c:

@@ -40,27 +40,28 @@ if [ ! -f "$CRTMM" ];  then echo "build: crtmm.lib not found at $CRTMM (rebuild 
 #                        throughput.obj sitting in the dir, producing a
 #                        binary built from a previous compile. See user
 #                        memory note "usbterm manual build gotcha".
-env PATH="$OW/build/binbuild:$PATH" \
-  "$BWCL" -zq -bt=dos -lr -mm -0 -os -wx -c \
-    -i="$HDR" \
-    -fo=throughput.obj \
-    throughput.c
-
-# Copy the run-time lib in next to us so the linker response file can
-# refer to it by bare name. (bwlink's library search path handling under
-# the hosted build is finicky; co-locating sidesteps it.)
-cp "$CRTMM" ./crtmm.lib
-
-# Write a linker response file. Format taken from CH375's usbterm_mm.rsp.
-cat > throughput_mm.rsp <<'EOF'
+# Build both throughput.exe and httpget.exe with the same recipe.
+build_one() {
+    local src="$1"
+    local stem="${src%.c}"
+    env PATH="$OW/build/binbuild:$PATH" \
+      "$BWCL" -zq -bt=dos -lr -mm -0 -os -wx -c \
+        -i="$HDR" \
+        -fo="${stem}.obj" \
+        "$src"
+    cat > "${stem}_mm.rsp" <<EOF
 option quiet
 format dos
-file throughput.obj
+file ${stem}.obj
 library crtmm
-name throughput.exe
+name ${stem}.exe
 EOF
+    env PATH="$OW/build/binbuild:$PATH" "$BWLINK" @"${stem}_mm.rsp"
+}
 
-env PATH="$OW/build/binbuild:$PATH" "$BWLINK" @throughput_mm.rsp
+cp "$CRTMM" ./crtmm.lib
+build_one throughput.c
+build_one httpget.c
 
-echo "build: ok -- throughput.exe"
-ls -l throughput.exe
+echo "build: ok"
+ls -l throughput.exe httpget.exe

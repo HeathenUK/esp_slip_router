@@ -1,0 +1,5 @@
+option quiet
+format dos
+file httpget.obj
+library crtmm
+name httpget.exe
