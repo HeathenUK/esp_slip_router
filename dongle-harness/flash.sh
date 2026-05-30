@@ -28,9 +28,12 @@ fi
 FW="${1:-$HERE/../tdongle-s3/.pio/build/dos/firmware.bin}"
 [ -f "$FW" ] || { echo "flash: no firmware at $FW" >&2; exit 1; }
 
-DONGLE=/dev/cu.usbmodemF412FA44AC4C1
-if [ ! -e "$DONGLE" ]; then
-    echo "flash: dongle not present at $DONGLE" >&2
+# Match either the original CDC-only build's tty (F412FA44AC4C1) or the
+# composite CDC+MSC build's (...AC4C2 -- TinyUSB rebases the per-interface
+# suffix when MSC joins).
+DONGLE=$(ls /dev/cu.usbmodemF412FA44AC4C* 2>/dev/null | head -1)
+if [ -z "$DONGLE" ] || [ ! -e "$DONGLE" ]; then
+    echo "flash: dongle not present (/dev/cu.usbmodemF412FA44AC4C*)" >&2
     echo "flash: if it's in ROM bootloader (usbmodem123401), use: $0 --boot" >&2
     exit 1
 fi

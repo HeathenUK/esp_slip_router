@@ -16,7 +16,7 @@ ESPTOOL_PYTHON="${ESPTOOL_PYTHON:-$HOME/.platformio/penv/bin/python}"
 
 [ -f "$FW" ] || { echo "flash-bl: no firmware at $FW" >&2; exit 1; }
 
-FW_PORT=/dev/cu.usbmodemF412FA44AC4C1
+FW_PORT=$(ls /dev/cu.usbmodemF412FA44AC4C* 2>/dev/null | head -1)
 DL_PORT=/dev/cu.usbmodem123401
 
 if [ ! -e "$DL_PORT" ] && [ -e "$FW_PORT" ]; then

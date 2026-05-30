@@ -9,6 +9,7 @@ extern "C" {
 #include "esp32-hal-tinyusb.h"   /* tud_cdc_n_write / tud_cdc_n_write_flush */
 #include "esp_ota_ops.h"          /* OTA partition write API (USB-CDC OTA) */
 #include "esp_system.h"           /* esp_restart() for AT$RESET */
+#include "dongle_disk.h"          /* AT$DISK status */
 #include "lwip/netif.h"           /* AT$NETIF dump */
 #include "ping/ping_sock.h"       /* AT$PING -- WiFi outbound smoke test */
 size_t cdc_read_raw(uint8_t *buf, size_t max);   /* defined in main.cpp */
@@ -468,6 +469,21 @@ static void handle_dollar(char *s) {
             cdc_print(b);
             r_ok();
         }
+    } else if (!strcmp(key, "DISK")) {
+        // AT$DISK? -- USB MSC / HTTP dev-disk status. See dongle_disk.cpp.
+        dongle_disk_status_t st;
+        dongle_disk_get_status(&st);
+        char b[200];
+        snprintf(b, sizeof(b),
+                 "\r\nmdns=%s.local  http=%s  msc_present=%s  fs_locked=%s\r\n"
+                 "partition=%lu bytes\r\n",
+                 st.mdns_host,
+                 st.http_ready ? "up" : "down",
+                 st.msc_present ? "yes" : "no",
+                 st.mounted ? "yes" : "no",
+                 (unsigned long)st.partition_bytes);
+        cdc_print(b);
+        r_ok();
     } else if (!strcmp(key, "RESET")) {
         // AT$RESET -- software reboot. Differs from AT$BOOT (which jumps into the
         // ROM bootloader for esptool) -- this just esp_restarts, which boots the
@@ -515,6 +531,7 @@ static void handle_dollar(char *s) {
                      "AT$RSSI?             just the dBm value (scriptable)\r\n"
                      "AT$SCAN              list WiFi networks (~3-5 s)\r\n"
                      "AT$STATS  / =0       SLIP byte+pkt counters / clear\r\n"
+                     "AT$DISK?             USB MSC + HTTP dev-disk status\r\n"
                      "AT$RESET             software reboot (esp_restart)\r\n"
                      "AT$OTASTART=<size>   USB-CDC OTA: stream <size> B fw.bin\r\n"
                      "AT$BOOT              fallback: reboot into ROM bootloader\r\n"

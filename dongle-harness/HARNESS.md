@@ -1,211 +1,297 @@
-# T-Dongle S3 — test harness + USB-CDC OTA
+# T-Dongle S3 — harness and developer guide
 
-Two related tools in this directory:
+This directory is the host-side toolbox for the dongle: how you flash
+it, how you exercise each of its data paths, and how you push or pull
+files from it over WiFi. Everything in here is **macOS-side**, talking
+to the dongle either over its USB CDC link, the new USB Mass Storage
+class device, or its WiFi-side HTTP server.
 
-* **`flash.sh`** — USB-CDC OTA. Stream firmware.bin straight into the
-  inactive OTA partition via `AT$OTASTART`, then the dongle reboots
-  into the new build. No bootloader trip, no esptool, no WiFi, no
-  buttons. ~10s end-to-end for a 1.1 MB image. **This replaces
-  every previous flashing workflow.** See "Flashing" below.
+## Mental model
 
-* **`run.sh`** — adversarial / regression test harness. Drives the
-  dongle's Hayes-modem firmware via the *actual* `usbterm.exe`
-  running inside DOSBox on macOS. Send a script of AT commands, get
-  back the bytes the modem replied with. Useful for regression
-  testing, reproducing user-reported issues, and demonstrating the
-  modem path works without sitting in front of the Pocket386.
-
-## Flashing (USB-CDC OTA)
+The dongle is one ESP32-S3 with three USB roles and two runtime
+personalities multiplexed onto one CDC byte stream:
 
 ```
-$ ./flash.sh                              # uses ../tdongle-s3/.pio/build/dos/firmware.bin
-$ ./flash.sh path/to/firmware.bin         # custom image
-$ ./flash.sh --boot [factory.bin]         # escape hatch: AT$BOOT → ROM
-                                          # bootloader → esptool (use this if
-                                          # the running firmware can't talk
-                                          # or you need to update the bootloader
-                                          # / partition table itself)
+                                                       ┌── /dev/cu.usbmodem… ── AT engine    (Hayes / MODEM)
+                            ┌── USB CDC-ACM ───────────┤
+                            │                          └── /dev/cu.usbmodem… ── SLIP framing (SLIP/router)
+                            │      (one stream, switched at runtime via AT$MODE
+   T-Dongle S3 ── USB ──────┤       or GPIO0 long-press; magic frame 0xC0
+                            │       "MODE=MODEM" 0xC0 flips back from SLIP)
+                            │
+                            ├── USB MSC ─────────────── /dev/disk4 "DOSONGLE" (8 MB FAT12 dev disk)
+                            │
+                            └── (DFU during AT$BOOT: ROM bootloader for esptool)
+
+                                            WiFi (STA, NAPT'd onto LAN)
+                                              │
+                                              └── HTTP :80 on dosongle.local
+                                                  (GET /list, PUT /fs/X, /status, ...)
 ```
 
-The OTA path uses `AT$OTASTART=<bytes>` to stream the new app image
-through the existing modem CDC link into the inactive OTA partition,
-then `esp_ota_set_boot_partition` + `esp_restart`. Throughput ~110 KB/s,
-1.1 MB image in ~10 s, fully autonomous including post-reboot verify.
+The two personalities share **the same CDC endpoint**. SLIP mode = lwIP
+NAPT, host runs a packet driver. MODEM mode = WiFi232-style Hayes
+engine, host runs any terminal. Switching:
 
-**One-time prereq:** if the dongle isn't yet running a firmware
-containing `AT$OTASTART` (i.e. anything before commit `f120652` on
-`tdongle-s3-port`), do one manual download-mode flash first. After
-that, `./flash.sh` handles every subsequent update.
+* `AT$MODE=SLIP` / `AT$MODE=MODEM` (NVS-persisted)
+* Long-press GPIO0
+* SLIP → MODEM only: send the magic SLIP frame `0xC0 "MODE=MODEM" 0xC0`
+  (used by `MAGICOUT.EXE` on the DOS side and by the harness scripts
+  when they need to escape SLIP mid-test)
 
-`firmware.bin` (app only, ~1.1 MB) is what OTA writes. `firmware.factory.bin`
-(bootloader + partitions + boot_app0 + app, ~1.16 MB) is what the
-`--boot` escape-hatch writes via esptool. OTA can't replace the
-bootloader from the running app.
+The MSC and WiFi/HTTP planes are **always-on** and orthogonal to which
+personality the CDC plane is in. So you can be `MODE=SLIP` running a
+mTCP download and at the same time drop a new binary onto the disk via
+WiFi.
 
-## Testing (AT harness via DOSBox + usbterm)
+## Components
 
-```
-$ ./run.sh
-=== rx (89 bytes from /dev/cu.usbmodemF412FA44AC4C1) ===
-AT
-OK
-ATI
-FOSSLIP WiFi Modem
+| File / dir | Role |
+|------------|------|
+| `flash.sh` | USB-CDC OTA (no buttons, no esptool, ~10 s). Default path. |
+| `flash-bootloader.sh` | Escape-hatch: trip into ROM bootloader, esptool full-image flash. Use when the running firmware can't talk, or when the bootloader / partition table itself changed. `flash.sh --boot` forwards here. |
+| `run.sh` | Adversarial Hayes-modem regression: drives the dongle's AT engine from DOSBox+`usbterm.exe` via socat. |
+| `run-throughput.sh` | DOS-side throughput: `THROUGHPUT.EXE` (Hayes path) under DOSBox→BNU→nullmodem→socat→dongle. |
+| `run-httpget.sh` | DOS-side HTTP download: `HTTPGET.EXE` (Hayes) under the same DOSBox+BNU stack. |
+| `run-mtcp-throughput.sh` | End-to-end DOS-side SLIP via FOSSLIP+mTCP HTGET — the production path. |
+| `slip-test.py` | One-shot SLIP ICMP-echo round trip (USB CDC SLIP framing → lwIP → reply). |
+| `slip-tcp-test.py` | Synthesised TCP-over-SLIP integrity test: handshake, data, FIN. |
+| `slip-throughput.py` | UDP-over-SLIP throughput (host → dongle → WiFi → Mac UDP server). |
+| `slip-bench.py` | SLIP intake microbenchmark — bytes/sec the dongle accepts. |
+| `datapath-test.py` | Hayes (MODEM mode) online-mode integrity + throughput: host → CDC → TCP → Mac echo. |
+| `mtcpget-src/` | Clean-room mTCP-based DOS profiler (`PROFILE.EXE`) and downloader (`MTCPGET.EXE`). |
+| `mtcp-bin/` | Stock mTCP utilities shipped to the CF for ad-hoc DOS testing. |
+| `dos-throughput/` | DOS-side throughput tools (THROUGHPUT.EXE, HTTPGET.EXE, MAGICOUT.EXE, ATQ.EXE) and the CF deploy tree. |
 
-OK
-AT$WIFI?
-SSID:
-status: not connected
+## The four planes
 
-OK
-```
+### 1. OTA (USB CDC)
 
-```
-$ ./run.sh my-test.txt    # custom AT script (CR-terminated lines)
-```
-
-## What it actually does
-
-```
-   AT script (CR-terminated text file)
-        │
-        ▼
-   usbterm.exe -s at.txt -l rx.log com1   (running under headless DOSBox)
-        │  reads bytes from at.txt, sends via INT 14h, tees RX to rx.log
-        ▼
-   DOSBox INT 14h handler (BIOS path — AH=01 send, AH=03 status, AH=02 read)
-        │
-        ▼
-   serial1=nullmodem to 127.0.0.1:5555
-        │
-        ▼
-   socat TCP-LISTEN:5555 ── raw stream ── /dev/cu.usbmodemF412FA44AC4C1
-        │
-        ▼
-   T-Dongle S3 (TinyUSB CDC → modem firmware → AT response)
+```sh
+./flash.sh                              # ../tdongle-s3/.pio/build/dos/firmware.bin
+./flash.sh path/to/firmware.bin
+./flash.sh --boot [firmware.factory.bin]   # ROM bootloader + esptool
 ```
 
-The shell script (`run.sh`) sets up `socat` as a TCP-to-serial bridge, writes
-a DOSBox `.conf` that uses `nullmodem` to connect to that bridge, copies
-`usbterm.exe` + the AT script into a temp dir mounted as `C:`, runs DOSBox
-headlessly (`SDL_VIDEODRIVER=dummy` + `perl alarm` for timeout), and prints
-the captured `rx.log`.
+The default OTA path streams `firmware.bin` straight into the inactive
+OTA partition via `AT$OTASTART=<bytes>`:
+
+```
+host:    AT$OTASTART=<bytes>\r
+dongle:  \r\nOTA READY\r\n
+host:    <bytes raw firmware.bin>
+dongle:  \r\nOTA OK\r\n          ← esp_ota_set_boot_partition + esp_restart
+```
+
+~187 KB/s, 1.2 MB app in ~7 s, fully autonomous including post-reboot
+verify. Implemented in `tdongle-s3/src/modem.cpp` (the `AT$OTASTART`
+handler) — see commit history for `f120652` / `fe0d1b0`.
+
+OTA writes the app slot only. The `--boot` fallback flashes
+`firmware.factory.bin` (bootloader + partition table + boot_app0 +
+app) and is required whenever the partition table itself changes
+(e.g. the MSC introduction added a `ffat` partition).
+
+The dongle's CDC tty is matched by glob (`/dev/cu.usbmodemF412FA44AC4C*`) —
+adding MSC made it a composite device, which bumps the per-interface
+suffix.
+
+### 2. Hayes / MODEM (USB CDC)
+
+`AT$MODE=MODEM` (default at first boot). The dongle terminates TCP and
+acts as a WiFi-aware Hayes modem:
+
+```
+ATDT example.com:80          → CONNECT
+GET / HTTP/1.0\r\n\r\n        → response
++++ (1 s guard)               → returns to command mode
+ATH                           → hang up
+ATO                           → re-enter online mode
+ATNET0 / ATNET1               → bare-TCP / telnet-protocol on the connection
+```
+
+Plus `AT$` extensions: `AT$WIFI=ssid,pw`, `AT$WIFI?`, `AT$MODE=…`,
+`AT$SCAN`, `AT$STATS`, `AT$RESET`, `AT$BOOT`, `AT$OTASTART`, `AT$DISK?`
+(see "MSC" below). Full list: `AT$HELP`.
+
+The Hayes side is exercised three ways from here:
+
+* **`run.sh`** drives it through the *actual* `usbterm.exe` inside
+  DOSBox so we exercise the same DOS code path. AT scripts are
+  CR-terminated (no LF) — the dongle's `feed_cmd` only commits on CR.
+
+* **`run-throughput.sh`** runs `THROUGHPUT.EXE` (Hayes ATD to a Mac
+  echo server) to measure user-mode DOS throughput. DOSBox CPU-paces
+  the nullmodem serial, so the numbers aren't the dongle's ceiling —
+  they're a regression detector for the Hayes pipeline.
+
+* **`run-httpget.sh`** runs `HTTPGET.EXE` (Hayes ATD to an HTTP server,
+  bare `GET / HTTP/1.0`). Same DOSBox-paced caveats.
+
+* **`datapath-test.py`** is the pure-Mac equivalent — exercises Hayes
+  online-mode via pyserial, no DOSBox in the chain.
+
+Why DOSBox + nullmodem + socat instead of `directserial`: see
+"Provenance" at the end. Short version: `directserial` doesn't
+propagate DTR/RTS the way TinyUSB CDC needs, AND `INT 14h AH=01h`
+waits for CTS/DSR that the dongle never asserts. `nullmodem` virtual
+modem-status lines work around both.
+
+### 3. SLIP (USB CDC)
+
+`AT$MODE=SLIP`. The CDC stream is now RFC1055 SLIP frames; the dongle
+strips them into IP packets, lwIP NAPTs onto WiFi.
+
+```
+host runs SLIP packet driver  ── CDC SLIP ──>  dongle ── NAPT ── WiFi
+                              <── CDC SLIP ──  dongle <─ NAT ─── WiFi
+```
+
+DOS-side this lands on FOSSLIP (`~/FOSSLIP`) — a clean-room INT 0x60
+packet driver TSR that talks INT 14h/FOSSIL to CHUSB. mTCP binds the
+INT 0x60 packet driver like any other. The throughput target is real
+TCP-on-DOS over the SLIP link.
+
+Exercise it from the Mac (no DOS) via:
+
+* **`slip-test.py`** — one-shot ICMP echo. Smoke test the framing
+  + lwIP path. Hits `192.168.240.1` (the dongle's SLIP-side IP).
+* **`slip-tcp-test.py`** — synthesises a full TCP handshake to a Mac
+  TCP echo server. Validates NAPT and the dongle's host→Net direction.
+* **`slip-throughput.py`** — UDP bytes/sec through the same path.
+* **`slip-bench.py`** — how fast the dongle's USB→SLIP decode→lwIP
+  intake can accept bytes. Doesn't depend on a peer.
+
+Exercise it end-to-end as DOS would via:
+
+* **`run-mtcp-throughput.sh`** — full DOS production path:
+  `mTCP HTGET` → INT 0x60 → `FOSSLIP.EXE` → INT 14h → BNU → COM1 →
+  DOSBox `nullmodem` → socat → dongle (SLIP) → WiFi.
+
+After a SLIP test, escape back to MODEM with the magic frame
+(`MAGICOUT.EXE` on DOS, or `python3 -c "import serial; serial.Serial('…',
+115200).write(b'\\xc0MODE=MODEM\\xc0')"` on the Mac) so the next AT
+command lands on the AT engine instead of the SLIP decoder.
+
+### 4. USB MSC + WiFi HTTP (dev disk)
+
+The dongle exposes the new `ffat` partition (8 MB FAT12) as a USB Mass
+Storage device. macOS / Windows / Linux mount it natively; CHUSB on
+the DOS side already implements INT 13h MSC, so the same drive appears
+in DOS without any extra driver work.
+
+The same FAT is served on WiFi by an HTTP file server, with mDNS
+registered as `dosongle.local`:
+
+```
+GET  /                  index (links to the JSON + the file endpoints)
+GET  /status            JSON: WiFi, MSC, FS total/free
+GET  /list              root-directory listing (size + name)
+GET  /fs/<NAME>         download the file (8.3-uppercased server side)
+PUT  /fs/<NAME>         upload (raw body, use curl -T <file>)
+DELETE /fs/<NAME>       delete
+POST /eject             tell the host MSC is gone
+POST /present           re-present (mediaPresent true + UNIT ATTENTION)
+POST /reset             esp_restart
+```
+
+Examples:
+
+```sh
+curl http://dosongle.local/status
+curl http://dosongle.local/list
+curl http://dosongle.local/fs/PROFILE.LOG > local-profile.log
+curl -T new-PROFILE.EXE http://dosongle.local/fs/PROFILE.EXE
+curl -X DELETE http://dosongle.local/fs/STALE.TXT
+```
+
+**Coordination model.** The FAT partition has one writer at a time.
+USB MSC owns the disk by default. Each `/fs` or `/list` request
+briefly takes ownership: the dongle sends `mediaPresent(false)` to
+the host (the disk appears to eject), mounts FATFS internally, does
+the op, `fsync`s, unmounts, and sends `mediaPresent(true)` again.
+The host sees a brief eject-and-remount around each WiFi op. macOS
+won't auto-mount after the re-present — `diskutil mount /dev/disk4`
+or click the icon in Finder, or just work entirely through HTTP.
+DOS-side CHUSB notices via UNIT ATTENTION and reads the fresh dir on
+next access.
+
+`AT$DISK?` shows status from the CDC side:
+
+```
+mdns=dosongle.local  http=up  msc_present=yes  fs_locked=no
+partition=8306688 bytes
+```
+
+The 8 MB partition came out of the OTA slots (shrunk to 3.94 MB each
+from the stock 6.25 MB; still 3.5× headroom over the current 1.2 MB
+firmware). Layout in `tdongle-s3/partitions_dongle.csv`. **Changing
+this CSV requires a `--boot` flash** — the partition table can't be
+OTA'd from the running app.
+
+## Sequencing a typical dev loop
+
+1. Edit firmware in `tdongle-s3/src/`.
+2. `pio run -e dos` (builds `firmware.bin` + `firmware.factory.bin`).
+3. `./flash.sh` (or `./flash.sh --boot` if you touched the partition
+   table or the bootloader, or the dongle isn't responding to AT).
+4. Drop new DOS-side artifacts to the dongle's FAT over WiFi:
+   `curl -T mtcpget-src/PROFILE.EXE http://dosongle.local/fs/PROFILE.EXE`
+5. Run on hardware (or in DOSBox via the run-* scripts).
+6. Pull the log back:
+   `curl http://dosongle.local/fs/PROFILE.LOG > tmp.log`
+7. Repeat without unplugging anything.
 
 ## Prerequisites
 
-* **macOS** with DOSBox 0.74-3 installed at `/Applications/dosbox.app`.
-  Override with `DOSBOX=/path/to/dosbox`.
-* **socat** in `$PATH` (`brew install socat`). Override with
-  `SOCAT=/path/to/socat`.
-* **`~/CH375/usbterm.exe`** built at HEAD or later (must include the
-  `-s` / `-l` script-mode flags and the FOSSIL-fallback path — both
-  shipped in commit `23ab543` of CH375). Override with
-  `USBTERM=/path/to/usbterm.exe`.
-* **T-Dongle S3** plugged in directly to the Mac (not via a marginal hub),
-  enumerated as `/dev/cu.usbmodemF412FA44AC4C1`. The dongle's serial number
-  is the chip MAC, so the path is stable across reboots for any given
-  physical device. Other dongles need the path tweaked in `run.sh`.
-* **Dongle firmware** at `tdongle-s3-port` branch tip or later (commit
-  `92d8033` of esp_slip_router or newer — this contains the
-  `tud_cdc_n_write` bypass that makes non-pyserial hosts work).
+* **macOS** with DOSBox 0.74-3 at `/Applications/dosbox.app` (override
+  with `DOSBOX=…`). Only needed for the `run*.sh` scripts.
+* **socat** in `$PATH` (`brew install socat`; override `SOCAT=…`).
+* **`~/CH375/usbterm.exe`** built from commit `23ab543` or later
+  (override `USBTERM=…`). Only for `run.sh`.
+* **PlatformIO** in `$PATH` for `pio run`.
+* **T-Dongle S3** enumerated as `/dev/cu.usbmodemF412FA44AC4C*`. The
+  serial number is the chip MAC so the path is stable for a given
+  unit; scripts glob the suffix so the composite USB descriptor's
+  per-interface bump doesn't break them.
 
-## Why all this scaffolding?
+## Why all the DOSBox scaffolding (provenance)
 
-The "obvious" approach — `serial1=directserial realport:cu.usbmodemF412…`
-— silently fails. The dongle responds, but the bytes never make it back
-to DOS, because **two independent problems compound**:
+The "obvious" approach — `serial1=directserial realport:cu.usbmodemF412…` —
+silently fails. Two independent problems compound:
 
 1. **DOSBox `directserial` doesn't propagate DTR/RTS** in a way that
    triggers TinyUSB CDC's `connected` state on the device side. The
-   stock `USBCDC::write` gates on `tud_cdc_n_connected(itf)` — so every
+   stock `USBCDC::write` gates on `tud_cdc_n_connected(itf)`, so every
    modem reply gets silently dropped at the device. **Fixed firmware-
-   side** by routing TX through `tud_cdc_n_write` directly
-   (esp_slip_router `92d8033`) and by `Serial.enableReboot(false)` to
-   disable a DTR-state-machine that interfered.
+   side** by routing TX through `tud_cdc_n_write` directly and by
+   `Serial.enableReboot(false)`.
 
-2. **DOSBox's BIOS `INT 14h AH=01h` send waits for CTS+DSR**, and the
-   dongle's TinyUSB CDC doesn't assert SERIAL_STATE notifications, so
-   macOS reports CTS/DSR as 0, and `AH=01h` times out with `AH=80h` for
-   every byte. **Worked around** by routing through DOSBox's `nullmodem`
-   backend (which provides virtual modem-status lines always asserted)
-   plus a `socat` TCP-to-serial bridge to the actual dongle. `nullmodem`
-   doesn't enforce CTS the way `directserial` does.
+2. **DOSBox `INT 14h AH=01h` waits for CTS+DSR**, and TinyUSB CDC
+   doesn't assert SERIAL_STATE notifications, so macOS reports them
+   as 0 and `AH=01h` times out with `AH=80h` for every byte. **Worked
+   around** by routing through DOSBox's `nullmodem` backend (always-
+   asserted virtual modem-status lines) plus `socat` bridging to the
+   real dongle.
 
-Separately, `usbterm.exe` was written for the Pocket386 + CHUSB target,
-which provides full FOSSIL — so its TX path used `AH=0Bh` (FOSSIL
-nonblocking send) and RX used `AH=0Ch`/`AH=18h` (FOSSIL peek / batch).
-DOSBox implements none of those. Commit `23ab543` of CH375 adds a runtime
-fossil-probe and falls back to plain BIOS `AH=01h`/`AH=03h`/`AH=02h` when
-FOSSIL is absent — letting the same `usbterm.exe` binary work under
-DOSBox-on-Mac *and* on the real Pocket386 with CHUSB.
+Separately, `usbterm.exe` was written for the Pocket386 + CHUSB
+target (full FOSSIL): its TX used `AH=0Bh` (FOSSIL nonblocking) and RX
+used `AH=0Ch` / `AH=18h` (peek / batch). DOSBox implements none of
+those. Commit `23ab543` of CH375 adds a runtime FOSSIL probe and
+falls back to plain `AH=01h`/`AH=03h`/`AH=02h`, so the same binary
+runs under DOSBox-on-Mac and on the Pocket386 with CHUSB.
 
 ## Limitations vs the Pocket386 target
 
-This harness **cannot** reproduce CHUSB-specific bugs:
+The DOSBox harness **cannot** reproduce CHUSB-specific bugs: it
+exercises the dongle through DOSBox's BIOS emulation → `nullmodem` →
+`socat` → kernel CDC ACM. The Pocket386 exercises it through
+`CHUSB.EXE` → CH375 silicon → USB. Different RX/TX queueing, different
+timing, different concurrency. What the harness IS good for: regression-
+testing the dongle's modem firmware (AT echo, OK, AT$ commands, dial
+flow, telnet pump) and that `usbterm.exe` itself parses + drives a
+serial port correctly.
 
-* The Pocket386 runs `CHUSB.EXE` as a TSR that talks to the CH375 USB
-  host chip via I/O ports. DOSBox doesn't emulate CH375 hardware, so
-  CHUSB can't load there.
-* DOSBox + this harness exercises the dongle through DOSBox's BIOS
-  emulation → `nullmodem` → `socat` → kernel CDC ACM driver. The
-  Pocket386 exercises it through `CHUSB.EXE` → CH375 silicon → USB.
-  Different RX/TX queueing, different timing, different concurrency
-  surface. A bug in CHUSB's foreground/tick interaction will not
-  reproduce here.
-* `usbterm`'s FOSSIL path (`AH=0Bh` / `AH=18h`) only runs on the
-  Pocket386. The harness exercises the BIOS-fallback path.
-
-What the harness IS good for: confirming the **dongle-side** modem
-firmware works (AT echo, OK, AT$ commands, dial flow, telnet pump), and
-that `usbterm.exe` itself parses + drives a serial port correctly. Both
-are common regression-test surfaces.
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `run.sh` | Driver script. Sets up socat + DOSBox + collects rx log. |
-| `default-at.txt` | Default AT script: `AT\rATI\rAT$WIFI?\r` (CR-terminated, no LFs). |
-| `HARNESS.md` | This file. |
-
-## Writing your own AT script
-
-The dongle's `feed_cmd` (in `tdongle-s3/src/modem.cpp`) commits a line on
-`\r` (CR) only; LF is ignored. So your script file must use **CR
-terminators**, NOT CR-LF or LF.
-
-```sh
-printf 'AT\rATDT example.com:23\r' > my-script.txt
-./run.sh my-script.txt
-```
-
-Bytes after the last command get sent too — useful for stuffing payload
-into a connected TCP session (Hayes online mode). The harness waits 5
-seconds of RX silence after EOF before exiting, so make sure your final
-expected reply lands inside that window.
-
-## Troubleshooting
-
-* `=== rx (0 bytes …)` — most often: the dongle's TFT shows `WiFi Modem H?`
-  (red) rather than `H+`, meaning the host hasn't asserted CDC connect.
-  Confirm the dongle is plugged directly into the Mac (not a marginal
-  hub), and that `python3 -c "import serial; print(serial.Serial('/dev/cu.usbmodemF412FA44AC4C1', 115200, timeout=1).read(64))"`
-  responds to AT.
-* `harness: no T-Dongle S3 found on USB` — the device path
-  `/dev/cu.usbmodemF412FA44AC4C1` doesn't exist. Either replug (without
-  holding BOOT), or update the path in `run.sh` for a different physical
-  unit.
-* DOSBox prints `BIOS INT14: Unhandled call AH=…` — fine for `AH=04h`
-  (the FOSSIL probe, which is expected to fail in DOSBox and trigger
-  the fallback) and the one-time `AH=1Eh` init. Anything else means
-  `usbterm.exe` is older than commit `23ab543` of CH375 (pre-fallback)
-  — rebuild from HEAD.
-
-## Provenance / forensic notes
-
-Both compounding bugs were diagnosed empirically over a long session
-(see `MEMORY.md` and the commit messages on `92d8033` /
-`23ab543`). The short version: the `usbterm` author assumed FOSSIL, the
-arduino-esp32 USBCDC author assumed pyserial-style DTR handling, and
-neither held when you stacked DOSBox-on-macOS in front of a TinyUSB CDC
-device. The dongle was innocent the whole time.
+For real DOS coverage, deploy to the CF (`dos-throughput/deploy-to-cf.sh`)
+or push to the dev disk via HTTP (no CF needed) and run on the
+Pocket386 directly.

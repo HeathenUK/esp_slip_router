@@ -23,6 +23,8 @@ extern "C" {
 #include "esp32-hal-tinyusb.h"   /* tud_cdc_n_write / tud_cdc_n_write_flush */
 }
 
+#include "dongle_disk.h"
+
 // Direct TinyUSB CDC write that bypasses USBCDC's `connected` gate -- same
 // rationale as modem.cpp's cdc_write. SLIP-mode lwIP traffic was hitting the
 // gated Serial.write and being silently dropped on hosts that don't propagate
@@ -428,6 +430,13 @@ void setup() {
 
     g_mode = (LinkMode)g_prefs.getUChar("mode", MODE_MODEM);  // default: modem
     apply_mode();
+
+    // Bring up the dev-disk side (USB MSC + HTTP over WiFi + mDNS). Safe
+    // to call here even though WiFi isn't necessarily connected yet --
+    // dongle_disk_init hooks WiFi events and starts HTTP/mDNS when STA
+    // gets an IP.
+    dongle_disk_init();
+
     DBG("[boot] setup complete, mode=%s\n", g_mode == MODE_SLIP ? "SLIP" : "MODEM");
 }
 

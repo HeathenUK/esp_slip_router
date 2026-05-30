@@ -1,0 +1,16 @@
+# Custom partition layout for T-Dongle S3 (16 MB QIO flash).
+# ~3.94 MB OTA slots (3.5x our 1.1 MB firmware), 8 MB FAT for the USB MSC
+# dev-disk + HTTP file server. After first flash via
+# `./dongle-harness/flash.sh --boot`, OTA (./flash.sh) continues to work
+# as long as the app stays under ~3.94 MB.
+#
+# Alignment: app partitions must be 64 KB (0x10000) aligned; data
+# partitions need 4 KB (0x1000). 64 KB is lost in the gap before ffat to
+# keep ffat on a clean 0x800000 boundary at exactly 8 MB long.
+#
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x3F0000,
+app1,     app,  ota_1,   0x400000, 0x3F0000,
+ffat,     data, fat,     0x800000, 0x800000,

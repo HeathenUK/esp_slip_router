@@ -52,7 +52,9 @@
 #define IN_BUF_SIZE   8192
 #define LINE_BUF_SIZE 1024
 #define REQ_BUF_SIZE  1024
-#define TCP_RECV_BUF  16384
+#define TCP_RECV_BUF  16384     // Match stock HTGET so our numbers reflect
+                                // what a stock-mTCP user would actually see.
+                                // PACKET_BUFFERS also kept at stock 20.
 #define CONNECT_TO_MS 10000
 #define IDLE_TO_MS    30000
 
@@ -95,6 +97,19 @@ static void log_open( void )
     setbuf( g_log, NULL );      // unbuffered so we don't lose data on crash
 }
 
+/* DOS 3.3+ Commit File (INT 21h AH=68h): flush this handle's data and
+ * update its directory entry NOW without closing. setbuf(NULL) only kills
+ * the C-runtime buffer -- DOS still defers the FAT/dirent write until
+ * close, so a hard crash leaves the file at 0 bytes on disk. */
+static void log_commit( void )
+{
+    union REGS r;
+    if ( !g_log ) return;
+    r.h.ah = 0x68;
+    r.x.bx = (unsigned)fileno( g_log );
+    int86( 0x21, &r, &r );
+}
+
 static void log_print( const char *fmt, ... )
 {
     va_list ap;
@@ -104,6 +119,7 @@ static void log_print( const char *fmt, ... )
     va_start( ap, fmt );
     if ( g_log ) vfprintf( g_log, fmt, ap );
     va_end( ap );
+    log_commit();
 }
 
 static void log_section( const char *name )
@@ -156,13 +172,33 @@ static unsigned short int14( unsigned char ah, unsigned char al,
     return r.x.ax;
 }
 
+static int g_has_block_read = 0;
 static int probe_fossil( unsigned dx )
 {
     union REGS r;
     r.h.ah = 0x04; r.h.al = 0xFF;
     r.x.bx = 0x4F50; r.x.dx = dx;
     int86( 0x14, &r, &r );
-    return ( r.x.ax == 0x1954 );
+    if ( r.x.ax != 0x1954 ) return 0;
+    g_has_block_read = ( r.h.bl >= 0x18 );    // FOSSIL advertises AH=18h block-read
+    return 1;
+}
+
+// FOSSIL AH=18h non-blocking block-read. ES:DI=buf, CX=count. Returns
+// bytes actually copied. CHUSB supports this; without it we do per-byte
+// AH=03+02 which is 2 INT 14h per byte (~100x slower for bulk RX).
+static unsigned fos_recv_block_ah18( unsigned port,
+                                     unsigned char __far *buf, unsigned count )
+{
+    struct SREGS s; union REGS r;
+    segread( &s );
+    s.es = FP_SEG( buf );
+    r.x.di = FP_OFF( buf );
+    r.h.ah = 0x18;
+    r.x.cx = count;
+    r.x.dx = port;
+    int86x( 0x14, &r, &r, &s );
+    return r.x.ax;
 }
 
 static void fos_send_byte( unsigned port, unsigned char ch )
@@ -643,11 +679,16 @@ static void phase_2_hayes( const char *url )
         unsigned long last_bytes = 0;
         const unsigned long silence = 90;     // 5 s of silence => end
         for (;;) {
-            unsigned r = 0;
-            int c;
-            // Inline pump: drain everything available, dump to file
-            while ( ( c = fos_recv_nowait( g_port ) ) >= 0 && r < IN_BUF_SIZE ) {
-                g_inbuf[r++] = (unsigned char)c;
+            unsigned r;
+            if ( g_has_block_read ) {
+                r = fos_recv_block_ah18( g_port,
+                    (unsigned char __far *)g_inbuf, IN_BUF_SIZE );
+            } else {
+                int c;
+                r = 0;
+                while ( ( c = fos_recv_nowait( g_port ) ) >= 0 && r < IN_BUF_SIZE ) {
+                    g_inbuf[r++] = (unsigned char)c;
+                }
             }
             if ( r ) {
                 got += r;
@@ -660,9 +701,12 @@ static void phase_2_hayes( const char *url )
             if ( ( bios_ticks() - last_tick ) >= 18 ) {
                 unsigned long db = got - last_bytes;
                 unsigned long dt = bios_ticks() - last_tick;
+                unsigned long kbps10;
                 if ( !dt ) dt = 1;
-                printf( "  ... %lu bytes (%lu KB/s)        \r",
-                        got, db * 1820UL / dt / 1024UL );
+                // bytes/sec = db * 18.2 / dt; KB/s = /1024; *10 for tenths
+                kbps10 = db * 10UL * 18UL / dt / 1024UL;
+                printf( "  ... %lu bytes (%lu.%lu KB/s)        \r",
+                        got, kbps10 / 10, kbps10 % 10 );
                 last_tick = bios_ticks();
                 last_bytes = got;
             }
@@ -706,6 +750,12 @@ static inline void mtcp_pump( void )
     Tcp::drivePackets();
     Dns::drivePendingQuery();
 }
+// NOTE: the previous version invoked INT 0x1C from here to defeat
+// FOSSLIP's 18.2 Hz RX cap. That broke mTCP -- calling FOSSLIP's
+// timer-context handler from app context re-entered its upcall path
+// while mTCP was already inside its own packet processing, corrupting
+// the RX queue. Connect attempts then timed out. The clean fix lives
+// in FOSSLIP itself (poll RX inside send_pkt / expose a custom AH).
 
 static int mtcp_resolve( const char *name, IpAddr_t out )
 {
@@ -807,6 +857,76 @@ static int mtcp_read_line( char *out, unsigned cap )
 // Common mTCP HTTP download (used by phases 3 + 4). Spawns FOSSLIP itself.
 // ---------------------------------------------------------------------------
 
+// Spawn FOSSLIP + bring up mTCP. Returns 0 on success.
+static int mtcp_session_setup( void )
+{
+    char *fosslip_argv[5];
+    int rc;
+
+    magic_escape();
+    fos_send_str( g_port, "AT\rAT$MODE=SLIP\r" );
+    wait_ms( 700 );
+    fos_drain( g_port, 200 );
+
+    fosslip_argv[0] = (char *)"FOSSLIP.EXE";
+    fosslip_argv[1] = (char *)"0x60";
+    fosslip_argv[2] = (char *)"1";
+    fosslip_argv[3] = (char *)"115200";
+    fosslip_argv[4] = NULL;
+    rc = spawnvp( P_WAIT, "FOSSLIP.EXE", fosslip_argv );
+    if ( rc < 0 ) { log_print( "FOSSLIP spawn failed (rc=%d)\n", rc ); return -1; }
+    log_print( "FOSSLIP loaded\n" );
+
+    if ( Utils::parseEnv() ) { log_print( "MTCPCFG parse failed\n" ); return -1; }
+    if ( Utils::initStack( 1, TCP_SOCKET_RING_SIZE, ctrlBreakHandler, ctrlBreakHandler ) ) {
+        log_print( "mTCP initStack failed\n" );
+        return -1;
+    }
+    return 0;
+}
+
+static void mtcp_session_teardown( void )
+{
+    Utils::endStack();
+    g_sock = NULL;
+    {
+        union REGS r;
+        r.h.ah = 0x05;
+        int86( 0x60, &r, &r );
+        log_print( "FOSSLIP unloaded\n" );
+    }
+    magic_escape();
+    log_print( "back in MODEM mode\n" );
+}
+
+// Do one HTTP download. Assumes mTCP + FOSSLIP already up via
+// mtcp_session_setup(). Does NOT teardown -- caller does that.
+// mtcp_read_line uses static state; reset between calls.
+static unsigned char g_mread_buf[1024];
+static unsigned      g_mread_len = 0;
+static unsigned      g_mread_pos = 0;
+static int mtcp_read_line_2( char *out, unsigned cap )
+{
+    unsigned n = 0;
+    for (;;) {
+        while ( g_mread_pos >= g_mread_len ) {
+            int16_t rc;
+            if ( g_userBreak ) return -1;
+            mtcp_pump();
+            rc = g_sock->recv( g_mread_buf, sizeof g_mread_buf );
+            if ( rc > 0 ) { g_mread_len = rc; g_mread_pos = 0; break; }
+            if ( rc < 0 ) return -1;
+            if ( g_sock->isRemoteClosed() ) return -2;
+        }
+        {
+            unsigned char c = g_mread_buf[g_mread_pos++];
+            if ( c == '\r' ) continue;
+            if ( c == '\n' ) { out[n] = 0; return (int)n; }
+            if ( n + 1 < cap ) out[n++] = (char)c;
+        }
+    }
+}
+
 static void mtcp_run_phase( const char *label, const char *url )
 {
     IpAddr_t host;
@@ -814,52 +934,25 @@ static void mtcp_run_phase( const char *label, const char *url )
     int have_clen = 0;
     int reqlen;
     unsigned long t_body, t_done, got = 0;
-    int rc;
-    char *fosslip_argv[5];
 
     log_section( label );
     log_print( "URL=%s\n", url );
-
     if ( parse_url( url ) ) { log_print( "bad URL\n" ); return; }
     log_print( "host=%s:%u path=%s\n", g_host, g_port_num, g_path );
 
-    magic_escape();
-    fos_send_str( g_port, "AT\rAT$MODE=SLIP\r" );
-    wait_ms( 700 );
-    fos_drain( g_port, 200 );
-
-    // Load FOSSLIP TSR by spawning it. After it install-exits, INT 0x60 is
-    // hooked. mTCP code in this binary then uses that hook.
-    fosslip_argv[0] = (char *)"FOSSLIP.EXE";
-    fosslip_argv[1] = (char *)"0x60";
-    fosslip_argv[2] = (char *)"1";
-    fosslip_argv[3] = (char *)"115200";
-    fosslip_argv[4] = NULL;
-    rc = spawnvp( P_WAIT, "FOSSLIP.EXE", fosslip_argv );
-    if ( rc < 0 ) {
-        log_print( "FOSSLIP spawn failed (rc=%d)\n", rc );
-        magic_escape();
-        return;
-    }
-    log_print( "FOSSLIP loaded\n" );
-
-    if ( Utils::parseEnv() ) { log_print( "MTCPCFG parse failed\n" ); goto cleanup; }
-    if ( Utils::initStack( 1, TCP_SOCKET_RING_SIZE, ctrlBreakHandler, ctrlBreakHandler ) ) {
-        log_print( "mTCP initStack failed\n" );
-        goto cleanup;
-    }
+    // Reset mtcp_read_line state for fresh socket
+    g_mread_len = 0; g_mread_pos = 0;
+    g_sock = NULL;
 
     if ( mtcp_resolve( g_host, host ) ) {
         log_print( "DNS fail for %s\n", g_host );
-        Utils::endStack();
-        goto cleanup;
+        return;
     }
     log_print( "resolved %s -> %u.%u.%u.%u\n", g_host, host[0], host[1], host[2], host[3] );
 
     if ( mtcp_connect( host, g_port_num ) ) {
         log_print( "connect fail\n" );
-        Utils::endStack();
-        goto cleanup;
+        return;
     }
     log_print( "connected\n" );
 
@@ -868,21 +961,20 @@ static void mtcp_run_phase( const char *label, const char *url )
         "Connection: close\r\n\r\n", g_path, g_host );
     if ( mtcp_send_all( (unsigned char *)g_req, (unsigned)reqlen ) ) {
         log_print( "GET send fail\n" );
-        Utils::endStack();
-        goto cleanup;
+        return;
     }
 
     // Status + headers
     {
-        int n = mtcp_read_line( g_line, sizeof g_line );
-        if ( n < 0 ) { log_print( "no status line\n" ); Utils::endStack(); goto cleanup; }
+        int n = mtcp_read_line_2( g_line, sizeof g_line );
+        if ( n < 0 ) { log_print( "no status line\n" ); return; }
         log_print( "%s\n", g_line );
         if ( strncmp( g_line, "HTTP/", 5 ) || !strstr( g_line, "200" ) ) {
-            log_print( "non-200\n" ); Utils::endStack(); goto cleanup;
+            log_print( "non-200\n" ); return;
         }
         for (;;) {
-            n = mtcp_read_line( g_line, sizeof g_line );
-            if ( n < 0 ) { log_print( "header timeout\n" ); Utils::endStack(); goto cleanup; }
+            n = mtcp_read_line_2( g_line, sizeof g_line );
+            if ( n < 0 ) { log_print( "header timeout\n" ); return; }
             if ( n == 0 ) break;
             if ( ( g_line[0] == 'C' || g_line[0] == 'c' ) && strlen( g_line ) > 16 ) {
                 const char *p = g_line;
@@ -919,9 +1011,11 @@ static void mtcp_run_phase( const char *label, const char *url )
             if ( ( bios_ticks() - last_tick ) >= 18 ) {
                 unsigned long db = got - last_bytes;
                 unsigned long dt = bios_ticks() - last_tick;
+                unsigned long kbps10;
                 if ( !dt ) dt = 1;
-                printf( "  ... %lu bytes (%lu KB/s)        \r",
-                        got, db * 1820UL / dt / 1024UL );
+                kbps10 = db * 10UL * 18UL / dt / 1024UL;
+                printf( "  ... %lu bytes (%lu.%lu KB/s)        \r",
+                        got, kbps10 / 10, kbps10 % 10 );
                 last_tick = bios_ticks();
                 last_bytes = got;
             }
@@ -940,20 +1034,7 @@ static void mtcp_run_phase( const char *label, const char *url )
                        label, got, centi/100, centi%100, tkb10/10, tkb10%10 );
         }
     }
-
-    Utils::endStack();          // mTCP-side cleanup, releases packet driver
-
-cleanup:
-    g_sock = NULL;
-    // Unload FOSSLIP TSR (INT 0x60 AH=5 = release/unload)
-    {
-        union REGS r;
-        r.h.ah = 0x05;
-        int86( 0x60, &r, &r );
-        log_print( "FOSSLIP unloaded\n" );
-    }
-    magic_escape();
-    log_print( "back in MODEM mode\n" );
+    return;                   // caller does endStack + FOSSLIP unload
 }
 
 // ---------------------------------------------------------------------------
@@ -984,8 +1065,20 @@ int main( int argc, char **argv )
     phase_0_baseline();
     phase_1_slip_udp();
     phase_2_hayes( url_inet );
-    mtcp_run_phase( "PHASE 3 -- mTCP HTTP via LAN",      url_lan );
-    mtcp_run_phase( "PHASE 4 -- mTCP HTTP via INTERNET", url_inet );
+
+    // Phases 3 + 4 share one FOSSLIP install + one mTCP init. Loading
+    // FOSSLIP and bringing up mTCP per-phase doesn't work reliably -- the
+    // unload + reload + reinit sequence corrupts state.
+    log_section( "PHASES 3+4 -- mTCP setup" );
+    if ( mtcp_session_setup() == 0 ) {
+        mtcp_run_phase( "PHASE 3 -- mTCP HTTP via LAN",      url_lan );
+        mtcp_run_phase( "PHASE 4 -- mTCP HTTP via INTERNET", url_inet );
+        mtcp_session_teardown();
+    } else {
+        log_print( "mTCP setup failed -- skipping phases 3+4\n" );
+        // Try to put dongle back in a known state regardless
+        magic_escape();
+    }
 
     log_section( "DONE" );
     log_print( "log saved to %s\n", LOG_FILENAME );
