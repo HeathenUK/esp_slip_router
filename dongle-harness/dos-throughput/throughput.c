@@ -113,20 +113,47 @@ static unsigned long bios_ticks(void)
     return *(unsigned long __far *)MK_FP(0x0040U, 0x006CU);
 }
 
-/* FOSSIL AH=0Bh send-no-wait. Returns non-zero if char queued. Bounded
- * retry loop matches usbterm.c's send path. Sends the single byte; caller
- * counts. */
-static int fossil_send(unsigned port, unsigned char ch)
+/* DOS yield: INT 28h tells DOSBox (and TSRs / DOS itself) it's OK to
+ * pre-empt. Sprinkle into spin loops so BNU's transmit task gets cycles. */
+static void dos_yield(void)
 {
-    int tries;
-    for (tries = 0; tries < 4096; ++tries) {
-        if (int14(0x0B, ch, 0, 0, port) != 0U) return 1;
-    }
-    return 0;   /* gave up -- TX ring stuck */
+    union REGS r;
+    int86(0x28, &r, &r);
 }
 
-/* Send a buffer of bytes the long way (modem prompt). Tolerates the small
- * delay between bytes; not used in the hot loop. */
+/* FOSSIL AH=0Bh send-no-wait. Returns non-zero if char queued. Retries
+ * forever -- the harness has a wall-clock alarm to kill DOSBox if BNU
+ * truly wedges. Yields to DOS every 256 spins so BNU can drain TX. */
+static int fossil_send(unsigned port, unsigned char ch)
+{
+    unsigned long tries;
+    for (tries = 0UL; ; ++tries) {
+        if (int14(0x0B, ch, 0, 0, port) != 0U) return 1;
+        if ((tries & 0xFFUL) == 0xFFUL) dos_yield();
+    }
+}
+
+/* FOSSIL AH=19h "block-write" -- ES:DI = buffer, CX = count. Returns
+ * the number of bytes actually queued. Real bulk write; one INT 14h per
+ * packet instead of ~1KB. Far pointer needed because Watcom medium model
+ * defaults to near (DS). */
+static unsigned fossil_send_block(unsigned port,
+                                  const unsigned char __far *buf, unsigned count)
+{
+    struct SREGS s;
+    union REGS r;
+    segread(&s);
+    s.es = FP_SEG(buf);
+    r.x.di = FP_OFF(buf);
+    r.h.ah = 0x19U;
+    r.x.cx = count;
+    r.x.dx = port;
+    int86x(0x14, &r, &r, &s);
+    return r.x.ax;
+}
+
+/* Send a buffer of bytes the slow but reliable way: per-byte AH=0Bh
+ * with yield. Used for the AT prompt / escape (short, latency tolerant). */
 static int fossil_send_buf(unsigned port, const unsigned char *buf, unsigned len)
 {
     unsigned i;
@@ -494,15 +521,20 @@ int main(int argc, char **argv)
         t0 = bios_ticks();
         while ((bios_ticks() - t0) < deadline_ticks) {
             bump_ident_and_fix_csum();
-            /* Inline byte-blast: avoid per-call function overhead by
-             * writing directly through fossil_send. Bounded retry so a
-             * stuck CHUSB ring eventually surfaces instead of hanging. */
-            for (k = 0; k < slip_len; ++k) {
-                if (!fossil_send((unsigned)port_index, slip_buf[k])) {
-                    /* TX wedged -- abort the run. Report what we got. */
-                    goto done;
+            /* AH=19h block-write: one INT 14h per packet. The kernel
+             * accepts as much as fits in BNU's TX ring; we retry the
+             * rest with a yield so BNU can drain. */
+            {
+                unsigned remaining = slip_len;
+                const unsigned char __far *p = (const unsigned char __far *)slip_buf;
+                unsigned w;
+                while (remaining) {
+                    w = fossil_send_block((unsigned)port_index, p, remaining);
+                    if (w == 0U) { dos_yield(); continue; }
+                    p += w; remaining -= w;
                 }
             }
+            (void)k;
             ++pkts;
             bytes += slip_len;
         }
@@ -511,9 +543,9 @@ int main(int argc, char **argv)
         ticks = t1 - t0;
         if (ticks == 0UL) ticks = 1UL;
 
-        /* Print: seconds = ticks * 100 / 1820 (centi-seconds). */
+        /* Print: centi-seconds = ticks * 10000 / 1820 (BIOS tick ≈ 0.055s). */
         {
-            unsigned long centi = (ticks * 100UL + 9UL) / 1820UL;   /* ~0.01s */
+            unsigned long centi = (ticks * 10000UL + 910UL) / 1820UL;
             unsigned long kb_per_s;        /* KB/s integer part */
             unsigned long kb_per_s_frac;   /* tenths */
             /* bytes/sec = bytes * 1820 / (ticks * 100). KB/s = bytes/sec/1024.
