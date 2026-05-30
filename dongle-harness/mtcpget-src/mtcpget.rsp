@@ -3,13 +3,13 @@ format dos
 option map
 option eliminate
 option stack=8192
-name htget.exe
+name mtcpget.exe
 file arp.obj
 file dns.obj
 file eth.obj
-file htget.obj
 file ip.obj
 file ipasm.obj
+file mtcpget.obj
 file packet.obj
 file tcp.obj
 file tcpsockm.obj
