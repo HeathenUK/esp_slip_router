@@ -4,31 +4,32 @@ Design and implementation plan. Replaces SLIP as the high-throughput data
 path between the Pocket386 (DOS) and the T-Dongle S3, while preserving the
 existing Hayes/AT mode for byte-streaming use cases.
 
-Target: end-to-end mTCP throughput on a 386SX-40 in the 60-100 KB/s
-range (10-15x today's SLIP at 6 KB/s; 1.5-2.5x today's Hayes at 42 KB/s).
-The new wall after this work is mTCP's per-segment TCP cost on the 386,
-not framing, not FOSSIL, not USB.
+**Hypothesis** (not a target): end-to-end mTCP throughput on a 386SX-40
+lands somewhere in 60-100 KB/s — 10-15x today's SLIP at 6 KB/s, 1.5-2.5x
+today's Hayes at 42 KB/s. The wall after this work is mTCP's per-segment
+TCP cost on the 386, not framing, not FOSSIL, not USB. Phase 8
+measurements confirm or refute.
+
+Document history: initial draft committed, then red-teamed and rewritten
+(this revision). Red-team notes in commit history.
 
 ## Goals & non-goals
 
 ### Goals
-- DOS runs **unmodified** mTCP (and any other packet-driver client) via a
-  new TSR (`USBNET.COM`).
+- DOS runs **unmodified** mTCP via a new TSR (`USBNET.COM`) implementing
+  the FTP Software Packet Driver Spec v1.11 on INT 60h.
 - Heavy stuff that *can* be offloaded *is* offloaded to the dongle: ARP,
-  DHCP, DNS, IP routing/NAPT, link framing. DOS does TCP/UDP itself.
+  DNS, IP routing/NAPT, link framing. DOS does TCP/UDP itself.
 - Hayes/AT mode stays as a peer mode; mode switching is in-band.
-- **CHUSB is not modified.** The dongle continues to enumerate as plain
-  USB-CDC-ACM. The TSR uses CHUSB's existing bulk-I/O API the same way
-  any CDC user would.
+- **CHUSB is not modified.** Dongle continues to enumerate as plain
+  USB-CDC-ACM. TSR uses CHUSB's existing bulk-I/O API.
 - No FOSSIL on the packet-driver data path.
 
 ### Non-goals
-- We do *not* offload TCP. mTCP runs TCP on the 386 because that's what an
-  mTCP-compatible packet driver requires. If we ever want TCP-on-dongle
-  with a DOS app, that's what Hayes is for; this design does not preclude
-  layering a separate "socket" API on top of CDC later.
-- We do not accelerate Hayes here.
-- We do not retain SLIP as a third mode once PACKET works. (Retire it.)
+- We do *not* offload TCP. mTCP runs TCP on the 386 because that's what
+  an mTCP-compatible packet driver requires.
+- We do not accelerate Hayes.
+- We do not retain SLIP as a third mode once PACKET works.
 
 ## Architecture
 
@@ -46,10 +47,20 @@ not framing, not FOSSIL, not USB.
 +-----------------------+                              +------------------------+
 ```
 
-The dongle remains a generic USB-CDC-ACM device. The new code is:
-1. A DOS TSR using CHUSB for bulk RX/TX on the CDC endpoints.
-2. Firmware additions to terminate ARP/DNS and route IP via NAPT (most of
-   which we already have for SLIP).
+## Where the throughput gains come from
+
+Honest accounting of which parts of the design contribute what:
+
+| Source of win                          | Magnitude     |
+|----------------------------------------|---------------|
+| No FOSSIL on the data path             | **Large**     |
+| Bulk-aligned CHUSB reads (no per-byte) | **Large**     |
+| ARP/DHCP/DNS offload to dongle         | Small         |
+| Length-prefixed framing (no stuffing)  | Small (~5%)   |
+| L4 (TCP) offload                       | **Zero** — we don't do this |
+
+The framing choice is for simplicity, not throughput. The big win is
+removing FOSSIL and letting CHUSB do its bulk-shaped thing.
 
 ## Transport: framing on the CDC bulk pipe
 
@@ -67,202 +78,257 @@ Length-prefixed framing. No byte-stuffing.
 - `TYPE`:
   - `0x01` IP datagram (bulk traffic, both directions)
   - `0x10` MODE_SWITCH (payload = "MODEM" | "PACKET")
-  - `0x11` PING / heartbeat (diagnostic, optional)
-  - `0xFF` reserved / error
-- No link-layer CRC — USB already provides one at the bulk layer.
+  - `0x11` PING / heartbeat (diagnostic)
+  - `0xFF` reserved
+- No link-layer CRC — USB has one already.
 
-This eliminates SLIP byte-stuffing CPU on the 386. Modest win on its own
-(~5%); the bigger framing-related win is just having a cheap deframer.
+Mode-switch protocol:
+- `MODEM → PACKET`: TSR writes literal AT command `AT$MODE=PACKET\r`
+  to CDC. Dongle replies `\r\nOK\r\n` then **only after the OK has fully
+  drained from the CDC TX FIFO** flips to PACKET mode. (Existing
+  `cmd_dollar_mode` in `modem.c` already orders `r_ok()` before the
+  mode flip; verify and document.)
+- `PACKET → MODEM`: TSR sends framed MODE_SWITCH("MODEM"). Dongle flips
+  to MODEM mode after draining current TX. No reply expected.
 
 ## DOS-side TSR (USBNET.COM)
 
-Resident, ~10-15 KB code + RX ring buffer:
+Resident, ~10-15 KB code + RX ring buffer.
 
-1. **On load**:
-   - Locate dongle via CHUSB (CDC-ACM with our VID/PID; `/UNIT:n` for
-     multi-device).
-   - Send `AT$MODE=PACKET\r` once to force the dongle into PACKET mode.
-     Wait for the `OK` then switch our own RX path to framed mode.
-   - Hook INT 60h, presenting FTP Software Packet Driver Spec v1.11.
-   - Hook a high-rate timer source for RX polling (see "Open question"
-     below — INT 28h alone is *not* fast enough).
-   - Print: `usbnet: ready, mac=02:01:xx:xx:xx:xx mtu=1500`. Resident.
+### Load sequence
+1. Locate dongle via CHUSB (CDC-ACM with our VID/PID, first match).
+2. Write `AT$MODE=PACKET\r` to CDC, read back until seeing `\r\nOK\r\n`
+   or timeout (5s).
+3. Switch own RX parser to framed mode.
+4. Send framed PING, expect framed PING reply (handshake confirmation).
+5. Hook INT 60h with packet driver dispatch.
+6. Install RX servicing hook (see "Polling cadence" below — depends on
+   Phase 0 outcome).
+7. Print `usbnet: ready, mac=02:11:22:33:44:55, mtu=1500`. Resident.
 
-2. **Packet Driver INT 60h interface**:
-   - `driver_info` — class=1 (Ethernet), type=our assigned constant
-   - `access_type`, `release_type`, `send_pkt`, `get_address`
-   - `reset_interface`, `as_send_pkt`, `get_parameters`, `terminate`
+### Packet Driver INT 60h interface
+- `driver_info` — class=1 (Ethernet), type=our assigned constant,
+  number=0, name="USBNET"
+- `access_type`, `release_type`, `send_pkt`, `get_address`
+- `reset_interface`, `as_send_pkt`, `get_parameters`, `terminate`
+- Optional diagnostic subfunctions (0xF0+): expose packet/byte
+  counters, ring depth, drop count.
 
-3. **TX path** (`send_pkt`):
-   - Caller hands a complete Ethernet frame in ES:DI.
-   - We strip the 14-byte ETH header (we know dst=gw_mac, src=our_mac,
-     type=0x0800 or 0x0806), framing wraps the L3 body, push to CHUSB.
-   - **ARP (0x0806) traverses USB** — the dongle answers. (See red-team:
-     this is simpler than DOS-side ARP intercept and ARP traffic is
-     negligible.)
-   - **IPv4 (0x0800)** is the bulk case.
-   - Drop other EtherTypes (no IPv6 in mTCP).
+### Synthetic MAC addresses
+Hardcoded, locally-administered:
+- Our MAC (DOS side): `02:11:22:33:44:55`
+- Gateway MAC (dongle side): `02:11:22:33:44:01`
 
-4. **RX path**:
-   - Drain function reads from CHUSB into ring, parses framing:
-     - `0x01` IP → prepend synthetic ETH header
-       (`dst=our_mac, src=gw_mac, type=0x0800`), deliver via registered
-       handler.
-     - `0x10` MODE_SWITCH — log and ignore (TSR doesn't gracefully
-       reload mid-op; user issues UNLOAD first).
-     - Other types → log + drop.
-   - Drain is called from: (a) the periodic timer hook (b) inside
-     `send_pkt` after TX completes.
+mTCP only ever sees these via ARP responses from the dongle and via
+its own `get_address` query. No collision risk on the point-to-point
+link.
 
-5. **On unload (`/U`)**:
-   - Send `MODE=MODEM` framed control message to dongle to return to
-     Hayes.
-   - Unhook INT 60h and the timer hook.
+### TX path (`send_pkt`)
+- Caller hands a complete Ethernet frame in ES:DI, length CX.
+- Read EtherType (offset 12). Only `0x0800` (IPv4) and `0x0806` (ARP)
+  are expected; others dropped.
+- Strip 14-byte ETH header.
+- Wrap L3 body in framing (`A5 LEN 01 <bytes>`).
+- Push via CHUSB bulk write.
+- Drain RX opportunistically before returning.
 
-6. **Identity**:
-   - Synthetic MAC, locally-administered prefix: `02:01:xx:xx:xx:xx`
-     where the low 24 bits come from the dongle's WiFi MAC (read once
-     at load via an AT query, e.g. `AT$MAC`).
-   - Gateway MAC: `02:02:xx:xx:xx:xx` with the same low 24.
-   - This keeps both stable across reboots and unique per dongle.
+### RX path
+- Drain function reads non-blockingly from CHUSB into ring, parses
+  frames:
+  - `0x01` IP → prepend synthetic ETH header (`dst=our_mac,
+    src=gw_mac, type=0x0800`) → deliver via registered handler.
+  - `0x10` MODE_SWITCH → log + ignore.
+  - Other → log + drop.
+- Drain is called from: (a) timer hook (see polling cadence), (b)
+  inside `send_pkt` after TX.
 
-7. **No DHCP/CONFIG_REQ.** Network config (IP/mask/gw/ns) lives in
-   `MTCP.CFG` as mTCP already expects. The TSR doesn't care about
-   L3 — it only owns the synthetic MAC.
+### Polling cadence (depends on Phase 0)
+Decision tree resolved by Phase 0:
+- **If CHUSB exposes an interrupt callback for endpoint completion**:
+  register callback, drain there. Best case.
+- **If CHUSB requires polling but has a fast non-blocking poll-for-data
+  call**: hook INT 1Ch (~18 Hz, too slow on its own) **plus** poll
+  inside `send_pkt`. Adequacy depends on application traffic pattern.
+- **If neither works**: design needs revisiting. Possible alternatives:
+  reprogram PIT to ~1 kHz (breaks DOS time-of-day unless we chain-call
+  original handler), use INT 09h keyboard hook (cursed but possible),
+  or accept polling at INT 1Ch rate as a hard ceiling (~25 KB/s with
+  ring oversizing — about 4x SLIP, still useful).
+
+### Unload (`/U`)
+- Send framed MODE_SWITCH("MODEM").
+- Unhook INT 60h and timer/interrupt hook.
+- Release resident memory.
+
+### Resident footprint estimate
+- RX ring: 16 × 1536 = 24 KB
+- TX scratch: 1.5 KB
+- Code + state: ~6-10 KB
+- **Total: ~32-36 KB**. Acceptable if loaded high (UMB); concerning
+  in conventional RAM. Measure early in Phase 5; can shrink ring if
+  needed.
 
 ## Dongle-side firmware changes
 
-Most of this already exists for SLIP mode and is being adapted.
+Most of this exists for SLIP and is being adapted.
 
-1. **lwIP netif `usbnet0`** — replaces the SLIP netif. Same role,
-   different framing on the wire.
-
+1. **lwIP netif `usbnet0`** — replaces SLIP netif.
 2. **Framer/deframer** — replaces SLIP encode/decode on the CDC path
-   when in PACKET mode. Counters surface via `/net-stats`.
-
+   when in PACKET mode.
 3. **ARP responder on usbnet0** — answers any ARP for `gw_ip` or any
-   address mTCP probes locally. Pure synthesis.
+   address mTCP probes locally. Pure synthesis with the hardcoded
+   gateway MAC.
+4. **DNS forwarder** — UDP socket bound on `192.168.240.1:53`. Resolves
+   via `getaddrinfo` over WiFi, synthesizes DNS response.
+5. **NAPT** — on usbnet0 netif (the "inverted" IDF API we already
+   handle).
+6. **Mode-switching** — extend existing MODEM/SLIP/PACKET state, retire
+   SLIP after Phase 10.
+7. **`/net-stats` HTTP endpoint** — replaces `/slip-stats`. Counters:
+   pkts/bytes in/out, framer errors, ARP requests answered, DNS
+   queries forwarded, NAPT translations.
 
-4. **DNS forwarder** — UDP socket on `192.168.240.1:53`. On query:
-   resolve via dongle's WiFi resolver, synthesize DNS response.
-   ~1-2 hours of code; bundled with this work since `MTCP.CFG` will
-   point `NAMESERVER` at the dongle.
+## MTCP.CFG changes
 
-5. **NAPT** — keep on the usbnet0 netif (the "inverted" IDF API we
-   already handle correctly).
-
-6. **Mode-switching state machine**:
-
+```diff
+  PACKETINT 0x60
+  HOSTNAME bolo
+  IPADDR 192.168.240.2
+  NETMASK 255.255.255.0
+  GATEWAY 192.168.240.1
+- NAMESERVER 1.1.1.1
++ NAMESERVER 192.168.240.1
+  MTU 1500
 ```
-        ┌──────────┐  AT$MODE=PACKET / framed MODE_SWITCH("PACKET")  ┌──────────┐
-        │  MODEM   │ ───────────────────────────────────────────────▶│  PACKET  │
-        │ (Hayes)  │ ◀───────────────────────────────────────────── │ (usbnet) │
-        └──────────┘  AT$MODE=MODEM (via TSR) / framed MODE_SWITCH    └──────────┘
-                                                                        │
-                          GPIO0 long-press cycles MODEM ↔ PACKET
-                          /mode?to=PACKET|MODEM HTTP endpoint
-                          AT$MODE=PACKET|MODEM AT command
-```
 
-   - Two modes only: MODEM (Hayes), PACKET (new).
-   - SLIP retires once PACKET works.
-   - Mode persisted in NVS as today.
-   - Switching from MODEM→PACKET: AT command from TSR load.
-   - Switching from PACKET→MODEM: framed MODE_SWITCH from TSR unload.
+Plus our new TSR loaded before mTCP at boot.
 
-7. **`/net-stats` HTTP endpoint** — replaces `/slip-stats`. Same
-   counters + ARP/DNS counters.
+## PROFILE.EXE changes
 
-8. **`AT$MAC` AT command** — returns the dongle's WiFi MAC so the TSR
-   can derive its synthetic MAC from the low 24 bits. (Trivial: already
-   accessible via `esp_wifi_get_mac`.)
+Out of scope for the firmware/TSR work but tracked separately:
+- Phase 1 (raw FOSSIL SLIP UDP throughput): retire — measures something
+  no longer in the data path.
+- Phase 2 (Hayes HTTP): unchanged.
+- Phase 3 (mTCP HTTP via LAN): unchanged BAT-level invocation; now goes
+  through USBNET.COM instead of FOSSLIP.EXE.
+- Phase 4 (mTCP HTTP via Internet + DNS): same change as Phase 3.
+
+A separate PROFILE rebuild + redeploy after Phase 8.
 
 ## What we don't do (and why)
 
-- **No custom CDC interface, descriptor, or class.** Plain CDC-ACM.
-  CHUSB sees it like any USB serial dongle.
-- **No DOS-side ARP intercept.** ARP traffic is negligible; let the
-  dongle answer over USB. Less code, fewer bugs.
+- **No custom CDC interface/descriptor/class.** Plain CDC-ACM.
+- **No DOS-side ARP intercept.** ARP traffic is negligible; dongle
+  answers over USB.
 - **No DOS-side TCP offload API.** Out of scope.
-- **No link-layer CRC.** USB has one already.
-- **No byte-stuffing.** Length-prefixed framing on atomic USB bulk.
+- **No link-layer CRC.** USB has one.
+- **No byte-stuffing.** Length-prefixed framing.
+- **No `/UNIT:n` arg.** One dongle.
+- **No `AT$MAC` round-trip.** Hardcoded synthetic MACs.
 
 ## Implementation plan
 
-Each phase ends with something testable.
+### Phase 0 — CHUSB feasibility (HARD GATE)
 
-**Phase 0 — CHUSB API spike** (before any other work).
-Read CHUSB headers/docs. Confirm:
-- Non-blocking bulk read (or timed-poll with short timeout).
-- A path to high-rate RX servicing (interrupt hook, INT 1Ch, custom
-  timer reprog — find out what's available).
-- TX completion semantics.
-If non-blocking RX isn't viable, the entire DOS-side architecture has
-to be reconsidered. **Do not skip.**
+**Output**: A 1-page note in `dongle-harness/CHUSB_API_NOTES.md`
+answering, with concrete CHUSB function/macro names where they exist:
 
-**Phase 1 — dongle: PACKET mode skeleton.**
+1. Is there an **interrupt callback** API for endpoint completion?
+2. If not, is there a **non-blocking poll** for "data available on
+   bulk IN endpoint"?
+3. What's the **bulk read/write API** for arbitrary lengths up to MTU?
+4. Can **MSC and CDC traffic coexist** on the same composite device,
+   or does CHUSB serialize them?
+5. Are there **any hooks for high-rate servicing** other than INT 28h
+   idle?
+
+**Go criterion**: At least (1) or (2) is true and (4) is yes.
+**No-go**: design needs revisiting before further work.
+
+Source: read CHUSB headers/docs (user-supplied; do not reverse-engineer
+without permission). Ask user pointed questions if docs are silent.
+
+### Phase 1 — Dongle: PACKET mode skeleton
+
 New netif, framer, mode-switch wiring (NVS, `/mode`, `AT$MODE`, GPIO0).
-SLIP stays parallel for safety during transition. Mac-side Python test
-script: open CDC, send a framed IP packet, see it counted.
+SLIP stays parallel for safety.
 
-**Phase 2 — dongle: ARP responder + DNS forwarder.**
-Both bound to usbnet0. Mac script fires ARP and DNS, sees correct
-synthesized replies.
+**Test from Mac**: Python script opens CDC, sends `AT$MODE=PACKET\r`,
+reads `OK`, sends a framed PING, expects framed PING reply.
 
-**Phase 3 — dongle: IP forwarding + NAPT on usbnet0.**
-Near-copy of today's SLIP NAPT. Mac script sends framed UDP/ICMP to
-public IP, sees reply.
+### Phase 2 — Dongle: ARP responder + DNS forwarder
 
-**Phase 4 — DOS TSR: skeleton + CHUSB I/O proof.**
-USBNET.COM opens CDC, sends `AT$MODE=PACKET`, sends one framed PING,
-exits. Confirms CHUSB I/O works on the 386.
+Both bound to usbnet0. Mac script fires framed ARP request packets
+(0x0806 EtherType wrapped in our framing? or — given we already
+dropped DOS-side ARP — just direct IP traffic plus DNS queries) and
+DNS queries, sees synthesized replies.
 
-**Phase 5 — DOS TSR: packet driver INT 60h core.**
-`driver_info`, `access_type`, `release_type`, `send_pkt`,
-`get_address`. Tested with a packet-driver dump tool.
+**Note**: re-evaluate during Phase 1 whether ARP should travel framed
+as-is (Ethernet frame in payload) or whether we should run a thin
+"pseudo-Ethernet" layer where the TSR-side strips/re-adds ETH headers.
+The latter saves 14 bytes per frame on the wire; the former is simpler.
+Lean toward saving bytes.
 
-**Phase 6 — DOS TSR: TX path.**
+### Phase 3 — Dongle: IP forwarding + NAPT on usbnet0
+
+Near-copy of today's SLIP NAPT setup.
+
+**Test**: Mac script sends framed UDP to a public IP, sees reply.
+
+### Phase 4 — DOS TSR: skeleton + CHUSB I/O proof
+
+USBNET.COM opens CDC, completes the load handshake (AT$MODE=PACKET,
+PING), exits without going resident. Confirms CHUSB I/O works on the
+386 as Phase 0 predicted.
+
+### Phase 5 — DOS TSR: packet driver INT 60h core
+
+All required subfunctions, tested with a packet-driver diagnostic tool
+(or hand-rolled INT 60h test program). Resident size measured here.
+
+### Phase 6 — DOS TSR: TX path
+
 mTCP sends ARP via TSR → frame appears on dongle's CDC RX → dongle
 ARP responder synthesizes reply → mTCP receives.
 
-**Phase 7 — DOS TSR: RX path & polling.**
-End-to-end mTCP `ping <local-ip>` succeeds. Tune polling cadence
-based on actual loss.
+### Phase 7 — DOS TSR: RX path + polling
 
-**Phase 8 — benchmark + tune.**
-mTCP HTTP GET `192.168.1.226:8765/1M.bin`. Compare to SLIP and
-Hayes. Tune RX ring depth, CHUSB read sizing.
+End-to-end mTCP `ping <local-ip>` succeeds. Tune polling cadence.
 
-**Phase 9 — mode-switch robustness.**
-TSR `/U` unload path, GPIO0 cycle MODEM↔PACKET, AT$MODE round-trip.
+### Phase 8 — Benchmark + tune
 
-**Phase 10 — Internet HTTP GET via mTCP.**
-PROFILE Phase 4 actually works end to end (DNS via forwarder + NAPT).
+mTCP HTTP GET `192.168.1.226:8765/1M.bin`. Compare to SLIP and Hayes.
+**This is where we validate or refute the 60-100 KB/s hypothesis.**
 
-**Phase 11 — retire SLIP.**
-Once PACKET is consistently better, delete SLIP code path. Reduces
-firmware complexity to two modes (MODEM, PACKET).
+### Phase 9 — Mode-switch robustness
 
-**Estimated calendar**: 8-12 days focused. DOS TSR (Phases 4-7) is
-the bulk; dongle side is mostly reassembly of existing pieces.
+TSR `/U` unload, GPIO0 cycle MODEM↔PACKET, AT$MODE round-trip.
 
-## Risks
+### Phase 10 — Internet HTTP GET via mTCP
 
-- **TSR polling cadence (biggest open question).** INT 28h fires only
-  on DOS idle — during heavy mTCP we're not idle. INT 1Ch is ~18 Hz,
-  too slow for 60+ KB/s. Need to find a faster polling path through
-  CHUSB or reprogram a timer. Phase 0 spike must resolve this.
-- **CHUSB bulk RX behavior under bursty load.** If CHUSB doesn't
-  buffer adequately or blocks on read, we drop frames → retransmits.
-- **mTCP packet driver corner cases.** Spec is documented but
-  broadcast/multicast/odd EtherTypes may surface during integration.
-- **TSR resident size.** Estimate 30 KB (24 KB ring + ~10 KB code).
-  Worth measuring early; might force loading high.
-- **Concurrent USB MSC + CDC.** Dongle already does composite
-  MSC+HID+CDC; new code shouldn't disturb that. But TSR holding the
-  CDC open while DOS does MSC reads to the same device is novel —
-  verify CHUSB can multiplex.
+PROFILE.LOG Phase 4 works end-to-end (DNS forwarder + NAPT).
 
-## Open questions for the user
+### Phase 11 — Retire SLIP
 
-None blocking. Plan is to proceed with Phase 0 immediately.
+Delete SLIP code path. Two modes only: MODEM, PACKET.
+
+**Estimated calendar**: 8-12 days focused, gated on Phase 0 outcome.
+
+## Risks (ranked)
+
+1. **TSR polling cadence (Phase 0 gates the whole plan).** Without a
+   high-rate RX servicing path on DOS, this architecture fails. Phase 0
+   must resolve before any other work starts.
+2. **MSC + CDC concurrency under CHUSB.** Novel; verify in Phase 0.
+3. **mTCP packet driver corner cases.** Broadcast/multicast/odd
+   EtherTypes will surface during integration. Mitigate by exercising
+   against actual mTCP source during Phase 5-6.
+4. **TSR resident size.** 32-36 KB estimate. Worth measuring early;
+   could force UMB load.
+5. **Mode-switch handshake races.** The MODEM→PACKET flip depends on
+   the dongle fully draining its TX FIFO before flipping. Verify
+   `cmd_dollar_mode` does this correctly today.
+
+## Open questions
+
+None blocking. Phase 0 starts immediately and will surface any new ones.
