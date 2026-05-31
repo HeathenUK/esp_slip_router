@@ -831,10 +831,16 @@ static void exec(char *line) {
         case 'V': s_verbose = (p[1] != '0'); r_ok(); return;
         case 'Q': s_quiet   = (p[1] == '1'); r_ok(); return;
         case 'I': cdc_print("\r\nDOSongle Modem (Phase 1c)\r\n"); r_ok(); return;
-        case 'N': /* ATN0/1 -- telnet IAC + CR-to-CRLF processing off/on.
-                   * HTTP over Hayes mode needs ATN0 so the dongle
-                   * doesn't double CRs in the request headers. */
-                  s_telnet = (p[1] != '0'); r_ok(); return;
+        case 'N': {
+            /* AT N<n> / AT NET<n> -- telnet IAC + CR-to-CRLF processing.
+             * Old build accepts both "ATN0" and "ATNET0"; HTTPGET.EXE
+             * sends the longer form. Skip over any non-digit letters
+             * after N until we find the digit. */
+            const char *q = p + 1;
+            while (*q && (*q < '0' || *q > '9')) ++q;
+            s_telnet = (*q != '0');
+            r_ok();
+        } return;
         case 'Z': s_echo = true; s_verbose = true; s_quiet = false; s_telnet = true; r_ok(); return;
         case 'D': cmd_dial(p + 1); return;
         case 'H': {
