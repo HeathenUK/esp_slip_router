@@ -140,6 +140,7 @@ static volatile uint32_t s_max_write_us       = 0;
 static volatile uint32_t s_max_write_lba      = 0;
 static volatile uint32_t s_slow_write_count   = 0; /* writes > 50 ms */
 static volatile uint32_t s_max_read_us        = 0;
+static volatile uint32_t s_max_alloc_wait_us  = 0; /* time blocked waiting on clean_sem */
 #define SLOW_WRITE_THRESHOLD_US 50000U
 
 /* ---- cache helpers (multi-slot, async) ----
@@ -173,6 +174,8 @@ static wb_slot_t *wb_find(uint32_t sect_base) {
  * MUST be called with s_io_mutex held; may temporarily release it to
  * wait on the clean-slot semaphore. */
 static esp_err_t wb_alloc_slot(wb_slot_t **out) {
+    int64_t wait_t0 = esp_timer_get_time();
+    bool waited = false;
     for (int spin = 0; spin < 100; ++spin) {     /* runaway guard */
         wb_slot_t *empty_slot = NULL;
         wb_slot_t *clean_lru  = NULL;
@@ -187,18 +190,19 @@ static esp_err_t wb_alloc_slot(wb_slot_t **out) {
         }
         if (empty_slot) {
             *out = empty_slot;
-            return ESP_OK;
+            goto done;
         }
         if (clean_lru) {
             s_wb_evict_count++;          /* displacing a CLEAN slot; no flash op */
             wb_slot_invalidate(clean_lru);
             *out = clean_lru;
-            return ESP_OK;
+            goto done;
         }
         /* All slots are DIRTY or FLUSHING. Wake the worker (if it
          * isn't already busy) and wait for it to promote one to
          * CLEAN. Drop the mutex while we wait so the worker can
          * actually progress. */
+        waited = true;
         xSemaphoreGive(s_wb_dirty_sem);
         xSemaphoreGive(s_io_mutex);
         xSemaphoreTake(s_wb_clean_sem, pdMS_TO_TICKS(200));
@@ -206,6 +210,12 @@ static esp_err_t wb_alloc_slot(wb_slot_t **out) {
     }
     disk_logf("[wb] alloc_slot timeout -- all slots stuck?");
     return ESP_ERR_TIMEOUT;
+done:
+    if (waited) {
+        uint32_t dt = (uint32_t)(esp_timer_get_time() - wait_t0);
+        if (dt > s_max_alloc_wait_us) s_max_alloc_wait_us = dt;
+    }
+    return ESP_OK;
 }
 
 /* Read one full WL sector from flash into the given slot. Caller must
@@ -619,16 +629,55 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
         wb_slot_t *hit = wb_find(sect_base);
         if (hit) {
             /* Cache hit: dirty data may not be on flash yet -- always
-             * serve from RAM so the host sees a consistent view. */
+             * serve from RAM so the host sees a consistent view.
+             * memcpy is safe under mutex; hit pointer stays valid. */
             memcpy(dst, hit->data + sect_off, chunk);
             hit->last_use_us = (uint64_t)esp_timer_get_time();
         } else {
-            esp_err_t e = wl_read(s_wl, addr, dst, chunk);
+            /* Miss: pre-warm the cache. Allocate a slot, load the
+             * FULL 4 KB sector (even if the host only asked for
+             * part of it), then memcpy the requested portion out.
+             *
+             * Why: typical host pattern is read-modify-write on
+             * FAT/dir sectors. Without pre-warm, the subsequent
+             * write misses the cache and triggers wb_load_into_slot,
+             * whose wl_read serializes against any in-flight worker
+             * erase on the SPI bus (~67 ms). With pre-warm the
+             * write finds a cached slot and merges in microseconds.
+             *
+             * The mutex is dropped around wl_read so concurrent
+             * ops don't pile up. The slot is left CLEAN (data
+             * matches flash). */
+            wb_slot_t *new_slot = NULL;
+            esp_err_t e = wb_alloc_slot(&new_slot);
             if (e != ESP_OK) {
-                disk_logf("[msc] read wl_read fail addr=0x%x bsz=%u err=%d (%s)",
-                          (unsigned)addr, (unsigned)chunk, e, esp_err_to_name(e));
+                /* Fallback: direct read, no caching. */
                 xSemaphoreGive(s_io_mutex);
-                return -1;
+                e = wl_read(s_wl, addr, dst, chunk);
+                xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+                if (e != ESP_OK) {
+                    disk_logf("[msc] read wl_read fail addr=0x%x bsz=%u err=%d (%s)",
+                              (unsigned)addr, (unsigned)chunk, e, esp_err_to_name(e));
+                    xSemaphoreGive(s_io_mutex);
+                    return -1;
+                }
+            } else {
+                new_slot->sect_base   = sect_base;
+                new_slot->state       = SLOT_CLEAN;
+                new_slot->last_use_us = (uint64_t)esp_timer_get_time();
+                xSemaphoreGive(s_io_mutex);
+                e = wl_read(s_wl, sect_base, new_slot->data, sect);
+                xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+                if (e != ESP_OK) {
+                    disk_logf("[msc] read prewarm fail base=0x%x err=%d (%s)",
+                              (unsigned)sect_base, e, esp_err_to_name(e));
+                    /* Don't strand a partly-populated slot in the cache. */
+                    if (new_slot->state == SLOT_CLEAN && new_slot->sect_base == sect_base)
+                        wb_slot_invalidate(new_slot);
+                    xSemaphoreGive(s_io_mutex);
+                    return -1;
+                }
+                memcpy(dst, new_slot->data + sect_off, chunk);
             }
         }
         addr += chunk; dst += chunk; remaining -= chunk;
@@ -786,7 +835,7 @@ size_t disk_stats_json(char *out, size_t cap) {
         "{\"counts\":{\"tur\":%u,\"read\":%u,\"write\":%u,\"scsi\":%u,\"start_stop\":%u"
         ",\"mount\":%u,\"umount\":%u,\"suspend\":%u,\"resume\":%u}"
         ",\"last\":{\"op\":\"%c\",\"lba\":%u,\"size\":%u}"
-        ",\"timing_us\":{\"max_write\":%u,\"max_write_lba\":%u,\"slow_writes\":%u,\"max_read\":%u}"
+        ",\"timing_us\":{\"max_write\":%u,\"max_write_lba\":%u,\"slow_writes\":%u,\"max_read\":%u,\"max_alloc_wait\":%u}"
         ",\"wb\":{\"slots\":%u,\"merges\":%u,\"evicts\":%u,\"async_flushes\":%u"
         ",\"empty\":%u,\"clean\":%u,\"dirty\":%u,\"flushing\":%u}}\n",
         (unsigned)s_cb_tur, (unsigned)s_cb_read, (unsigned)s_cb_write,
@@ -796,6 +845,7 @@ size_t disk_stats_json(char *out, size_t cap) {
         s_last_op, (unsigned)s_last_lba, (unsigned)s_last_size,
         (unsigned)s_max_write_us, (unsigned)s_max_write_lba,
         (unsigned)s_slow_write_count, (unsigned)s_max_read_us,
+        (unsigned)s_max_alloc_wait_us,
         (unsigned)WB_SLOTS, (unsigned)s_wb_merge_count, (unsigned)s_wb_evict_count,
         (unsigned)s_wb_async_flush_count,
         empty, clean, dirty, flushing);

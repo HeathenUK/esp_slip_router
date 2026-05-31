@@ -493,11 +493,15 @@ void app_main(void) {
 
     wifi_start();
 
-    /* USB device init is deferred to POST /usb-start so a crash in
-     * TinyUSB init doesn't take WiFi/HTTP down with it. The first
-     * Phase 1a bring-up bootlooped silently and left no way to read
-     * what failed -- with this design the dongle always boots to a
-     * known-good HTTP-reachable baseline. */
+    /* USB up at boot. Phase 1a deferred this behind POST /usb-start
+     * as a safety scaffold while the JTAG -> OTG PHY-mux switch and
+     * TinyUSB init were unstable; that path is solid now. The
+     * /usb-start endpoint remains for manual retry if init fails. */
+    {
+        esp_err_t e = usb_start();
+        if (e != ESP_OK)
+            disk_logf("usb_start at boot failed: %s", esp_err_to_name(e));
+    }
 
     /* Idle forever. WiFi event handler will start HTTP + mDNS once
      * STA is connected. Subsequent phases will start additional tasks
