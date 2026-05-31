@@ -7,6 +7,7 @@
  * implementations -- those are weak-linked via tools/apply_iram_patches.sh.
  */
 #pragma once
+#include <stddef.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -18,6 +19,12 @@ extern "C" {
 esp_err_t disk_init(void);
 
 void disk_logf(const char *fmt, ...);
+
+/* Dump per-transaction counters + write-back cache stats as JSON.
+ * Reads volatile uint32_ts that the MSC callbacks increment without
+ * a lock; values may be slightly stale relative to a particular
+ * callback but never torn. */
+size_t disk_stats_json(char *out, size_t cap);
 
 #ifdef __cplusplus
 }

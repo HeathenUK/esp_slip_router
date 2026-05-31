@@ -66,6 +66,22 @@ static bool     s_wb_dirty     = false;
 static uint32_t s_wb_merge_count = 0;
 static uint32_t s_wb_evict_count = 0;
 
+/* Per-callback counters. Single-writer (TinyUSB task on CPU1), readers
+ * (HTTP handler on CPU0) get an atomic uint32_t load; values may be
+ * slightly stale but never torn. No lock in the hot path. */
+static volatile uint32_t s_cb_tur        = 0;
+static volatile uint32_t s_cb_read       = 0;
+static volatile uint32_t s_cb_write      = 0;
+static volatile uint32_t s_cb_scsi       = 0;
+static volatile uint32_t s_cb_start_stop = 0;
+static volatile uint32_t s_cb_mount      = 0;
+static volatile uint32_t s_cb_umount     = 0;
+static volatile uint32_t s_cb_suspend    = 0;
+static volatile uint32_t s_cb_resume     = 0;
+static volatile uint32_t s_last_lba      = 0;   /* last READ or WRITE LBA */
+static volatile uint32_t s_last_size     = 0;
+static volatile char     s_last_op       = '-'; /* 'R', 'W', 'T', 'S' */
+
 /* ---- cache helpers ---- */
 
 static esp_err_t wb_flush_to_flash(void) {
@@ -349,6 +365,8 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
     (void)lun;
+    s_cb_tur++;
+    s_last_op = 'T';
     return s_wl != WL_INVALID_HANDLE;
 }
 
@@ -360,6 +378,8 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
 
 bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject) {
     (void)lun; (void)power_condition; (void)start;
+    s_cb_start_stop++;
+    s_last_op = 'S';
     if (load_eject && !start) {
         /* Eject: flush the cache so the host doesn't lose the last
          * <=4 KB of writes if we reset before the next eviction. */
@@ -375,6 +395,10 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
 
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
     (void)lun;
+    s_cb_read++;
+    s_last_op = 'R';
+    s_last_lba = lba;
+    s_last_size = bufsize;
     if (s_wl == WL_INVALID_HANDLE) return -1;
 
     uint32_t addr = lba * (uint32_t)MSC_BLOCK_SIZE + offset;
@@ -415,6 +439,10 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
 
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
     (void)lun;
+    s_cb_write++;
+    s_last_op = 'W';
+    s_last_lba = lba;
+    s_last_size = bufsize;
     if (s_wl == WL_INVALID_HANDLE) return -1;
 
     uint32_t addr = lba * (uint32_t)MSC_BLOCK_SIZE + offset;
@@ -482,10 +510,66 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
 
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, uint16_t bufsize) {
     (void)lun; (void)buffer; (void)bufsize;
+    s_cb_scsi++;
     /* Unsupported SCSI command. Setting sense data isn't strictly
      * required here -- TinyUSB stalls the endpoint on negative
      * return -- but mirroring the arduino-esp32 path keeps host
      * driver behavior consistent. */
     tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
     return -1;
+}
+
+/* ---- USB bus event callbacks ----
+ *
+ * These only fire on state changes (host configures the device, host
+ * disconnects/re-enumerates, suspend/resume on the bus). Not on the
+ * hot transfer path, so disk_logf cost is irrelevant. The umount/
+ * suspend events are the smoking-gun signals for "host gave up": if
+ * we see those during a DISKTEST run, the dongle stayed alive but
+ * the host disconnected us. */
+
+void tud_mount_cb(void) {
+    s_cb_mount++;
+    disk_logf("[usb] mount #%u (host configured device)", (unsigned)s_cb_mount);
+}
+
+void tud_umount_cb(void) {
+    s_cb_umount++;
+    disk_logf("[usb] UMOUNT #%u  last=%c lba=%u sz=%u  r=%u w=%u tur=%u",
+              (unsigned)s_cb_umount, s_last_op,
+              (unsigned)s_last_lba, (unsigned)s_last_size,
+              (unsigned)s_cb_read, (unsigned)s_cb_write, (unsigned)s_cb_tur);
+}
+
+void tud_suspend_cb(bool remote_wakeup_en) {
+    (void)remote_wakeup_en;
+    s_cb_suspend++;
+    disk_logf("[usb] suspend #%u  last=%c lba=%u sz=%u  r=%u w=%u",
+              (unsigned)s_cb_suspend, s_last_op,
+              (unsigned)s_last_lba, (unsigned)s_last_size,
+              (unsigned)s_cb_read, (unsigned)s_cb_write);
+}
+
+void tud_resume_cb(void) {
+    s_cb_resume++;
+    disk_logf("[usb] resume #%u", (unsigned)s_cb_resume);
+}
+
+/* ---- JSON snapshot for /usb-stats ---- */
+
+size_t disk_stats_json(char *out, size_t cap) {
+    int n = snprintf(out, cap,
+        "{\"counts\":{\"tur\":%u,\"read\":%u,\"write\":%u,\"scsi\":%u,\"start_stop\":%u"
+        ",\"mount\":%u,\"umount\":%u,\"suspend\":%u,\"resume\":%u}"
+        ",\"last\":{\"op\":\"%c\",\"lba\":%u,\"size\":%u}"
+        ",\"wb\":{\"merges\":%u,\"evicts\":%u,\"dirty\":%s,\"sect_base\":%u}}\n",
+        (unsigned)s_cb_tur, (unsigned)s_cb_read, (unsigned)s_cb_write,
+        (unsigned)s_cb_scsi, (unsigned)s_cb_start_stop,
+        (unsigned)s_cb_mount, (unsigned)s_cb_umount,
+        (unsigned)s_cb_suspend, (unsigned)s_cb_resume,
+        s_last_op, (unsigned)s_last_lba, (unsigned)s_last_size,
+        (unsigned)s_wb_merge_count, (unsigned)s_wb_evict_count,
+        s_wb_dirty ? "true" : "false",
+        (unsigned)s_wb_sect_base);
+    return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }

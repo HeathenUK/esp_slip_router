@@ -46,6 +46,7 @@
 #include "mdns.h"
 
 #include "usb.h"
+#include "disk.h"
 
 /* First-flash bootstrap WiFi credentials. The file `wifi_creds.h` is
  * gitignored and locally created. NVS-stored creds always take
@@ -276,6 +277,19 @@ static esp_err_t h_usb_start(httpd_req_t *req) {
     return send_text(req, "500 Internal Server Error", "text/plain", msg);
 }
 
+/* /usb-stats: per-callback counters + last MSC op + write-back cache
+ * state, as JSON. Hot path is just uint32_t increments in disk.c;
+ * formatting cost is borne here on the slow GET path. */
+static esp_err_t h_usb_stats(httpd_req_t *req) {
+    char buf[512];
+    size_t n = disk_stats_json(buf, sizeof buf);
+    if (n == 0)
+        return send_text(req, "500 Internal Server Error", "text/plain", "stats buffer overflow\n");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
 static httpd_handle_t s_httpd = NULL;
 
 static void httpd_start_once(void) {
@@ -299,6 +313,7 @@ static void httpd_start_once(void) {
         { .uri = "/ota",       .method = HTTP_POST, .handler = h_ota,       .user_ctx = NULL },
         { .uri = "/reset",     .method = HTTP_POST, .handler = h_reset,     .user_ctx = NULL },
         { .uri = "/usb-start", .method = HTTP_POST, .handler = h_usb_start, .user_ctx = NULL },
+        { .uri = "/usb-stats", .method = HTTP_GET,  .handler = h_usb_stats, .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
         httpd_register_uri_handler(s_httpd, &routes[i]);
