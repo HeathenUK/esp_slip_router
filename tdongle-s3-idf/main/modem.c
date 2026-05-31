@@ -1,18 +1,23 @@
 /* modem.c -- Hayes AT modem on TinyUSB CDC interface 0.
  *
- * Phase 1c.0 scaffold. Receives bytes via tusb_cdc_acm's RX callback,
- * accumulates them into a command-line buffer, and dispatches on CR.
- * Replies and verbose / numeric per the ATV setting -- same wire-level
- * shape as the arduino-esp32 build (tdongle-s3/src/modem.cpp).
+ * Phase 1c (full set ported from the arduino-esp32 build's
+ * tdongle-s3/src/modem.cpp). The wire-level behaviour matches that
+ * firmware exactly so the DOS-side host stack (FOSSLIP + CHUSB +
+ * mtcpget) sees a drop-in replacement.
  *
- * Things NOT here yet (and the file they came from in the old build):
- *   - TCP dial (ATD)              -- modem.cpp:dial()
- *   - Online-mode data pump       -- modem.cpp:modem_poll() under online=true
- *   - Escape sequence (+++)       -- modem.cpp:modem_poll() one-second guard
- *   - DNS / PING / NETIF / SCAN   -- modem.cpp:handle_dollar()
- *   - HID typing relay (AT$TYPE)  -- modem.cpp:handle_dollar()
- *   - OTA over CDC (AT$OTASTART)  -- modem.cpp:handle_dollar()
- * Bring these in incrementally; the scaffold here is the spine.
+ * Command-mode bytes arrive via the CDC RX callback (TinyUSB task
+ * context). When a successful ATD opens a TCP socket, we flip into
+ * online mode and spawn modem_data_task to pump socket -> CDC; the
+ * RX callback keeps draining CDC -> socket. Either direction can
+ * trigger return-to-command (a +++ escape from CDC, a socket close
+ * from the peer).
+ *
+ * Telnet IAC handling (RFC 854 + a few common options) is on by
+ * default; binary-mode hosts negotiate it off via DO/WILL BINARY.
+ *
+ * NVS layout (shared with main.c's bootstrap path):
+ *   slip-router/ssid  (string, max 32)
+ *   slip-router/pass  (string, max 64)
  */
 
 #include "modem.h"
@@ -21,11 +26,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_netif.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -33,31 +41,82 @@
 #include "tusb_cdc_acm.h"
 #include "class/cdc/cdc_device.h"
 
-#include "disk.h"   /* for disk_logf */
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "lwip/inet.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#include "disk.h"   /* disk_logf */
 
 #define TAG "modem"
 
-/* ---- terminal / line state ---- */
+/* ---- command-mode state ---- */
 #define CMD_LINE_MAX 256
 static char     s_cmd[CMD_LINE_MAX];
 static uint16_t s_cmd_len      = 0;
-static bool     s_cmd_overflow = false;   /* >= CMD_LINE_MAX before CR */
+static bool     s_cmd_overflow = false;
 
-/* Hayes runtime knobs. Defaults match the AT&F state in the old
- * modem.cpp; AT&W persists these to NVS, AT&V dumps them. */
-static bool s_echo    = true;             /* ATE -- echo command bytes back */
-static bool s_verbose = true;             /* ATV -- "OK\r\n" vs "0\r\n" */
-static bool s_quiet   = false;            /* ATQ -- suppress result codes  */
+static bool s_echo    = true;
+static bool s_verbose = true;
+static bool s_quiet   = false;
+static bool s_telnet  = true;     /* Telnet IAC handling on by default */
 
-/* ---- CDC write helpers ----
- *
- * TinyUSB's CDC TX FIFO is bounded (CFG_TUD_CDC_TX_BUFSIZE = 512).
- * Long replies (AT$HELP) won't fit in one write -- loop until done. */
+/* ---- online-mode state ---- */
+static int       s_sock = -1;
+static volatile bool s_online = false;
+static char      s_peer[96] = {0};       /* "host:port" string for AT$STATUS */
+static TaskHandle_t s_data_task = NULL;
+
+/* +++ escape sequence detector. Hayes rule: 1 s of guard, then exactly
+ * three '+' within 1 s, then 1 s of guard with no other data. */
+#define GUARD_US 1000000
+static volatile uint8_t  s_plus_count    = 0;
+static volatile int64_t  s_last_data_us  = 0;
+static volatile int64_t  s_plus_time_us  = 0;
+
+/* ---- telnet ---- */
+#define TN_IAC  0xFF
+#define TN_WILL 0xFB
+#define TN_WONT 0xFC
+#define TN_DO   0xFD
+#define TN_DONT 0xFE
+#define TN_SB   0xFA
+#define TN_SE   0xF0
+#define OPT_BINARY 0
+#define OPT_ECHO   1
+#define OPT_SGA    3
+#define OPT_TTYPE  24
+#define OPT_NAWS   31
+#define TT_IS      0
+#define TT_SEND    1
+#define TERM_TYPE  "ANSI"
+#define TERM_COLS  80
+#define TERM_ROWS  25
+
+/* Telnet RX state machine -- this is what we feed bytes-from-TCP into
+ * to strip the IAC negotiation noise before relaying payload to CDC. */
+enum { T_DATA, T_IAC, T_OPT, T_SB_OPT, T_SB_DATA, T_SB_IAC };
+static int     s_tstate = T_DATA;
+static uint8_t s_tcmd   = 0;
+static uint8_t s_sbopt  = 0;
+static uint8_t s_sbbuf[16];
+static uint8_t s_sblen  = 0;
+/* Tracked option flags so we don't echo the same WILL/DO repeatedly. */
+static uint8_t s_remote_on[32], s_local_on[32], s_local_offered[32];
+static inline bool bget(uint8_t *a, uint8_t o) { return a[o >> 3] & (1 << (o & 7)); }
+static inline void bset(uint8_t *a, uint8_t o) { a[o >> 3] |=  (1 << (o & 7)); }
+static inline void bclr(uint8_t *a, uint8_t o) { a[o >> 3] &= ~(1 << (o & 7)); }
+
+/* ---- CDC write helper ---- */
 
 static size_t cdc_write(const void *buf, size_t n) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t sent = 0;
-    while (sent < n) {
+    int64_t deadline = esp_timer_get_time() + 500000;  /* 500 ms */
+    while (sent < n && esp_timer_get_time() < deadline) {
         if (!tud_cdc_n_connected(0)) break;
         size_t avail = tud_cdc_n_write_available(0);
         if (avail == 0) {
@@ -82,33 +141,255 @@ static inline void cdc_print(const char *s) { cdc_write(s, strlen(s)); }
 static inline void cdc_byte(uint8_t b)      { cdc_write(&b, 1); }
 
 /* ---- result codes ---- */
-static void r_ok(void) {
-    if (s_quiet) return;
-    cdc_print(s_verbose ? "\r\nOK\r\n" : "0\r\n");
+static void r_ok(void)         { if (!s_quiet) cdc_print(s_verbose ? "\r\nOK\r\n"         : "0\r\n"); }
+static void r_error(void)      { if (!s_quiet) cdc_print(s_verbose ? "\r\nERROR\r\n"      : "4\r\n"); }
+static void r_connect(void)    { if (!s_quiet) cdc_print(s_verbose ? "\r\nCONNECT\r\n"    : "1\r\n"); }
+static void r_nocarrier(void)  { if (!s_quiet) cdc_print(s_verbose ? "\r\nNO CARRIER\r\n" : "3\r\n"); }
+
+/* ---- telnet helpers ---- */
+
+static void tn_send3(uint8_t cmd, uint8_t opt) {
+    uint8_t b[3] = {TN_IAC, cmd, opt};
+    if (s_sock >= 0) send(s_sock, b, 3, 0);
 }
-static void r_error(void) {
-    if (s_quiet) return;
-    cdc_print(s_verbose ? "\r\nERROR\r\n" : "4\r\n");
+static bool tn_accept_remote(uint8_t o) { return o == OPT_BINARY || o == OPT_SGA || o == OPT_ECHO; }
+static bool tn_offer_local(uint8_t o)   { return o == OPT_BINARY || o == OPT_SGA || o == OPT_TTYPE || o == OPT_NAWS; }
+static void tn_offer_will(uint8_t opt) {
+    if (!bget(s_local_offered, opt)) { bset(s_local_offered, opt); tn_send3(TN_WILL, opt); }
+}
+static void tn_send_naws(void) {
+    uint8_t b[] = {TN_IAC, TN_SB, OPT_NAWS, 0, TERM_COLS, 0, TERM_ROWS, TN_IAC, TN_SE};
+    if (s_sock >= 0) send(s_sock, b, sizeof b, 0);
+}
+static void tn_after_local_enable(uint8_t opt) {
+    if (opt == OPT_NAWS) tn_send_naws();
+}
+static void tn_handle_neg(uint8_t c, uint8_t opt) {
+    switch (c) {
+        case TN_WILL:
+            if (tn_accept_remote(opt)) {
+                if (!bget(s_remote_on, opt)) { bset(s_remote_on, opt); tn_send3(TN_DO, opt); }
+            } else {
+                bclr(s_remote_on, opt); tn_send3(TN_DONT, opt);
+            }
+            break;
+        case TN_WONT:
+            if (bget(s_remote_on, opt)) { bclr(s_remote_on, opt); tn_send3(TN_DONT, opt); }
+            break;
+        case TN_DO:
+            if (tn_offer_local(opt)) {
+                if (!bget(s_local_on, opt)) {
+                    bset(s_local_on, opt);
+                    if (!bget(s_local_offered, opt)) { bset(s_local_offered, opt); tn_send3(TN_WILL, opt); }
+                    tn_after_local_enable(opt);
+                }
+            } else {
+                tn_send3(TN_WONT, opt);
+            }
+            break;
+        case TN_DONT:
+            if (bget(s_local_on, opt)) { bclr(s_local_on, opt); tn_send3(TN_WONT, opt); }
+            break;
+    }
+}
+static void tn_handle_sb(void) {
+    if (s_sbopt == OPT_TTYPE && s_sblen >= 1 && s_sbbuf[0] == TT_SEND) {
+        uint8_t hdr[] = {TN_IAC, TN_SB, OPT_TTYPE, TT_IS};
+        if (s_sock >= 0) {
+            send(s_sock, hdr, sizeof hdr, 0);
+            send(s_sock, (const uint8_t *)TERM_TYPE, strlen(TERM_TYPE), 0);
+            uint8_t tail[] = {TN_IAC, TN_SE};
+            send(s_sock, tail, sizeof tail, 0);
+        }
+    }
+}
+static void tn_start(void) {
+    memset(s_remote_on, 0, sizeof s_remote_on);
+    memset(s_local_on, 0, sizeof s_local_on);
+    memset(s_local_offered, 0, sizeof s_local_offered);
+    s_sblen = 0; s_tstate = T_DATA;
+    if (!s_telnet) return;
+    /* Opener: offer the options that make a BBS session clean. */
+    tn_offer_will(OPT_TTYPE);
+    tn_offer_will(OPT_NAWS);
+    tn_offer_will(OPT_SGA);    tn_send3(TN_DO, OPT_SGA);
+    tn_offer_will(OPT_BINARY); tn_send3(TN_DO, OPT_BINARY);
 }
 
-/* ---- parser helpers ---- */
+/* ---- TCP -> CDC pump (drains payload bytes, runs telnet IAC machine
+ * inline so option negotiation never reaches the user terminal) ---- */
 
-/* Strip leading "AT" / "at", then uppercase the remainder in place
- * (except the parts inside quoted strings, which we don't actually
- * parse yet -- this is the scaffold). Returns NULL if the line
- * didn't start with AT. */
-static char *strip_at(char *line) {
-    while (*line == ' ') line++;
-    if (line[0] != 'A' && line[0] != 'a') return NULL;
-    if (line[1] != 'T' && line[1] != 't') return NULL;
-    char *rest = line + 2;
-    for (char *p = rest; *p; ++p) *p = (char)toupper((unsigned char)*p);
-    return rest;
+static void modem_data_task(void *arg) {
+    (void)arg;
+    /* Loose 100 ms poll. The recv timeout means we wake periodically
+     * to check for +++ guard expiry / socket close even when the peer
+     * is silent. */
+    struct timeval rcv_tv = { .tv_sec = 0, .tv_usec = 100 * 1000 };
+    setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof rcv_tv);
+
+    uint8_t inbuf[512];
+    uint8_t outbuf[512];
+    bool peer_closed = false;
+
+    while (s_online && s_sock >= 0) {
+        int n = recv(s_sock, inbuf, sizeof inbuf, 0);
+        if (n > 0) {
+            size_t outlen = 0;
+            for (int i = 0; i < n; ++i) {
+                uint8_t ch = inbuf[i];
+                if (!s_telnet) {
+                    outbuf[outlen++] = ch;
+                    if (outlen >= sizeof outbuf) { cdc_write(outbuf, outlen); outlen = 0; }
+                    continue;
+                }
+                switch (s_tstate) {
+                    case T_DATA:
+                        if (ch == TN_IAC) s_tstate = T_IAC;
+                        else {
+                            outbuf[outlen++] = ch;
+                            if (outlen >= sizeof outbuf) { cdc_write(outbuf, outlen); outlen = 0; }
+                        }
+                        break;
+                    case T_IAC:
+                        if (ch == TN_IAC) {
+                            outbuf[outlen++] = TN_IAC;
+                            if (outlen >= sizeof outbuf) { cdc_write(outbuf, outlen); outlen = 0; }
+                            s_tstate = T_DATA;
+                        } else if (ch == TN_WILL || ch == TN_WONT || ch == TN_DO || ch == TN_DONT) {
+                            s_tcmd = ch; s_tstate = T_OPT;
+                        } else if (ch == TN_SB) {
+                            s_tstate = T_SB_OPT;
+                        } else {
+                            s_tstate = T_DATA;
+                        }
+                        break;
+                    case T_OPT:
+                        tn_handle_neg(s_tcmd, ch); s_tstate = T_DATA;
+                        break;
+                    case T_SB_OPT:
+                        s_sbopt = ch; s_sblen = 0; s_tstate = T_SB_DATA;
+                        break;
+                    case T_SB_DATA:
+                        if (ch == TN_IAC) s_tstate = T_SB_IAC;
+                        else if (s_sblen < sizeof s_sbbuf) s_sbbuf[s_sblen++] = ch;
+                        break;
+                    case T_SB_IAC:
+                        if (ch == TN_SE) { tn_handle_sb(); s_tstate = T_DATA; }
+                        else { if (s_sblen < sizeof s_sbbuf) s_sbbuf[s_sblen++] = ch; s_tstate = T_SB_DATA; }
+                        break;
+                }
+            }
+            if (outlen) cdc_write(outbuf, outlen);
+        } else if (n == 0) {
+            peer_closed = true;
+            break;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            disk_logf("modem: recv err=%d", errno);
+            peer_closed = true;
+            break;
+        }
+
+        /* +++ guard expired -> command mode, socket stays open (ATO returns). */
+        int64_t now = esp_timer_get_time();
+        if (s_plus_count == 3 && (now - s_plus_time_us) > GUARD_US) {
+            s_plus_count = 0;
+            s_online = false;
+            r_ok();
+            break;
+        }
+    }
+
+    if (peer_closed) {
+        s_online = false;
+        if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+        s_peer[0] = 0;
+        r_nocarrier();
+    }
+    s_data_task = NULL;
+    vTaskDelete(NULL);
 }
 
-/* ---- AT$ commands ---- */
+/* ---- CDC -> TCP push (called from on_cdc_rx when online) ---- */
 
-static void print_wifi_status(void) {
+static void online_push_bytes(const uint8_t *buf, size_t n) {
+    if (s_sock < 0) return;
+    uint8_t txbuf[1024];  /* worst case for telnet IAC + CRLF doubling */
+    size_t txlen = 0;
+    int64_t now = esp_timer_get_time();
+
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t ch = buf[i];
+        if (ch == '+' && s_plus_count < 3 &&
+            (s_plus_count > 0 || (now - s_last_data_us) > GUARD_US)) {
+            /* Hold the +'s back until we know whether the escape
+             * completes (3 +'s + 1 s silence) or breaks. */
+            if (txlen) { send(s_sock, txbuf, txlen, 0); txlen = 0; }
+            s_plus_count++;
+            s_plus_time_us = now;
+            continue;
+        }
+        /* Any non-'+' (or 4th '+', etc.) breaks the escape: flush the
+         * pending +'s as real data, then process this byte normally. */
+        while (s_plus_count > 0) { txbuf[txlen++] = '+'; s_plus_count--; }
+
+        if (s_telnet && ch == 0x0D && !bget(s_local_on, OPT_BINARY)) {
+            /* Telnet NVT CR -> CR LF */
+            txbuf[txlen++] = 0x0D;
+            txbuf[txlen++] = 0x0A;
+        } else {
+            if (s_telnet && ch == TN_IAC) txbuf[txlen++] = TN_IAC;  /* escape */
+            txbuf[txlen++] = ch;
+        }
+        s_last_data_us = now;
+
+        if (txlen >= sizeof txbuf - 2) {
+            send(s_sock, txbuf, txlen, 0); txlen = 0;
+        }
+    }
+    if (txlen) send(s_sock, txbuf, txlen, 0);
+}
+
+/* ---- AT$ command handlers ---- */
+
+static esp_err_t save_wifi_creds(const char *ssid, const char *pass) {
+    nvs_handle_t h;
+    esp_err_t e = nvs_open("slip-router", NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    nvs_set_str(h, "ssid", ssid);
+    nvs_set_str(h, "pass", pass);
+    nvs_commit(h);
+    nvs_close(h);
+    return ESP_OK;
+}
+
+static void cmd_wifi_set(const char *arg) {
+    /* AT$WIFI=ssid,password -- comma is the separator; ssids with
+     * literal commas aren't supported (matches old firmware). */
+    const char *comma = strchr(arg, ',');
+    if (!comma) { r_error(); return; }
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    size_t sl = (size_t)(comma - arg);
+    if (sl == 0 || sl >= sizeof ssid) { r_error(); return; }
+    memcpy(ssid, arg, sl);
+    strncpy(pass, comma + 1, sizeof pass - 1);
+
+    if (save_wifi_creds(ssid, pass) != ESP_OK) { r_error(); return; }
+
+    wifi_config_t wc = {0};
+    size_t n = strnlen(ssid, sizeof wc.sta.ssid);
+    memcpy(wc.sta.ssid, ssid, n);
+    n = strnlen(pass, sizeof wc.sta.password);
+    memcpy(wc.sta.password, pass, n);
+    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    cdc_print("\r\nconnecting...\r\n");
+    esp_wifi_connect();
+    r_ok();
+}
+
+static void cmd_wifi_query(void) {
     cdc_print("\r\n");
     wifi_ap_record_t ap = {0};
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
@@ -119,12 +400,11 @@ static void print_wifi_status(void) {
                  "Channel: %u\r\n",
                  (const char *)ap.ssid, (int)ap.rssi, (unsigned)ap.primary);
         cdc_print(line);
-
         esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (sta) {
             esp_netif_ip_info_t ip = {0};
             esp_netif_get_ip_info(sta, &ip);
-            char ips[64];
+            char ips[128];
             snprintf(ips, sizeof ips,
                      "IP:      " IPSTR "\r\n"
                      "GW:      " IPSTR "\r\n",
@@ -137,71 +417,257 @@ static void print_wifi_status(void) {
     }
 }
 
+static void cmd_dns(const char *host) {
+    cdc_print("\r\n");
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+        cdc_print("NXDOMAIN\r\n");
+        r_error();
+        return;
+    }
+    char ip[INET_ADDRSTRLEN];
+    struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+    inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip);
+    cdc_print(ip); cdc_print("\r\n");
+    freeaddrinfo(res);
+    r_ok();
+}
+
+static void cmd_ping(const char *host) {
+    /* Lightweight TCP-handshake "ping" (port 80). Real ICMP needs
+     * lwIP's raw socket setup which is heavier; the TCP variant is
+     * what the old firmware shipped. */
+    cdc_print("\r\n");
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, "80", &hints, &res) != 0 || !res) {
+        cdc_print("NXDOMAIN\r\n");
+        r_error();
+        return;
+    }
+    int s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s < 0) { freeaddrinfo(res); r_error(); return; }
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    int64_t t0 = esp_timer_get_time();
+    int ok = connect(s, res->ai_addr, res->ai_addrlen);
+    int64_t dt = esp_timer_get_time() - t0;
+    close(s);
+    freeaddrinfo(res);
+    char line[64];
+    if (ok == 0)
+        snprintf(line, sizeof line, "reply %d ms\r\n", (int)(dt / 1000));
+    else
+        snprintf(line, sizeof line, "timeout (%d ms)\r\n", (int)(dt / 1000));
+    cdc_print(line);
+    r_ok();
+}
+
+static void cmd_scan(void) {
+    cdc_print("\r\nscanning...\r\n");
+    wifi_scan_config_t sc = {0};
+    if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
+        cdc_print("scan failed\r\n");
+        r_error();
+        return;
+    }
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n > 24) n = 24;
+    wifi_ap_record_t *ap = calloc(n, sizeof *ap);
+    if (!ap) { r_error(); return; }
+    esp_wifi_scan_get_ap_records(&n, ap);
+    char line[128];
+    snprintf(line, sizeof line, "%u networks:\r\n", (unsigned)n);
+    cdc_print(line);
+    for (uint16_t i = 0; i < n; ++i) {
+        snprintf(line, sizeof line,
+                 "  %-32.32s  ch=%-2u  rssi=%4d  auth=%u\r\n",
+                 (const char *)ap[i].ssid,
+                 (unsigned)ap[i].primary,
+                 (int)ap[i].rssi,
+                 (unsigned)ap[i].authmode);
+        cdc_print(line);
+    }
+    free(ap);
+    r_ok();
+}
+
+static void cmd_netif(void) {
+    cdc_print("\r\n");
+    esp_netif_t *netif = NULL;
+    char buf[160];
+    for (netif = esp_netif_next_unsafe(NULL); netif; netif = esp_netif_next_unsafe(netif)) {
+        esp_netif_ip_info_t ip = {0};
+        esp_netif_get_ip_info(netif, &ip);
+        snprintf(buf, sizeof buf,
+                 "%-12s  ip=" IPSTR "  gw=" IPSTR "  mask=" IPSTR "\r\n",
+                 esp_netif_get_ifkey(netif),
+                 IP2STR(&ip.ip), IP2STR(&ip.gw), IP2STR(&ip.netmask));
+        cdc_print(buf);
+    }
+    r_ok();
+}
+
+/* ---- ATD: dial a host:port ---- */
+
+static void cmd_dial(const char *arg) {
+    /* Strip Hayes dial-type modifier (T/P/R). */
+    while (*arg == ' ' || *arg == '\t') arg++;
+    if (*arg == 'T' || *arg == 'P' || *arg == 'R') arg++;
+    while (*arg == ' ' || *arg == '\t') arg++;
+    if (!*arg) { r_error(); return; }
+
+    char host[80];
+    uint16_t port = 23;     /* Hayes default = telnet */
+    const char *colon = strrchr(arg, ':');
+    if (colon) {
+        size_t n = (size_t)(colon - arg);
+        if (n >= sizeof host) n = sizeof host - 1;
+        memcpy(host, arg, n); host[n] = 0;
+        int p = atoi(colon + 1);
+        if (p > 0 && p < 65536) port = (uint16_t)p;
+    } else {
+        strncpy(host, arg, sizeof host - 1); host[sizeof host - 1] = 0;
+    }
+
+    /* Need WiFi up to resolve and dial. */
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) { r_nocarrier(); return; }
+
+    char portstr[8];
+    snprintf(portstr, sizeof portstr, "%u", (unsigned)port);
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
+        disk_logf("modem: dial DNS-fail '%s'", host);
+        r_nocarrier();
+        return;
+    }
+
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) { freeaddrinfo(res); r_nocarrier(); return; }
+    struct timeval tv = { .tv_sec = 20, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+
+    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+        close(sock);
+        freeaddrinfo(res);
+        r_nocarrier();
+        return;
+    }
+    freeaddrinfo(res);
+
+    int yes = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes);
+
+    s_sock = sock;
+    snprintf(s_peer, sizeof s_peer, "%s:%u", host, (unsigned)port);
+    s_plus_count = 0;
+    s_last_data_us = esp_timer_get_time();
+    s_online = true;
+    tn_start();
+    r_connect();
+
+    /* Spawn the TCP -> CDC pump task. CPU1 with priority below
+     * TinyUSB (so CDC RX callbacks preempt this when CDC has data). */
+    xTaskCreatePinnedToCore(modem_data_task, "modem_data",
+                            4096, NULL, 16, &s_data_task, 1);
+}
+
+/* ---- exec one AT line (command mode only) ---- */
+
+static char *strip_at(char *line) {
+    while (*line == ' ') line++;
+    if (line[0] != 'A' && line[0] != 'a') return NULL;
+    if (line[1] != 'T' && line[1] != 't') return NULL;
+    char *rest = line + 2;
+    for (char *p = rest; *p; ++p) *p = (char)toupper((unsigned char)*p);
+    return rest;
+}
+
 static void handle_dollar(char *s) {
-    /* s points to the char after the "$", e.g. "HELP" or "WIFI?".  */
-    if (!strcmp(s, "HELP")) {
+    /* AT$<KEY>[=<value>|?] */
+    char *eq  = strchr(s, '=');
+    char *qm  = strchr(s, '?');
+    char *key = s;
+    char *val = NULL;
+    if (eq) { *eq = 0; val = eq + 1; }
+    else if (qm) { *qm = 0; val = qm; }   /* '?' query keeps key clean */
+
+    if (!strcmp(key, "WIFI")) {
+        if (val && eq)        cmd_wifi_set(val);
+        else                  { cmd_wifi_query(); r_ok(); }
+    } else if (!strcmp(key, "DNS") && val && eq) {
+        cmd_dns(val);
+    } else if (!strcmp(key, "PING") && val && eq) {
+        cmd_ping(val);
+    } else if (!strcmp(key, "SCAN")) {
+        cmd_scan();
+    } else if (!strcmp(key, "NETIF")) {
+        cmd_netif();
+    } else if (!strcmp(key, "RESET")) {
+        cdc_print("\r\nRESETTING\r\n");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    } else if (!strcmp(key, "HELP")) {
         cdc_print(
             "\r\n"
-            "AT          OK                          ATE0/1     echo off/on\r\n"
-            "ATI         identity                    ATV0/1     numeric/verbose\r\n"
-            "ATZ         soft reset settings         ATQ0/1     result codes on/off\r\n"
-            "AT$WIFI?    show current WiFi state     AT$HELP    this help\r\n"
-            "\r\n"
-            "Not yet implemented (Phase 1c.1+): AT$WIFI=, ATD, ATO, +++, ATH,\r\n"
-            "AT$DNS=, AT$PING=, AT$NETIF, AT$SCAN, AT$TYPE=, AT$RESET, AT$OTASTART=\r\n"
+            "ATE0/1  echo off/on        ATV0/1  numeric/verbose\r\n"
+            "ATQ0/1  result codes       ATI     identity\r\n"
+            "ATZ     reset settings     ATD<host>[:port]  dial out\r\n"
+            "ATO     return online      ATH     hang up\r\n"
+            "+++     escape to cmd      (1 s guard, 3 +'s, 1 s guard)\r\n"
+            "AT$WIFI=ssid,pw    set wifi creds + reconnect\r\n"
+            "AT$WIFI?           show wifi status\r\n"
+            "AT$DNS=host        DNS lookup\r\n"
+            "AT$PING=host       TCP-handshake ping\r\n"
+            "AT$SCAN            list visible networks\r\n"
+            "AT$NETIF           dump netif state\r\n"
+            "AT$RESET           reboot the dongle\r\n"
+            "AT$HELP            this help\r\n"
         );
-        r_ok();
-    } else if (!strcmp(s, "WIFI?")) {
-        print_wifi_status();
         r_ok();
     } else {
         r_error();
     }
 }
 
-/* ---- exec one AT line ---- */
-
 static void exec(char *line) {
     char *p = strip_at(line);
-    if (!p) {
-        /* No AT prefix -- ignore (matches Hayes "non-command line" silent
-         * behaviour). The old firmware did the same. */
-        return;
-    }
-    /* Bare "AT" -- just return OK. */
-    if (!*p) { r_ok(); return; }
+    if (!p) return;                 /* non-AT line: silent */
+    if (!*p) { r_ok(); return; }    /* bare AT */
 
-    /* Hayes single-character commands. The old firmware uses a switch
-     * here, dispatching on the first letter of the suffix. Keep that
-     * shape; it's familiar and obvious. */
     switch (*p) {
-        case 'E': {
-            /* ATE0 = echo off, ATE1 = echo on, bare ATE = ATE1 */
-            s_echo = (p[1] != '0');
+        case 'E': s_echo    = (p[1] != '0'); r_ok(); return;
+        case 'V': s_verbose = (p[1] != '0'); r_ok(); return;
+        case 'Q': s_quiet   = (p[1] == '1'); r_ok(); return;
+        case 'I': cdc_print("\r\nDOSongle Modem (Phase 1c)\r\n"); r_ok(); return;
+        case 'Z': s_echo = true; s_verbose = true; s_quiet = false; s_telnet = true; r_ok(); return;
+        case 'D': cmd_dial(p + 1); return;
+        case 'H': {
+            if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+            s_online = false;
+            s_peer[0] = 0;
             r_ok();
         } return;
-        case 'V': {
-            s_verbose = (p[1] != '0');
-            r_ok();
+        case 'O': {
+            if (s_sock >= 0) {
+                s_online = true;
+                if (!s_data_task) {
+                    xTaskCreatePinnedToCore(modem_data_task, "modem_data",
+                                            4096, NULL, 16, &s_data_task, 1);
+                }
+                r_connect();
+            } else {
+                r_error();
+            }
         } return;
-        case 'Q': {
-            s_quiet = (p[1] == '1');
-            r_ok();
-        } return;
-        case 'I': {
-            cdc_print("\r\nDOSongle Modem (Phase 1c.0)\r\n");
-            r_ok();
-        } return;
-        case 'Z': {
-            s_echo = true; s_verbose = true; s_quiet = false;
-            r_ok();
-        } return;
-        case '$': {
-            handle_dollar(p + 1);
-        } return;
-        default:
-            r_error();
-            return;
+        case '$': handle_dollar(p + 1); return;
+        default:  r_error(); return;
     }
 }
 
@@ -212,6 +678,16 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
     uint8_t buf[64];
     size_t got = 0;
     if (tinyusb_cdcacm_read(itf, buf, sizeof buf, &got) != ESP_OK) return;
+    if (got == 0) return;
+
+    if (s_online) {
+        /* Online: pipe CDC bytes to TCP with +++ escape + telnet
+         * IAC/CRLF handling. */
+        online_push_bytes(buf, got);
+        return;
+    }
+
+    /* Command mode: line-buffered AT parser. */
     for (size_t i = 0; i < got; ++i) {
         uint8_t b = buf[i];
         if (b == '\r' || b == '\n') {
@@ -226,14 +702,14 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
             s_cmd_len = 0;
             continue;
         }
-        if (b == 0x08 || b == 0x7F) { /* BS / DEL */
+        if (b == 0x08 || b == 0x7F) {
             if (s_cmd_len > 0) {
                 s_cmd_len--;
                 if (s_echo) cdc_print("\b \b");
             }
             continue;
         }
-        if (b < 0x20 || b > 0x7E) continue; /* drop control + non-ASCII */
+        if (b < 0x20 || b > 0x7E) continue;
         if (s_cmd_len + 1 < sizeof s_cmd) {
             s_cmd[s_cmd_len++] = (char)b;
             if (s_echo) cdc_byte(b);
@@ -252,6 +728,6 @@ esp_err_t modem_init(void) {
         ESP_LOGE(TAG, "cdc rx cb register: %s", esp_err_to_name(e));
         return e;
     }
-    disk_logf("modem: AT scaffold ready on CDC0");
+    disk_logf("modem: AT engine ready on CDC0");
     return ESP_OK;
 }
