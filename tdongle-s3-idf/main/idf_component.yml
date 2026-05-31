@@ -1,0 +1,17 @@
+# Managed components for the main module.
+#
+# `esp_tinyusb` is Espressif's wrapper around upstream TinyUSB that
+# integrates with ESP-IDF's component manager. Pulling it here means
+# `idf.py reconfigure` will fetch upstream TinyUSB + the Espressif
+# DWC2 port hook automatically.
+#
+# We do NOT pin a specific version yet; let the component manager
+# resolve against the current ESP-IDF release. If/when we need to
+# patch TinyUSB itself (e.g. to IRAM-flag the DWC2 ISR), we'd vendor
+# the sources here instead of referencing the registry version.
+
+dependencies:
+  espressif/esp_tinyusb: "~1.4"
+  espressif/mdns: "^1.2"
+  idf:
+    version: ">=5.5,<6.0"

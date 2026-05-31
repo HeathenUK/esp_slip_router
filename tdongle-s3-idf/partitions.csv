@@ -1,0 +1,16 @@
+# T-Dongle S3 partition layout -- identical to the arduino-esp32 build's
+# tdongle-s3/partitions_dongle.csv so OTA between the two firmwares is
+# possible (same boot_app0 / app0 / app1 layout, same ffat at 0x800000).
+#
+# 16 MB flash. Slimmed OTA slots (3.94 MB each, was 6.25 MB stock) to make
+# room for the 8 MB ffat partition that backs the USB MSC dev disk.
+# Alignment: app partitions must be 64 KB aligned; data partitions need
+# 4 KB. 64 KB lost in the gap before ffat to keep it on a clean 8 MB
+# boundary.
+#
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x3F0000,
+app1,     app,  ota_1,   0x400000, 0x3F0000,
+ffat,     data, fat,     0x800000, 0x800000,

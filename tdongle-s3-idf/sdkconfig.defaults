@@ -1,0 +1,65 @@
+# T-Dongle S3 -- sdkconfig defaults.
+#
+# Target: ESP32-S3, 16 MB QIO flash (Winbond W25Q128JV), no PSRAM.
+# This file gives ESP-IDF native what we couldn't get from the prebuilt
+# arduino-esp32 libs: specifically AUTO_SUSPEND on the flash chip, which
+# is what makes the device tolerable to strict USB hosts (CH375 / CHUSB).
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# Flash settings -- match the bootloader/flash format pioarduino was using.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+# Custom partition table (see partitions.csv -- 16 MB layout with OTA
+# slots + 8 MB ffat for the USB MSC dev-disk).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ===== The reason this project exists =====
+# AUTO_SUSPEND lets a non-IRAM ISR (the OTG IRQ) keep running through a
+# flash erase. Without this, the cache disables for ~70 ms per erase
+# and the USB device goes silent, which strict hosts treat as a
+# disconnect. Winbond W25Q is on Espressif's qualified list for this.
+CONFIG_SPI_FLASH_AUTO_SUSPEND=y
+
+# No PSRAM on this dongle variant -- we verified via esptool chip_id.
+# CONFIG_SPIRAM is not set
+
+# FreeRTOS: keep dual-core scheduling. Pin Arduino-ish work to core 1
+# in code; let WiFi land on core 0 by ESP-IDF default.
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_USE_CORE_AFFINITY=y
+
+# Logging: send ESP_LOG to USB-Serial-JTAG (the built-in JTAG/CDC on
+# GPIO19/20 -- a SEPARATE controller from the USB-OTG we use for our
+# MSC/CDC/HID device. JTAG is what's exposed for debugger access and
+# is non-data-plane.) Falls back gracefully if JTAG isn't connected.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# HTTP server (we use it for /fs, /list, /status, /disk-log, /usb-log,
+# /lba, /ota, /reset, etc.)
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=256
+
+# OTA -- we use esp_ota_* for in-app updates via POST /ota.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
+
+# WiFi -- station-only, station-host-side WiFi for our IP path.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_LWIP_TCPIP_CORE_LOCKING=y
+
+# TinyUSB / esp_tinyusb -- enable MSC + HID + CDC. Configured further
+# in main code via tinyusb_config_t. We use raw tud_* callbacks for
+# MSC so we own the response semantics (can return 0 to NAK).
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_HID_ENABLED=y
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=4096
+
+# Compiler / runtime tuning
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y

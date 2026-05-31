@@ -1,0 +1,11 @@
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+.cache/
+compile_commands.json
+# WiFi bootstrap credentials -- never commit. See main/wifi_creds.h for
+# the only-once first-flash purpose; after first successful connection
+# the creds live in NVS and this file is no longer required.
+main/wifi_creds.h
