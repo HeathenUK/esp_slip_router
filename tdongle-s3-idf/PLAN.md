@@ -227,12 +227,32 @@ at ~50 KB/s. See memory `arduino-esp32-usbcdc-rx-queue-is-slow`.
 The ESP-IDF native CDC should bypass this; we'll see real
 numbers when 1c is up.
 
-### Phase 2 — Raw-FAT HTTP handlers (defer)
+### Phase 2 — Raw-FAT HTTP handlers — done
 
-The arduino-esp32 build had `/fs/<name>` (HTTP GET/PUT/DELETE for
-files in the FAT volume), `/list`, `/lba`. Useful for fast file
-transfers without unplugging the dongle. Defer until the SLIP
-gateway is up, since SLIP is the user's actual goal.
+GET `/list`, GET / PUT / DELETE `/fs/<name>` (8.3 names). FATFS-backed
+file ops on the same WL handle MSC uses, with stability improvements
+over the arduino-esp32 design:
+
+- Reads (/list, GET) don't take MSC ownership -- they pass through
+  the custom 512-byte FATFS diskio direct to `wl_read`; DOS can
+  write concurrently.
+- Writes (PUT, DELETE) take ownership briefly, after pre-flushing
+  the cache while MSC is still usable. Cache invalidated on
+  release; UNIT_ATTENTION sense data signals DOS to re-read FAT.
+- 429 "try again" if DOS wrote in the last 500 ms -- defers HTTP
+  writes during host bursts.
+
+The custom 512-byte FATFS diskio (`fat.c`) was needed because IDF's
+stock `diskio_wl` exposes wl_sector_size (4096) to FATFS, which then
+rejects our 512-byte BPB (matched to MSC's 512-byte LBAs for DOS
+compat). Wrapper does pass-through reads + RMW writes at the 4 KB wl
+granularity. `CONFIG_FATFS_SECTOR_512=y` to make FATFS accept 512.
+GET `/lba` (raw block diagnostic) NOT yet added; trivial if we need
+it later.
+
+`/lba` (raw block diagnostic) not yet ported -- trivial when needed.
+`AT$DISK=device|usb` from old build also not ported -- the new
+ownership model is per-op, no persistent "device-side" state.
 
 ### Phase 3 — SLIP framing + lwIP NAPT (after 1c)
 
