@@ -25,10 +25,10 @@
 
 #include "tinyusb.h"
 #include "tusb_cdc_acm.h"
-#include "tusb_msc_storage.h"
 #include "tusb_console.h"
-#include "wear_levelling.h"
 #include "class/hid/hid_device.h"
+
+#include "disk.h"
 
 #include "hal/usb_serial_jtag_ll.h"
 #include "hal/usb_wrap_ll.h"
@@ -138,58 +138,11 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
     (void)buffer; (void)bufsize;
 }
 
-/* ---- MSC backing store -- mount the ffat partition through the
- * wear-levelling layer, then hand the WL handle to esp_tinyusb's MSC
- * helper. Phase 1a uses the stock SCSI plumbing; the write-back-cache
- * pattern from the arduino-esp32 build gets re-applied in 1b. */
-
-static esp_err_t mount_msc_partition(void) {
-    const esp_partition_t *part = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "ffat");
-    if (!part) {
-        ESP_LOGE(TAG, "ffat partition not found");
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    wl_handle_t wl = WL_INVALID_HANDLE;
-    esp_err_t err = wl_mount(part, &wl);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wl_mount: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    const tinyusb_msc_spiflash_config_t cfg = {
-        .wl_handle = wl,
-        .mount_config = {
-            .format_if_mount_failed = true,
-            .max_files            = 5,
-            .allocation_unit_size  = 4096,
-        },
-    };
-    err = tinyusb_msc_storage_init_spiflash(&cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "msc storage init: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    /* Trigger a one-shot local mount so format_if_mount_failed kicks
-     * in on a blank/fresh partition. Then unmount so the host gets
-     * exclusive MSC access. On an already-formatted partition this is
-     * essentially a no-op. */
-    err = tinyusb_msc_storage_mount("/data");
-    if (err == ESP_OK) {
-        tinyusb_msc_storage_unmount();
-    } else {
-        /* Not fatal -- mount-for-format is opportunistic. Host can
-         * still format the raw volume via Disk Utility / FORMAT. */
-        ESP_LOGW(TAG, "first-boot format probe: %s", esp_err_to_name(err));
-    }
-
-    ESP_LOGI(TAG, "MSC backing store mounted (%u sectors x %u bytes)",
-             (unsigned)tinyusb_msc_storage_get_sector_count(),
-             (unsigned)tinyusb_msc_storage_get_sector_size());
-    return ESP_OK;
-}
+/* MSC backing store lives in disk.c -- it owns the wl_handle and
+ * provides strong tud_msc_*_cb implementations (the esp_tinyusb stock
+ * ones are weak-linked via tools/apply_iram_patches.sh). usb_start
+ * just calls disk_init() here; the SCSI plumbing wires itself up at
+ * link time. */
 
 /* ---- public entry point ---- */
 
@@ -233,7 +186,7 @@ esp_err_t usb_start(void) {
     snprintf(s_serial_str, sizeof(s_serial_str), "%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    esp_err_t err = mount_msc_partition();
+    esp_err_t err = disk_init();
     if (err != ESP_OK) return err;
 
     switch_phy_jtag_to_otg();

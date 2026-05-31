@@ -102,7 +102,7 @@ static portMUX_TYPE s_disk_log_mux = portMUX_INITIALIZER_UNLOCKED;
 static char         s_disk_log[DISK_LOG_LINES][DISK_LOG_LINE_LEN];
 static uint32_t     s_disk_log_seq = 0;
 
-static void disk_logf(const char *fmt, ...) {
+void disk_logf(const char *fmt, ...) {
     char msg[DISK_LOG_MSG_LEN];
     va_list ap;
     va_start(ap, fmt);

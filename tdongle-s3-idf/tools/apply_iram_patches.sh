@@ -22,6 +22,7 @@ PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 TUSB="${PROJECT_DIR}/managed_components/espressif__tinyusb/src/portable/synopsys/dwc2"
 ESP32_H="${TUSB}/dwc2_esp32.h"
 DCD_C="${TUSB}/dcd_dwc2.c"
+MSC_C="${PROJECT_DIR}/managed_components/espressif__esp_tinyusb/tusb_msc_storage.c"
 
 if [[ ! -f "${ESP32_H}" ]]; then
   echo "apply_iram_patches: managed component not present yet (${ESP32_H} missing)."
@@ -90,6 +91,24 @@ else
   rm -f "${DCD_C}.bak"
   echo "apply_iram_patches: dcd_dwc2.c patched (added IRAM_ATTR to dcd_int_handler)"
   patched=1
+fi
+
+# --- Patch 3: tusb_msc_storage.c -- weak-link tud_msc_*_cb so our own
+# implementations in disk.c can override them. Without this we get a
+# duplicate-symbol link error; with this our strong symbols win.
+if [[ -f "${MSC_C}" ]]; then
+  if grep -qE '^__attribute__\(\(weak\)\)[[:space:]]+(void|bool|int32_t) tud_msc_' "${MSC_C}"; then
+    echo "apply_patches: tusb_msc_storage.c already patched"
+  else
+    if ! grep -qE '^(void|bool|int32_t) tud_msc_' "${MSC_C}"; then
+      echo "ERROR: tusb_msc_storage.c doesn't have the expected tud_msc_*_cb signatures. Upstream changed."
+      exit 1
+    fi
+    sed -i.bak -E 's/^(void|bool|int32_t)( tud_msc_[a-z_0-9]+_cb)/__attribute__((weak)) \1\2/' "${MSC_C}"
+    rm -f "${MSC_C}.bak"
+    echo "apply_patches: tusb_msc_storage.c patched (weak-linked tud_msc_*_cb)"
+    patched=1
+  fi
 fi
 
 if [[ ${patched} -eq 0 ]]; then

@@ -10,6 +10,7 @@ idf_component_register(
     SRCS
         "main.c"
         "usb.c"
+        "disk.c"
     INCLUDE_DIRS "."
     REQUIRES
         # Networking / WiFi
