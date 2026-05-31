@@ -31,17 +31,43 @@ fi
 
 patched=0
 
-# --- Patch 1: dwc2_esp32.h esp_intr_alloc flag ---
-if grep -q 'ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM' "${ESP32_H}"; then
+# --- Patch 1: dwc2_esp32.h ---
+#   1a. esp_intr_alloc flag: OR in ESP_INTR_FLAG_IRAM so the ROM
+#       trampoline dispatches via the IRAM-resident path.
+#   1b. dwc2_int_handler_wrap: IRAM_ATTR so the wrapper the trampoline
+#       jumps into is itself in IRAM (otherwise it page-faults during
+#       cache-disable BEFORE reaching dcd_int_handler).
+if grep -q 'ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM' "${ESP32_H}" \
+   && grep -qE 'IRAM_ATTR static void dwc2_int_handler_wrap' "${ESP32_H}"; then
   echo "apply_iram_patches: dwc2_esp32.h already patched"
 else
-  if ! grep -q 'esp_intr_alloc(_dwc2_controller\[rhport\].irqnum, ESP_INTR_FLAG_LOWMED,' "${ESP32_H}"; then
+  if ! grep -q 'esp_intr_alloc(_dwc2_controller\[rhport\].irqnum, ESP_INTR_FLAG_LOWMED,' "${ESP32_H}" 2>/dev/null \
+     && ! grep -q 'ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM' "${ESP32_H}"; then
     echo "ERROR: dwc2_esp32.h doesn't have the expected esp_intr_alloc call. Upstream changed."
     exit 1
   fi
-  sed -i.bak 's#esp_intr_alloc(_dwc2_controller\[rhport\].irqnum, ESP_INTR_FLAG_LOWMED,#esp_intr_alloc(_dwc2_controller[rhport].irqnum, ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM,#' "${ESP32_H}"
-  rm -f "${ESP32_H}.bak"
-  echo "apply_iram_patches: dwc2_esp32.h patched (added ESP_INTR_FLAG_IRAM)"
+  if ! grep -qE '^static void dwc2_int_handler_wrap\(' "${ESP32_H}" \
+     && ! grep -qE '^IRAM_ATTR static void dwc2_int_handler_wrap\(' "${ESP32_H}"; then
+    echo "ERROR: dwc2_esp32.h doesn't have the expected dwc2_int_handler_wrap signature. Upstream changed."
+    exit 1
+  fi
+  # Pull in esp_attr.h so IRAM_ATTR resolves.
+  if ! grep -q '#include "esp_attr.h"' "${ESP32_H}"; then
+    sed -i.bak '/#include "esp_intr_alloc.h"/a\
+#include "esp_attr.h"
+' "${ESP32_H}"
+    rm -f "${ESP32_H}.bak"
+  fi
+  # Idempotent: only run the substitution if the target isn't already present.
+  if ! grep -q 'ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM' "${ESP32_H}"; then
+    sed -i.bak 's#esp_intr_alloc(_dwc2_controller\[rhport\].irqnum, ESP_INTR_FLAG_LOWMED,#esp_intr_alloc(_dwc2_controller[rhport].irqnum, ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM,#' "${ESP32_H}"
+    rm -f "${ESP32_H}.bak"
+  fi
+  if ! grep -qE '^IRAM_ATTR static void dwc2_int_handler_wrap' "${ESP32_H}"; then
+    sed -i.bak 's#^static void dwc2_int_handler_wrap(#IRAM_ATTR static void dwc2_int_handler_wrap(#' "${ESP32_H}"
+    rm -f "${ESP32_H}.bak"
+  fi
+  echo "apply_iram_patches: dwc2_esp32.h patched (ESP_INTR_FLAG_IRAM + IRAM_ATTR on wrapper)"
   patched=1
 fi
 

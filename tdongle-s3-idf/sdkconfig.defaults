@@ -27,15 +27,14 @@ CONFIG_SPI_FLASH_AUTO_SUSPEND=y
 # No PSRAM on this dongle variant -- we verified via esptool chip_id.
 # CONFIG_SPIRAM is not set
 
-# FreeRTOS: keep dual-core scheduling. Pin Arduino-ish work to core 1
-# in code; let WiFi land on core 0 by ESP-IDF default.
+# FreeRTOS: dual-core scheduling stays on (the default).
 CONFIG_FREERTOS_HZ=1000
-CONFIG_FREERTOS_USE_CORE_AFFINITY=y
 
-# Logging: send ESP_LOG to USB-Serial-JTAG (the built-in JTAG/CDC on
-# GPIO19/20 -- a SEPARATE controller from the USB-OTG we use for our
-# MSC/CDC/HID device. JTAG is what's exposed for debugger access and
-# is non-data-plane.) Falls back gracefully if JTAG isn't connected.
+# Console: USB-Serial-JTAG and USB-OTG share GPIO 19/20 on ESP32-S3.
+# We keep JTAG enabled so boot logs flow during early init; the moment
+# tinyusb_driver_install() flips the USB phy to OTG, JTAG goes away
+# and tusb_console_init() takes over via the CDC interface. Any panic
+# in usb_start() before the phy flip is still visible over JTAG.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
@@ -52,13 +51,23 @@ CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 
-# TinyUSB / esp_tinyusb -- enable MSC + HID + CDC. Configured further
-# in main code via tinyusb_config_t. We use raw tud_* callbacks for
-# MSC so we own the response semantics (can return 0 to NAK).
+# TinyUSB / esp_tinyusb -- composite MSC + HID(1) + CDC(1). The
+# descriptor itself is hand-rolled in usb.c since esp_tinyusb's stock
+# template doesn't include HID.
 CONFIG_TINYUSB_MSC_ENABLED=y
-CONFIG_TINYUSB_HID_ENABLED=y
-CONFIG_TINYUSB_CDC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=4096
+CONFIG_TINYUSB_CDC_ENABLED=y
+CONFIG_TINYUSB_CDC_COUNT=1
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=512
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=512
+CONFIG_TINYUSB_HID_COUNT=1
+
+# Use Espressif's VID, custom PID. The product strings are also custom
+# (set in usb.c), so we tell esp_tinyusb not to pull in its defaults
+# for them either.
+CONFIG_TINYUSB_DESC_USE_ESPRESSIF_VID=y
+CONFIG_TINYUSB_DESC_USE_DEFAULT_PID=n
+CONFIG_TINYUSB_DESC_CUSTOM_PID=0x4023
 
 # Compiler / runtime tuning
 CONFIG_COMPILER_OPTIMIZATION_PERF=y

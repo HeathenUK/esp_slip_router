@@ -45,6 +45,8 @@
 #include "nvs.h"
 #include "mdns.h"
 
+#include "usb.h"
+
 /* First-flash bootstrap WiFi credentials. The file `wifi_creds.h` is
  * gitignored and locally created. NVS-stored creds always take
  * precedence; this header is only consulted when NVS is empty (i.e. on
@@ -260,6 +262,20 @@ static esp_err_t h_ota(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* /usb-start: bring up the composite USB device on demand. Deferred
+ * out of boot so a panic in TinyUSB init can't take WiFi/HTTP down
+ * with it -- the dongle stays reachable and we can OTA a fix. */
+static esp_err_t h_usb_start(httpd_req_t *req) {
+    disk_logf("usb-start: enter");
+    esp_err_t e = usb_start();
+    disk_logf("usb-start: ret=%s", esp_err_to_name(e));
+    if (e == ESP_OK)
+        return send_text(req, "200 OK", "text/plain", "USB up\n");
+    char msg[64];
+    snprintf(msg, sizeof msg, "usb_start failed: %s\n", esp_err_to_name(e));
+    return send_text(req, "500 Internal Server Error", "text/plain", msg);
+}
+
 static httpd_handle_t s_httpd = NULL;
 
 static void httpd_start_once(void) {
@@ -277,11 +293,12 @@ static void httpd_start_once(void) {
         return;
     }
     const httpd_uri_t routes[] = {
-        { .uri = "/",         .method = HTTP_GET,  .handler = h_root,     .user_ctx = NULL },
-        { .uri = "/status",   .method = HTTP_GET,  .handler = h_status,   .user_ctx = NULL },
-        { .uri = "/disk-log", .method = HTTP_GET,  .handler = h_disk_log, .user_ctx = NULL },
-        { .uri = "/ota",      .method = HTTP_POST, .handler = h_ota,      .user_ctx = NULL },
-        { .uri = "/reset",    .method = HTTP_POST, .handler = h_reset,    .user_ctx = NULL },
+        { .uri = "/",          .method = HTTP_GET,  .handler = h_root,      .user_ctx = NULL },
+        { .uri = "/status",    .method = HTTP_GET,  .handler = h_status,    .user_ctx = NULL },
+        { .uri = "/disk-log",  .method = HTTP_GET,  .handler = h_disk_log,  .user_ctx = NULL },
+        { .uri = "/ota",       .method = HTTP_POST, .handler = h_ota,       .user_ctx = NULL },
+        { .uri = "/reset",     .method = HTTP_POST, .handler = h_reset,     .user_ctx = NULL },
+        { .uri = "/usb-start", .method = HTTP_POST, .handler = h_usb_start, .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
         httpd_register_uri_handler(s_httpd, &routes[i]);
@@ -461,9 +478,15 @@ void app_main(void) {
 
     wifi_start();
 
+    /* USB device init is deferred to POST /usb-start so a crash in
+     * TinyUSB init doesn't take WiFi/HTTP down with it. The first
+     * Phase 1a bring-up bootlooped silently and left no way to read
+     * what failed -- with this design the dongle always boots to a
+     * known-good HTTP-reachable baseline. */
+
     /* Idle forever. WiFi event handler will start HTTP + mDNS once
      * STA is connected. Subsequent phases will start additional tasks
-     * (USB, AT engine, SLIP polling) here. */
+     * (AT engine, SLIP polling) here. */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
