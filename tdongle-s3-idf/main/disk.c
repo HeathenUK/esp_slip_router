@@ -58,27 +58,62 @@ static wl_handle_t s_wl = WL_INVALID_HANDLE;
 static uint32_t    s_block_count = 0;   /* in 512-byte logical blocks */
 static SemaphoreHandle_t s_io_mutex = NULL;
 
-/* Write-back cache: N slots, each holds one WL sector. The host's
- * typical write pattern (FAT update + data cluster + dir entry) hits
- * 3-4 distinct sectors interleaved; with multiple slots none of those
- * forces a flash eviction on the critical SCSI path. With one slot
- * (the previous design), eviction fired on almost every write, each
- * taking the full ~67 ms erase+program. CHUSB's per-CBW timeout
- * fires below that, causing DOS-side hangs.
+/* Write-back cache with ASYNC eviction.
  *
- * 4 slots × 4 KB = 16 KB RAM. Free heap is ~225 KB; cost is trivial. */
-#define WB_SLOTS 4
+ * SCSI WRITE callbacks no longer block on flash. The hot path is just:
+ *   1. lock mutex
+ *   2. find or allocate a slot (memory-only)
+ *   3. memcpy host data into the slot
+ *   4. mark slot DIRTY
+ *   5. unlock mutex
+ *   6. signal worker semaphore
+ * Total: ~1-10 microseconds per write callback.
+ *
+ * The wb_worker task (pinned to CPU1, priority just below TinyUSB)
+ * drains DIRTY slots to flash in the background. It snapshots each
+ * slot under brief mutex into a worker-private buffer, then releases
+ * the mutex before the slow wl_erase + wl_write (~67 ms) so the SCSI
+ * path stays unblocked.
+ *
+ * Slot states form a small state machine:
+ *
+ *   EMPTY  --writer-->  DIRTY  --worker-snapshot-->  FLUSHING
+ *                          ^                              |
+ *                          | (writer hits FLUSHING slot   v
+ *                          |  -> updates data in-place,  CLEAN
+ *                          |  marks DIRTY again)          |
+ *                          +----------------------------- + (re-dirty before commit)
+ *
+ * Slot count is the headroom for the host to burst writes faster
+ * than the worker can drain to flash (worker rate ~15 sectors/sec).
+ * At 32 slots × 4 KB = 128 KB RAM, the host can burst ~128 KB
+ * before any callback has to wait on the worker. DISKTEST's
+ * 78-write run with 8 slots saw 8 slow writes from cache
+ * saturation -- 32 slots leaves clear margin. */
+#define WB_SLOTS 32
+
+typedef enum {
+    SLOT_EMPTY    = 0,
+    SLOT_CLEAN    = 1,   /* data matches flash; safe to evict */
+    SLOT_DIRTY    = 2,   /* data differs; worker needs to flush */
+    SLOT_FLUSHING = 3,   /* worker is currently committing */
+} slot_state_t;
+
 typedef struct {
     uint8_t  data[WB_CACHE_BYTES];
     uint32_t sect_base;
-    uint64_t last_use_us;   /* esp_timer_get_time() of last hit -- for LRU */
-    bool     have;
-    bool     dirty;
+    uint64_t last_use_us;       /* for LRU when evicting CLEAN slots */
+    slot_state_t state;
 } wb_slot_t;
 
 static wb_slot_t s_wb[WB_SLOTS];
+static uint8_t   s_wb_flush_buf[WB_CACHE_BYTES];  /* worker's snapshot buf */
 static uint32_t  s_wb_merge_count = 0;
-static uint32_t  s_wb_evict_count = 0;
+static uint32_t  s_wb_evict_count = 0;            /* dirty slot displacements */
+static uint32_t  s_wb_async_flush_count = 0;      /* worker-completed flushes */
+static SemaphoreHandle_t s_wb_dirty_sem = NULL;    /* worker wakes on this */
+static SemaphoreHandle_t s_wb_clean_sem = NULL;    /* writer waits on this when all slots dirty */
+static TaskHandle_t      s_wb_worker_task = NULL;
 
 /* Per-callback counters. Single-writer (TinyUSB task on CPU1), readers
  * (HTTP handler on CPU0) get an atomic uint32_t load; values may be
@@ -107,88 +142,178 @@ static volatile uint32_t s_slow_write_count   = 0; /* writes > 50 ms */
 static volatile uint32_t s_max_read_us        = 0;
 #define SLOW_WRITE_THRESHOLD_US 50000U
 
-/* ---- cache helpers (multi-slot) ---- */
-
-/* Flush one specific slot to flash, if it's dirty. */
-static esp_err_t wb_flush_slot(wb_slot_t *s) {
-    if (!s->have || !s->dirty) return ESP_OK;
-    if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
-    size_t sect = wl_sector_size(s_wl);
-    if (sect > WB_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
-
-    esp_err_t e = wl_erase_range(s_wl, s->sect_base, sect);
-    if (e != ESP_OK) {
-        disk_logf("[wb] flush erase fail base=0x%x sect=%u err=%d (%s)",
-                  (unsigned)s->sect_base, (unsigned)sect, e, esp_err_to_name(e));
-        return e;
-    }
-    e = wl_write(s_wl, s->sect_base, s->data, sect);
-    if (e != ESP_OK) {
-        disk_logf("[wb] flush write fail base=0x%x sect=%u err=%d (%s)",
-                  (unsigned)s->sect_base, (unsigned)sect, e, esp_err_to_name(e));
-        return e;
-    }
-    s->dirty = false;
-    return ESP_OK;
-}
+/* ---- cache helpers (multi-slot, async) ----
+ *
+ * IMPORTANT: every function in this block runs with s_io_mutex held
+ * UNLESS it explicitly drops it (only the worker does that, for the
+ * actual wl_erase + wl_write calls). State transitions are valid only
+ * under the mutex. */
 
 static void wb_slot_invalidate(wb_slot_t *s) {
-    s->have      = false;
-    s->dirty     = false;
+    s->state     = SLOT_EMPTY;
     s->sect_base = 0;
 }
 
-/* Find a slot that currently holds `sect_base`, or NULL. */
+/* Find a slot that currently holds `sect_base`, or NULL. Slots in
+ * FLUSHING state still count as holding their sect_base -- the data
+ * in them is fresh, the worker is just persisting it. */
 static wb_slot_t *wb_find(uint32_t sect_base) {
     for (int i = 0; i < WB_SLOTS; ++i) {
-        if (s_wb[i].have && s_wb[i].sect_base == sect_base) return &s_wb[i];
+        if (s_wb[i].state != SLOT_EMPTY && s_wb[i].sect_base == sect_base)
+            return &s_wb[i];
     }
     return NULL;
 }
 
-/* Allocate a slot to hold `sect_base`: prefer an empty slot; otherwise
- * pick the least-recently-used one (flushing it if dirty). The chosen
- * slot is left empty -- caller is responsible for populating it. */
-static esp_err_t wb_alloc_slot(uint32_t sect_base, wb_slot_t **out) {
-    (void)sect_base;
-    /* Empty slot wins. */
-    for (int i = 0; i < WB_SLOTS; ++i) {
-        if (!s_wb[i].have) { *out = &s_wb[i]; return ESP_OK; }
+/* Allocate a slot. Preference order:
+ *   1. EMPTY slot
+ *   2. CLEAN slot, LRU (no flush needed)
+ *   3. block on s_wb_clean_sem until worker promotes a slot to CLEAN
+ * Returns the slot in EMPTY state ready to be populated.
+ * MUST be called with s_io_mutex held; may temporarily release it to
+ * wait on the clean-slot semaphore. */
+static esp_err_t wb_alloc_slot(wb_slot_t **out) {
+    for (int spin = 0; spin < 100; ++spin) {     /* runaway guard */
+        wb_slot_t *empty_slot = NULL;
+        wb_slot_t *clean_lru  = NULL;
+        for (int i = 0; i < WB_SLOTS; ++i) {
+            if (s_wb[i].state == SLOT_EMPTY) {
+                empty_slot = &s_wb[i]; break;
+            }
+            if (s_wb[i].state == SLOT_CLEAN) {
+                if (!clean_lru || s_wb[i].last_use_us < clean_lru->last_use_us)
+                    clean_lru = &s_wb[i];
+            }
+        }
+        if (empty_slot) {
+            *out = empty_slot;
+            return ESP_OK;
+        }
+        if (clean_lru) {
+            s_wb_evict_count++;          /* displacing a CLEAN slot; no flash op */
+            wb_slot_invalidate(clean_lru);
+            *out = clean_lru;
+            return ESP_OK;
+        }
+        /* All slots are DIRTY or FLUSHING. Wake the worker (if it
+         * isn't already busy) and wait for it to promote one to
+         * CLEAN. Drop the mutex while we wait so the worker can
+         * actually progress. */
+        xSemaphoreGive(s_wb_dirty_sem);
+        xSemaphoreGive(s_io_mutex);
+        xSemaphoreTake(s_wb_clean_sem, pdMS_TO_TICKS(200));
+        xSemaphoreTake(s_io_mutex, portMAX_DELAY);
     }
-    /* Evict the LRU (smallest last_use_us). */
-    wb_slot_t *victim = &s_wb[0];
-    for (int i = 1; i < WB_SLOTS; ++i) {
-        if (s_wb[i].last_use_us < victim->last_use_us) victim = &s_wb[i];
-    }
-    esp_err_t e = wb_flush_slot(victim);
-    if (e != ESP_OK) return e;
-    s_wb_evict_count++;
-    wb_slot_invalidate(victim);
-    *out = victim;
-    return ESP_OK;
+    disk_logf("[wb] alloc_slot timeout -- all slots stuck?");
+    return ESP_ERR_TIMEOUT;
 }
 
-/* Read one full WL sector from flash into the given slot. */
+/* Read one full WL sector from flash into the given slot. Caller must
+ * hold s_io_mutex; we drop and reacquire it around the wl_read since
+ * the read can take ~ms. */
 static esp_err_t wb_load_into_slot(wb_slot_t *s, uint32_t sect_base) {
     size_t sect = wl_sector_size(s_wl);
     if (sect > WB_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
+    /* Mark the slot CLEAN with its target sect_base so concurrent
+     * lookups (after we drop the mutex) find it -- the data will be
+     * loaded by the time we return. */
+    s->sect_base = sect_base;
+    s->state     = SLOT_CLEAN;
+    xSemaphoreGive(s_io_mutex);
     esp_err_t e = wl_read(s_wl, sect_base, s->data, sect);
+    xSemaphoreTake(s_io_mutex, portMAX_DELAY);
     if (e != ESP_OK) {
         disk_logf("[wb] load fail base=0x%x sect=%u err=%d (%s)",
                   (unsigned)sect_base, (unsigned)sect, e, esp_err_to_name(e));
+        wb_slot_invalidate(s);
         return e;
     }
-    s->have      = true;
-    s->dirty     = false;
-    s->sect_base = sect_base;
     return ESP_OK;
 }
 
-/* Flush all dirty slots. Called on eject (START_STOP_UNIT with eject=1). */
-static esp_err_t wb_flush_all(void) {
+/* The worker task. Runs forever, sleeps on s_wb_dirty_sem until a
+ * writer signals there's work. */
+static void wb_worker_task(void *arg) {
+    (void)arg;
+    while (1) {
+        xSemaphoreTake(s_wb_dirty_sem, portMAX_DELAY);
+
+        while (1) {
+            /* Find the oldest DIRTY slot. */
+            xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+            wb_slot_t *victim = NULL;
+            for (int i = 0; i < WB_SLOTS; ++i) {
+                if (s_wb[i].state == SLOT_DIRTY) {
+                    if (!victim || s_wb[i].last_use_us < victim->last_use_us)
+                        victim = &s_wb[i];
+                }
+            }
+            if (!victim) {
+                xSemaphoreGive(s_io_mutex);
+                break;        /* go back to sleep */
+            }
+            /* Snapshot the data + mark FLUSHING so the writer knows
+             * the slot is in transit. If the writer touches the slot
+             * before we finish, it'll mark it DIRTY again -- we'll
+             * see that on completion and re-flush in the next pass. */
+            uint32_t base = victim->sect_base;
+            memcpy(s_wb_flush_buf, victim->data, WB_CACHE_BYTES);
+            victim->state = SLOT_FLUSHING;
+            xSemaphoreGive(s_io_mutex);
+
+            /* Slow flash op -- ~67 ms -- runs OUTSIDE the mutex. */
+            size_t sect = wl_sector_size(s_wl);
+            esp_err_t e = wl_erase_range(s_wl, base, sect);
+            if (e == ESP_OK)
+                e = wl_write(s_wl, base, s_wb_flush_buf, sect);
+
+            xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+            if (e != ESP_OK) {
+                disk_logf("[wb] async flush fail base=0x%x err=%d (%s)",
+                          (unsigned)base, e, esp_err_to_name(e));
+                /* Leave slot DIRTY so we retry. */
+                victim->state = SLOT_DIRTY;
+            } else if (victim->state == SLOT_FLUSHING) {
+                /* No writer touched it during the flush: data on flash
+                 * matches data in slot; promote to CLEAN. */
+                victim->state = SLOT_CLEAN;
+                s_wb_async_flush_count++;
+                xSemaphoreGive(s_wb_clean_sem);
+            }
+            /* else: writer re-marked DIRTY mid-flush; loop will pick
+             * it up again next iteration. */
+            xSemaphoreGive(s_io_mutex);
+        }
+    }
+}
+
+/* Synchronously drain every dirty slot to flash. Called on eject so
+ * we don't lose data if the host pulls the device. Caller must hold
+ * s_io_mutex. The wl ops happen with the mutex released. */
+static esp_err_t wb_flush_all_sync(void) {
     for (int i = 0; i < WB_SLOTS; ++i) {
-        esp_err_t e = wb_flush_slot(&s_wb[i]);
-        if (e != ESP_OK) return e;
+        if (s_wb[i].state != SLOT_DIRTY && s_wb[i].state != SLOT_FLUSHING) continue;
+        /* Wait for any worker-in-flight on this slot to complete. */
+        while (s_wb[i].state == SLOT_FLUSHING) {
+            xSemaphoreGive(s_io_mutex);
+            vTaskDelay(pdMS_TO_TICKS(5));
+            xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+        }
+        if (s_wb[i].state != SLOT_DIRTY) continue;
+        uint32_t base = s_wb[i].sect_base;
+        memcpy(s_wb_flush_buf, s_wb[i].data, WB_CACHE_BYTES);
+        s_wb[i].state = SLOT_FLUSHING;
+        xSemaphoreGive(s_io_mutex);
+        size_t sect = wl_sector_size(s_wl);
+        esp_err_t e = wl_erase_range(s_wl, base, sect);
+        if (e == ESP_OK) e = wl_write(s_wl, base, s_wb_flush_buf, sect);
+        xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+        if (e != ESP_OK) {
+            s_wb[i].state = SLOT_DIRTY;
+            return e;
+        }
+        if (s_wb[i].state == SLOT_FLUSHING)
+            s_wb[i].state = SLOT_CLEAN;
     }
     return ESP_OK;
 }
@@ -360,6 +485,13 @@ esp_err_t disk_init(void) {
     s_io_mutex = xSemaphoreCreateMutex();
     if (!s_io_mutex) return ESP_ERR_NO_MEM;
 
+    /* Counting semaphores so multiple gives between worker passes
+     * (e.g., back-to-back writes) don't pile up infinitely; cap at
+     * WB_SLOTS since that's the worst case interesting. */
+    s_wb_dirty_sem = xSemaphoreCreateCounting(WB_SLOTS, 0);
+    s_wb_clean_sem = xSemaphoreCreateCounting(WB_SLOTS, 0);
+    if (!s_wb_dirty_sem || !s_wb_clean_sem) return ESP_ERR_NO_MEM;
+
     const esp_partition_t *part = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "ffat");
     if (!part) return ESP_ERR_NOT_FOUND;
@@ -386,10 +518,20 @@ esp_err_t disk_init(void) {
         }
     }
 
-    disk_logf("disk: wl ok, %u x 512B sectors (%u WL sectors of %u B), label=" MSC_VOLUME_LABEL,
+    /* Spawn the async write-back worker. Pinned to CPU1 (same as
+     * TinyUSB) with priority below it so MSC callbacks preempt the
+     * worker if both want CPU1 at once. Stack: the wl ops + a single
+     * snapshot buffer don't need much. */
+    BaseType_t bx = xTaskCreatePinnedToCore(
+        wb_worker_task, "wb_worker", 4096, NULL,
+        17 /* TinyUSB is 18 */, &s_wb_worker_task, 1 /* CPU1 */);
+    if (bx != pdPASS) return ESP_ERR_NO_MEM;
+
+    disk_logf("disk: wl ok, %u x 512B sectors (%u WL sectors of %u B), label=" MSC_VOLUME_LABEL ", slots=%u async",
               (unsigned)s_block_count,
               (unsigned)(total_bytes / wl_sector_size(s_wl)),
-              (unsigned)wl_sector_size(s_wl));
+              (unsigned)wl_sector_size(s_wl),
+              (unsigned)WB_SLOTS);
 
     /* Dump the first 16 bytes of sector 0 + the FAT signature so we
      * can verify the BPB layout. */
@@ -435,10 +577,11 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
     s_cb_start_stop++;
     s_last_op = 'S';
     if (load_eject && !start) {
-        /* Eject: flush ALL dirty slots so the host doesn't lose any
-         * data still in RAM if we reset before the next eviction. */
+        /* Eject: synchronously drain ALL dirty slots so the host
+         * doesn't lose any data still in RAM if we reset before the
+         * worker would have flushed them. */
         xSemaphoreTake(s_io_mutex, portMAX_DELAY);
-        esp_err_t e = wb_flush_all();
+        esp_err_t e = wb_flush_all_sync();
         xSemaphoreGive(s_io_mutex);
         if (e != ESP_OK) {
             disk_logf("[wb] eject flush err=%d (%s)", e, esp_err_to_name(e));
@@ -532,16 +675,18 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
 
         wb_slot_t *slot = wb_find(sect_base);
         if (slot) {
-            /* Hit: pure RAM merge, no flash op. The eviction (and the
-             * 67 ms erase+program latency that goes with it) was
-             * deferred to when this slot eventually gets reused. */
+            /* Hit (any state including FLUSHING): pure RAM merge.
+             * If it was FLUSHING the worker already snapshotted the
+             * old data; we can safely overwrite live data. Marking
+             * DIRTY tells the worker "redo this one when you're back". */
             memcpy(slot->data + sect_off, src, chunk);
-            slot->dirty = true;
+            slot->state = SLOT_DIRTY;
             slot->last_use_us = (uint64_t)esp_timer_get_time();
             s_wb_merge_count++;
         } else {
-            /* Miss. Allocate a slot (may flush a dirty victim). */
-            esp_err_t e = wb_alloc_slot(sect_base, &slot);
+            /* Miss. Allocate a slot (may evict a CLEAN one or block
+             * briefly waiting for the worker to drain). */
+            esp_err_t e = wb_alloc_slot(&slot);
             if (e != ESP_OK) {
                 xSemaphoreGive(s_io_mutex);
                 return -1;
@@ -549,8 +694,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
             if (sect_off == 0 && chunk == sect) {
                 /* Full-sector overwrite: skip the read. */
                 memcpy(slot->data, src, sect);
-                slot->have      = true;
-                slot->dirty     = true;
+                slot->state     = SLOT_DIRTY;
                 slot->sect_base = sect_base;
             } else {
                 e = wb_load_into_slot(slot, sect_base);
@@ -559,13 +703,14 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
                     return -1;
                 }
                 memcpy(slot->data + sect_off, src, chunk);
-                slot->dirty = true;
+                slot->state = SLOT_DIRTY;
             }
             slot->last_use_us = (uint64_t)esp_timer_get_time();
         }
 
         addr += chunk; src += chunk; remaining -= chunk;
     }
+    xSemaphoreGive(s_wb_dirty_sem);   /* wake worker (if needed) */
     xSemaphoreGive(s_io_mutex);
     {
         uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
@@ -628,14 +773,22 @@ void tud_resume_cb(void) {
 /* ---- JSON snapshot for /usb-stats ---- */
 
 size_t disk_stats_json(char *out, size_t cap) {
-    unsigned dirty = 0;
-    for (int i = 0; i < WB_SLOTS; ++i) if (s_wb[i].dirty) dirty++;
+    unsigned dirty = 0, flushing = 0, clean = 0, empty = 0;
+    for (int i = 0; i < WB_SLOTS; ++i) {
+        switch (s_wb[i].state) {
+            case SLOT_EMPTY:    empty++;    break;
+            case SLOT_CLEAN:    clean++;    break;
+            case SLOT_DIRTY:    dirty++;    break;
+            case SLOT_FLUSHING: flushing++; break;
+        }
+    }
     int n = snprintf(out, cap,
         "{\"counts\":{\"tur\":%u,\"read\":%u,\"write\":%u,\"scsi\":%u,\"start_stop\":%u"
         ",\"mount\":%u,\"umount\":%u,\"suspend\":%u,\"resume\":%u}"
         ",\"last\":{\"op\":\"%c\",\"lba\":%u,\"size\":%u}"
         ",\"timing_us\":{\"max_write\":%u,\"max_write_lba\":%u,\"slow_writes\":%u,\"max_read\":%u}"
-        ",\"wb\":{\"slots\":%u,\"merges\":%u,\"evicts\":%u,\"dirty_slots\":%u}}\n",
+        ",\"wb\":{\"slots\":%u,\"merges\":%u,\"evicts\":%u,\"async_flushes\":%u"
+        ",\"empty\":%u,\"clean\":%u,\"dirty\":%u,\"flushing\":%u}}\n",
         (unsigned)s_cb_tur, (unsigned)s_cb_read, (unsigned)s_cb_write,
         (unsigned)s_cb_scsi, (unsigned)s_cb_start_stop,
         (unsigned)s_cb_mount, (unsigned)s_cb_umount,
@@ -644,6 +797,7 @@ size_t disk_stats_json(char *out, size_t cap) {
         (unsigned)s_max_write_us, (unsigned)s_max_write_lba,
         (unsigned)s_slow_write_count, (unsigned)s_max_read_us,
         (unsigned)WB_SLOTS, (unsigned)s_wb_merge_count, (unsigned)s_wb_evict_count,
-        dirty);
+        (unsigned)s_wb_async_flush_count,
+        empty, clean, dirty, flushing);
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
