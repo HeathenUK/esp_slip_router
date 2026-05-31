@@ -34,8 +34,10 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "soc/rtc_cntl_reg.h"
 
 #include "tusb.h"
 #include "tusb_cdc_acm.h"
@@ -64,6 +66,30 @@ static bool s_echo    = true;
 static bool s_verbose = true;
 static bool s_quiet   = false;
 static bool s_telnet  = true;     /* Telnet IAC handling on by default */
+
+/* ---- NVS-persisted modem flags (E/V/N) ----
+ *
+ * Old build's AT&W packs E/V/N into a single byte; AT&F resets to
+ * all-on (matching ATZ defaults). modem_load_evn() is called at
+ * init; modem_save_evn() persists current state. */
+static void modem_load_evn(void) {
+    nvs_handle_t h;
+    if (nvs_open("slip-router", NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t b = 0x07;   /* default: all-on */
+    nvs_get_u8(h, "evn", &b);
+    nvs_close(h);
+    s_echo    = (b & 1) != 0;
+    s_verbose = (b & 2) != 0;
+    s_telnet  = (b & 4) != 0;
+}
+static void modem_save_evn(void) {
+    nvs_handle_t h;
+    if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) return;
+    uint8_t b = (s_echo ? 1 : 0) | (s_verbose ? 2 : 0) | (s_telnet ? 4 : 0);
+    nvs_set_u8(h, "evn", b);
+    nvs_commit(h);
+    nvs_close(h);
+}
 
 /* ---- online-mode state ---- */
 static int       s_sock = -1;
@@ -601,7 +627,59 @@ static void handle_dollar(char *s) {
 
     if (!strcmp(key, "WIFI")) {
         if (val && eq)        cmd_wifi_set(val);
-        else                  { cmd_wifi_query(); r_ok(); }
+        else if (val && qm)   { cmd_wifi_query(); r_ok(); }
+        else {
+            /* Bare AT$WIFI -- reconnect with stored creds. */
+            cdc_print("\r\nreconnecting...\r\n");
+            esp_wifi_disconnect();
+            esp_wifi_connect();
+            r_ok();
+        }
+    } else if (!strcmp(key, "SSID")) {
+        nvs_handle_t h;
+        if (val && eq) {
+            if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) { r_error(); return; }
+            nvs_set_str(h, "ssid", val);
+            nvs_commit(h); nvs_close(h);
+            /* Old build debounced SSID+PASS pair, but with separate
+             * commands we just reconnect on next AT$WIFI (or AT$WIFI=). */
+            r_ok();
+        } else {
+            char ssid[33] = {0};
+            size_t n = sizeof ssid;
+            if (nvs_open("slip-router", NVS_READONLY, &h) == ESP_OK) {
+                nvs_get_str(h, "ssid", ssid, &n);
+                nvs_close(h);
+            }
+            cdc_print("\r\n"); cdc_print(ssid); cdc_print("\r\n");
+            r_ok();
+        }
+    } else if (!strcmp(key, "PASS")) {
+        nvs_handle_t h;
+        if (val && eq) {
+            if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) { r_error(); return; }
+            nvs_set_str(h, "pass", val);
+            nvs_commit(h); nvs_close(h);
+            r_ok();
+        } else {
+            char pass[65] = {0};
+            size_t n = sizeof pass;
+            bool has = false;
+            if (nvs_open("slip-router", NVS_READONLY, &h) == ESP_OK) {
+                if (nvs_get_str(h, "pass", pass, &n) == ESP_OK && pass[0]) has = true;
+                nvs_close(h);
+            }
+            cdc_print(has ? "\r\n(set)\r\n" : "\r\n(none)\r\n");
+            r_ok();
+        }
+    } else if (!strcmp(key, "RSSI")) {
+        wifi_ap_record_t ap = {0};
+        char b[32];
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+            snprintf(b, sizeof b, "\r\n%d\r\n", (int)ap.rssi);
+        else
+            snprintf(b, sizeof b, "\r\nnoconn\r\n");
+        cdc_print(b); r_ok();
     } else if (!strcmp(key, "STATS")) {
         if (val && eq) {
             /* AT$STATS=0 -- zero the SLIP counters. The harness
@@ -658,6 +736,68 @@ static void handle_dollar(char *s) {
         cdc_print("\r\nRESETTING\r\n");
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
+    } else if (!strcmp(key, "BOOT")) {
+        /* AT$BOOT -- jump to ESP32-S3 ROM bootloader. Same fallback
+         * the old build had: if AT$OTASTART can't run (firmware too
+         * broken, locked, pre-OTA), we set the "force download mode"
+         * RTC option and reset. Bootloader then enumerates as
+         * cu.usbmodem123401 -- esptool can reflash via the same cable. */
+        cdc_print("\r\nENTERING BOOTLOADER\r\n");
+        vTaskDelay(pdMS_TO_TICKS(150));
+        REG_WRITE(RTC_CNTL_OPTION1_REG, 0x1);   /* RTC_CNTL_FORCE_DOWNLOAD_BOOT */
+        esp_restart();
+    } else if (!strcmp(key, "OTASTART") && val && eq) {
+        /* AT$OTASTART=<size> -- CDC-side OTA. Streams <size> bytes
+         * of raw firmware.bin into the inactive OTA slot, then
+         * commits + reboots. Recovery path when WiFi is unreachable.
+         *
+         *   host    -> AT$OTASTART=<size>\r
+         *   dongle  -> \r\nOTA READY\r\n
+         *   host    -> <size> bytes of fw.bin
+         *   dongle  -> \r\nOTA OK\r\n  (then esp_restart)
+         *           or \r\nOTA <code>\r\n + ERROR */
+        long sz = strtol(val, NULL, 10);
+        if (sz < 16384L || sz > 6L * 1024L * 1024L) {
+            cdc_print("\r\nOTA BADSIZE\r\n"); r_error(); return;
+        }
+        const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+        if (!next) { cdc_print("\r\nOTA NOPART\r\n"); r_error(); return; }
+        esp_ota_handle_t h = 0;
+        if (esp_ota_begin(next, (size_t)sz, &h) != ESP_OK) {
+            cdc_print("\r\nOTA BEGIN-FAIL\r\n"); r_error(); return;
+        }
+        cdc_print("\r\nOTA READY\r\n");
+        long got = 0;
+        int64_t last_rx_us = esp_timer_get_time();
+        static uint8_t buf[2048];
+        while (got < sz) {
+            size_t want = (size_t)(sz - got);
+            if (want > sizeof buf) want = sizeof buf;
+            size_t n = 0;
+            if (tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, buf, want, &n) == ESP_OK && n > 0) {
+                if (esp_ota_write(h, buf, n) != ESP_OK) {
+                    esp_ota_abort(h);
+                    cdc_print("\r\nOTA WRITE-FAIL\r\n"); r_error(); return;
+                }
+                got += (long)n;
+                last_rx_us = esp_timer_get_time();
+            } else {
+                if (esp_timer_get_time() - last_rx_us > 8 * 1000 * 1000LL) {
+                    esp_ota_abort(h);
+                    cdc_print("\r\nOTA TIMEOUT\r\n"); r_error(); return;
+                }
+                vTaskDelay(pdMS_TO_TICKS(2));
+            }
+        }
+        if (esp_ota_end(h) != ESP_OK) {
+            cdc_print("\r\nOTA END-FAIL\r\n"); r_error(); return;
+        }
+        if (esp_ota_set_boot_partition(next) != ESP_OK) {
+            cdc_print("\r\nOTA SETBOOT-FAIL\r\n"); r_error(); return;
+        }
+        cdc_print("\r\nOTA OK\r\n");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
     } else if (!strcmp(key, "HELP")) {
         cdc_print(
             "\r\n"
@@ -691,6 +831,10 @@ static void exec(char *line) {
         case 'V': s_verbose = (p[1] != '0'); r_ok(); return;
         case 'Q': s_quiet   = (p[1] == '1'); r_ok(); return;
         case 'I': cdc_print("\r\nDOSongle Modem (Phase 1c)\r\n"); r_ok(); return;
+        case 'N': /* ATN0/1 -- telnet IAC + CR-to-CRLF processing off/on.
+                   * HTTP over Hayes mode needs ATN0 so the dongle
+                   * doesn't double CRs in the request headers. */
+                  s_telnet = (p[1] != '0'); r_ok(); return;
         case 'Z': s_echo = true; s_verbose = true; s_quiet = false; s_telnet = true; r_ok(); return;
         case 'D': cmd_dial(p + 1); return;
         case 'H': {
@@ -712,7 +856,35 @@ static void exec(char *line) {
             }
         } return;
         case '$': handle_dollar(p + 1); return;
-        default:  r_error(); return;
+        case '&': {
+            /* AT&V dump config / AT&W save E/V/N / AT&F factory reset. */
+            char c = (char)toupper((unsigned char)p[1]);
+            if (c == 'V') {
+                char b[160];
+                snprintf(b, sizeof b,
+                         "\r\nATE%d  ATV%d  ATQ%d  ATN%d\r\n"
+                         "mode:  %s\r\n",
+                         s_echo?1:0, s_verbose?1:0, s_quiet?1:0, s_telnet?1:0,
+                         slip_get_mode() == MODE_SLIP ? "SLIP" : "MODEM");
+                cdc_print(b);
+                r_ok();
+            } else if (c == 'W') {
+                modem_save_evn();
+                r_ok();
+            } else if (c == 'F') {
+                s_echo = true; s_verbose = true; s_quiet = false; s_telnet = true;
+                modem_save_evn();
+                r_ok();
+            } else {
+                r_error();
+            }
+        } return;
+        default:
+            /* Real modems are lenient: unknown single-letter commands
+             * (AT&K0, ATS0=0, etc. that scripts commonly issue) return
+             * OK so the script doesn't abort. We do the same. */
+            r_ok();
+            return;
     }
 }
 
@@ -777,12 +949,14 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
 /* ---- public entry ---- */
 
 esp_err_t modem_init(void) {
+    modem_load_evn();      /* restore E/V/N from NVS (AT&W saved) */
     esp_err_t e = tinyusb_cdcacm_register_callback(
         TINYUSB_CDC_ACM_0, CDC_EVENT_RX, on_cdc_rx);
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "cdc rx cb register: %s", esp_err_to_name(e));
         return e;
     }
-    disk_logf("modem: AT engine ready on CDC0");
+    disk_logf("modem: AT engine ready on CDC0 (E%d V%d N%d)",
+              s_echo?1:0, s_verbose?1:0, s_telnet?1:0);
     return ESP_OK;
 }
