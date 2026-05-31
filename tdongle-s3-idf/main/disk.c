@@ -143,6 +143,13 @@ static volatile uint32_t s_max_read_us        = 0;
 static volatile uint32_t s_max_alloc_wait_us  = 0; /* time blocked waiting on clean_sem */
 #define SLOW_WRITE_THRESHOLD_US 50000U
 
+/* Ownership state for the raw-FAT HTTP path. When s_dongle_owns is
+ * true, tud_msc_write10_cb rejects new writes with -1 (host gets a
+ * sense-data error). Reads still pass through the cache + flash like
+ * normal. */
+static volatile bool    s_dongle_owns = false;
+static volatile int64_t s_last_msc_write_us = 0;
+
 /* ---- cache helpers (multi-slot, async) ----
  *
  * IMPORTANT: every function in this block runs with s_io_mutex held
@@ -295,6 +302,14 @@ static void wb_worker_task(void *arg) {
             xSemaphoreGive(s_io_mutex);
         }
     }
+}
+
+/* Invalidate every cache slot (force EMPTY). Used after the raw-FAT
+ * HTTP path mutates the volume so subsequent MSC reads pick up the
+ * new flash contents instead of stale cache data. Caller holds
+ * s_io_mutex. */
+static void wb_invalidate_all(void) {
+    for (int i = 0; i < WB_SLOTS; ++i) wb_slot_invalidate(&s_wb[i]);
 }
 
 /* Synchronously drain every dirty slot to flash. Called on eject so
@@ -697,7 +712,15 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
     s_last_lba = lba;
     s_last_size = bufsize;
     int64_t t0 = esp_timer_get_time();
+    s_last_msc_write_us = t0;
     if (s_wl == WL_INVALID_HANDLE) return -1;
+    if (s_dongle_owns) {
+        /* Firmware is mid-FAT-write via the raw-FAT HTTP path.
+         * Host's next TUR will get UNIT_ATTENTION sense from
+         * disk_release_to_usb, which makes DOS re-read the FAT
+         * after we're done. */
+        return -1;
+    }
 
     uint32_t addr = lba * (uint32_t)MSC_BLOCK_SIZE + offset;
     if ((uint64_t)addr + bufsize > (uint64_t)s_block_count * MSC_BLOCK_SIZE) {
@@ -817,6 +840,65 @@ void tud_suspend_cb(bool remote_wakeup_en) {
 void tud_resume_cb(void) {
     s_cb_resume++;
     disk_logf("[usb] resume #%u", (unsigned)s_cb_resume);
+}
+
+/* ---- ownership transfer for raw-FAT HTTP (Phase 2) ----
+ *
+ * Two-phase take: first pre-flush the cache WHILE MSC writes are
+ * still allowed (so the host stays usable up to the last possible
+ * moment). Then set s_dongle_owns=true. Any MSC write that races
+ * past the flush is held in the cache; the next pre-flush before
+ * the FATFS op picks it up.
+ *
+ * Release: invalidate cache (slots may hold stale data vs. flash
+ * after FATFS wrote), clear owns flag, signal SCSI UNIT_ATTENTION
+ * so the next TUR makes DOS re-read the FAT. */
+
+bool disk_dongle_owns(void) { return s_dongle_owns; }
+
+wl_handle_t disk_get_wl_handle(void) { return s_wl; }
+
+esp_err_t disk_take_for_firmware(void) {
+    if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
+
+    /* Defer if the host has been actively writing very recently --
+     * better to bounce the HTTP request than to fight DOS for the
+     * FAT mid-burst. Caller (HTTP handler) returns 429 to retry. */
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_msc_write_us < DISK_RECENT_MSC_WRITE_GUARD_US)
+        return ESP_ERR_TIMEOUT;
+
+    /* Pre-flush before claiming ownership. MSC writes remain allowed
+     * during this so the host doesn't see a stall. */
+    xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+    esp_err_t e = wb_flush_all_sync();
+    if (e != ESP_OK) { xSemaphoreGive(s_io_mutex); return e; }
+
+    s_dongle_owns = true;
+
+    /* Drain any MSC write that landed between the flush and the
+     * owns=true assignment. Same wb_flush_all_sync; any new dirty
+     * slots from a racing tud_msc_write10_cb get committed. */
+    e = wb_flush_all_sync();
+    xSemaphoreGive(s_io_mutex);
+    if (e != ESP_OK) {
+        s_dongle_owns = false;
+        return e;
+    }
+    return ESP_OK;
+}
+
+void disk_release_to_usb(void) {
+    xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+    /* FATFS may have written to flash via wl_write while we owned;
+     * our cache could now be stale. Drop everything. */
+    wb_invalidate_all();
+    s_dongle_owns = false;
+    xSemaphoreGive(s_io_mutex);
+    /* Next host TUR will see this sense data and re-read the FAT.
+     * 28h/00 == "not-ready-to-ready transition, medium may have
+     * changed" -- the right code for "I touched the volume." */
+    tud_msc_set_sense(0, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
 }
 
 /* ---- JSON snapshot for /usb-stats ---- */

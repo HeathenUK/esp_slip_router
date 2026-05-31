@@ -78,6 +78,15 @@ CONFIG_TINYUSB_TASK_PRIORITY=18
 # volume on first boot. Off by default to save space.
 CONFIG_FATFS_USE_LABEL=y
 
+# FATFS sector size must match our hand-built BPB (BytsPerSec=512).
+# The default 4096 corresponds to WL's native sector, which would
+# require the BPB to match -- but DOS / CHUSB expect 512-byte
+# logical sectors, and macOS rejected our earlier 4096-byte BPB.
+# Custom diskio in fat.c wraps wl with 512-byte semantics (RMW on
+# writes).
+CONFIG_FATFS_SECTOR_512=y
+# CONFIG_FATFS_SECTOR_4096 is not set
+
 # Use Espressif's VID, custom PID. The product strings are also custom
 # (set in usb.c), so we tell esp_tinyusb not to pull in its defaults
 # for them either.

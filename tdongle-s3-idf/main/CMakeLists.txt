@@ -12,6 +12,7 @@ idf_component_register(
         "usb.c"
         "disk.c"
         "modem.c"
+        "fat.c"
     INCLUDE_DIRS "."
     REQUIRES
         # Networking / WiFi

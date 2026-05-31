@@ -47,6 +47,7 @@
 
 #include "usb.h"
 #include "disk.h"
+#include "fat.h"
 
 /* First-flash bootstrap WiFi credentials. The file `wifi_creds.h` is
  * gitignored and locally created. NVS-stored creds always take
@@ -277,6 +278,101 @@ static esp_err_t h_usb_start(httpd_req_t *req) {
     return send_text(req, "500 Internal Server Error", "text/plain", msg);
 }
 
+/* ---- /list, /fs/<name>, /lba (raw-FAT HTTP, Phase 2) ----
+ *
+ * Reads (/list, GET /fs, /lba) don't take dongle ownership -- they
+ * go through FATFS mounted briefly on the same WL handle, accepting
+ * the small chance of inconsistency vs. concurrent MSC writes.
+ *
+ * Writes (PUT, DELETE) call disk_take_for_firmware() / release in
+ * fat.c, so MSC stays consistent while we mutate the FAT. */
+
+static bool list_json_cb(const char *name, uint32_t size, bool is_dir, void *ctx) {
+    httpd_req_t *req = (httpd_req_t *)ctx;
+    char line[96];
+    int n = snprintf(line, sizeof line,
+                     "  {\"name\":\"%s\",\"size\":%u,\"dir\":%s}",
+                     name, (unsigned)size, is_dir ? "true" : "false");
+    if (n <= 0 || (size_t)n >= sizeof line) return true;
+    /* Comma separator only after the first entry; track via a
+     * stashed flag in the req's user_ctx slot. */
+    if (req->user_ctx) httpd_resp_send_chunk(req, ",\n", 2);
+    httpd_resp_send_chunk(req, line, (size_t)n);
+    req->user_ctx = (void *)1;
+    return true;
+}
+
+static esp_err_t h_list(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send_chunk(req, "[\n", 2);
+    req->user_ctx = NULL;   /* re-used as "first-entry?" flag inside list_json_cb */
+    esp_err_t e = fat_list(list_json_cb, req);
+    httpd_resp_send_chunk(req, "\n]\n", 3);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return e;
+}
+
+static esp_err_t fat_out_to_httpd(const void *in, size_t n, void *ctx) {
+    httpd_req_t *req = (httpd_req_t *)ctx;
+    return httpd_resp_send_chunk(req, (const char *)in, n);
+}
+
+static esp_err_t h_fs_get(httpd_req_t *req) {
+    char name[13];
+    if (!fat_uri_to_name83(req->uri, name))
+        return send_text(req, "400 Bad Request", "text/plain", "bad name (8.3 only)\n");
+
+    httpd_resp_set_type(req, "application/octet-stream");
+    esp_err_t e = fat_read(name, fat_out_to_httpd, req);
+    if (e == ESP_ERR_NOT_FOUND)
+        return send_text(req, "404 Not Found", "text/plain", "no such file\n");
+    if (e != ESP_OK)
+        return send_text(req, "500 Internal Server Error", "text/plain", "read failed\n");
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t fat_in_from_httpd(void *out, size_t cap, size_t *got, void *ctx) {
+    httpd_req_t *req = (httpd_req_t *)ctx;
+    int r = httpd_req_recv(req, (char *)out, cap);
+    while (r == HTTPD_SOCK_ERR_TIMEOUT) r = httpd_req_recv(req, (char *)out, cap);
+    if (r < 0) return ESP_FAIL;
+    *got = (size_t)r;
+    return ESP_OK;
+}
+
+static esp_err_t h_fs_put(httpd_req_t *req) {
+    char name[13];
+    if (!fat_uri_to_name83(req->uri, name))
+        return send_text(req, "400 Bad Request", "text/plain", "bad name (8.3 only)\n");
+    if (req->content_len <= 0)
+        return send_text(req, "411 Length Required", "text/plain", "need Content-Length\n");
+
+    esp_err_t e = fat_write(name, fat_in_from_httpd, (size_t)req->content_len, req);
+    if (e == ESP_ERR_TIMEOUT)
+        return send_text(req, "429 Too Many Requests", "text/plain",
+                         "host (DOS) actively writing; retry shortly\n");
+    if (e != ESP_OK)
+        return send_text(req, "500 Internal Server Error", "text/plain", "write failed\n");
+    return send_text(req, "200 OK", "text/plain", "OK\n");
+}
+
+static esp_err_t h_fs_delete(httpd_req_t *req) {
+    char name[13];
+    if (!fat_uri_to_name83(req->uri, name))
+        return send_text(req, "400 Bad Request", "text/plain", "bad name (8.3 only)\n");
+
+    esp_err_t e = fat_delete(name);
+    if (e == ESP_ERR_NOT_FOUND)
+        return send_text(req, "404 Not Found", "text/plain", "no such file\n");
+    if (e == ESP_ERR_TIMEOUT)
+        return send_text(req, "429 Too Many Requests", "text/plain",
+                         "host (DOS) actively writing; retry shortly\n");
+    if (e != ESP_OK)
+        return send_text(req, "500 Internal Server Error", "text/plain", "delete failed\n");
+    return send_text(req, "200 OK", "text/plain", "OK\n");
+}
+
 /* /usb-stats: per-callback counters + last MSC op + write-back cache
  * state, as JSON. Hot path is just uint32_t increments in disk.c;
  * formatting cost is borne here on the slow GET path. */
@@ -314,6 +410,10 @@ static void httpd_start_once(void) {
         { .uri = "/reset",     .method = HTTP_POST, .handler = h_reset,     .user_ctx = NULL },
         { .uri = "/usb-start", .method = HTTP_POST, .handler = h_usb_start, .user_ctx = NULL },
         { .uri = "/usb-stats", .method = HTTP_GET,  .handler = h_usb_stats, .user_ctx = NULL },
+        { .uri = "/list",      .method = HTTP_GET,  .handler = h_list,      .user_ctx = NULL },
+        { .uri = "/fs/*",      .method = HTTP_GET,    .handler = h_fs_get,    .user_ctx = NULL },
+        { .uri = "/fs/*",      .method = HTTP_PUT,    .handler = h_fs_put,    .user_ctx = NULL },
+        { .uri = "/fs/*",      .method = HTTP_DELETE, .handler = h_fs_delete, .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
         httpd_register_uri_handler(s_httpd, &routes[i]);
