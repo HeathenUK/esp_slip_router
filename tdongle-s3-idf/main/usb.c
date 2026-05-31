@@ -160,12 +160,31 @@ static esp_err_t mount_msc_partition(void) {
 
     const tinyusb_msc_spiflash_config_t cfg = {
         .wl_handle = wl,
+        .mount_config = {
+            .format_if_mount_failed = true,
+            .max_files            = 5,
+            .allocation_unit_size  = 4096,
+        },
     };
     err = tinyusb_msc_storage_init_spiflash(&cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "msc storage init: %s", esp_err_to_name(err));
         return err;
     }
+
+    /* Trigger a one-shot local mount so format_if_mount_failed kicks
+     * in on a blank/fresh partition. Then unmount so the host gets
+     * exclusive MSC access. On an already-formatted partition this is
+     * essentially a no-op. */
+    err = tinyusb_msc_storage_mount("/data");
+    if (err == ESP_OK) {
+        tinyusb_msc_storage_unmount();
+    } else {
+        /* Not fatal -- mount-for-format is opportunistic. Host can
+         * still format the raw volume via Disk Utility / FORMAT. */
+        ESP_LOGW(TAG, "first-boot format probe: %s", esp_err_to_name(err));
+    }
+
     ESP_LOGI(TAG, "MSC backing store mounted (%u sectors x %u bytes)",
              (unsigned)tinyusb_msc_storage_get_sector_count(),
              (unsigned)tinyusb_msc_storage_get_sector_size());
