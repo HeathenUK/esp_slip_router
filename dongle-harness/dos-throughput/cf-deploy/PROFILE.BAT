@@ -1,0 +1,7 @@
+@ECHO OFF
+REM PROFILE wrapper -- sets MTCPCFG and runs the single-binary harness.
+C:
+CD \TDONGLE
+SET MTCPCFG=C:\TDONGLE\MTCP.CFG
+PROFILE.EXE %1 %2
+TYPE PROFILE.LOG
