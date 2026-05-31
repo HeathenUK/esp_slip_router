@@ -48,6 +48,7 @@
 #include "usb.h"
 #include "disk.h"
 #include "fat.h"
+#include "slip.h"
 
 /* First-flash bootstrap WiFi credentials. The file `wifi_creds.h` is
  * gitignored and locally created. NVS-stored creds always take
@@ -373,6 +374,35 @@ static esp_err_t h_fs_delete(httpd_req_t *req) {
     return send_text(req, "200 OK", "text/plain", "OK\n");
 }
 
+/* POST /mode?to=SLIP|MODEM -- runtime mode switch from the WiFi
+ * side. Always available (independent of CDC) so a stuck SLIP mode
+ * with no DOS-side recovery can be unstuck via curl. Persisted to
+ * NVS by slip_set_mode. */
+static esp_err_t h_mode(httpd_req_t *req) {
+    char qbuf[64];
+    char to[16] = {0};
+    int qlen = httpd_req_get_url_query_len(req);
+    if (qlen > 0 && (size_t)qlen < sizeof qbuf) {
+        if (httpd_req_get_url_query_str(req, qbuf, sizeof qbuf) == ESP_OK)
+            httpd_query_key_value(qbuf, "to", to, sizeof to);
+    }
+    if (!to[0]) {
+        return send_text(req, "200 OK", "text/plain",
+                         slip_get_mode() == MODE_SLIP ? "SLIP\n" : "MODEM\n");
+    }
+    LinkMode want = (LinkMode)-1;
+    if      (!strcasecmp(to, "SLIP"))  want = MODE_SLIP;
+    else if (!strcasecmp(to, "MODEM")) want = MODE_MODEM;
+    else
+        return send_text(req, "400 Bad Request", "text/plain", "to=SLIP|MODEM\n");
+
+    if (slip_set_mode(want) != ESP_OK)
+        return send_text(req, "500 Internal Server Error", "text/plain", "set_mode failed\n");
+
+    return send_text(req, "200 OK", "text/plain",
+                     want == MODE_SLIP ? "SLIP\n" : "MODEM\n");
+}
+
 /* /usb-stats: per-callback counters + last MSC op + write-back cache
  * state, as JSON. Hot path is just uint32_t increments in disk.c;
  * formatting cost is borne here on the slow GET path. */
@@ -414,6 +444,8 @@ static void httpd_start_once(void) {
         { .uri = "/fs/*",      .method = HTTP_GET,    .handler = h_fs_get,    .user_ctx = NULL },
         { .uri = "/fs/*",      .method = HTTP_PUT,    .handler = h_fs_put,    .user_ctx = NULL },
         { .uri = "/fs/*",      .method = HTTP_DELETE, .handler = h_fs_delete, .user_ctx = NULL },
+        { .uri = "/mode",      .method = HTTP_POST,   .handler = h_mode,      .user_ctx = NULL },
+        { .uri = "/mode",      .method = HTTP_GET,    .handler = h_mode,      .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
         httpd_register_uri_handler(s_httpd, &routes[i]);
@@ -592,6 +624,16 @@ void app_main(void) {
     }
 
     wifi_start();
+
+    /* SLIP netif + NAPT come up here. The netif is admin-down by
+     * default; entering SLIP mode (HTTP /mode, AT$MODE=, magic frame)
+     * flips it up. Needs to be called after wifi_start so the STA
+     * netif exists for NAPT to route through. */
+    {
+        esp_err_t e = slip_init();
+        if (e != ESP_OK)
+            disk_logf("slip_init failed: %s", esp_err_to_name(e));
+    }
 
     /* USB up at boot. Phase 1a deferred this behind POST /usb-start
      * as a safety scaffold while the JTAG -> OTG PHY-mux switch and

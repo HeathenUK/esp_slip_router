@@ -50,6 +50,7 @@
 #include "freertos/semphr.h"
 
 #include "disk.h"   /* disk_logf */
+#include "slip.h"
 
 #define TAG "modem"
 
@@ -601,6 +602,22 @@ static void handle_dollar(char *s) {
     if (!strcmp(key, "WIFI")) {
         if (val && eq)        cmd_wifi_set(val);
         else                  { cmd_wifi_query(); r_ok(); }
+    } else if (!strcmp(key, "MODE")) {
+        if (val && eq) {
+            LinkMode want = (LinkMode)-1;
+            if      (!strcmp(val, "SLIP"))  want = MODE_SLIP;
+            else if (!strcmp(val, "MODEM")) want = MODE_MODEM;
+            if (want == (LinkMode)-1) { r_error(); return; }
+            /* Reply BEFORE flipping mode, so the OK lands while the
+             * AT parser still owns the CDC stream. Once SLIP is up
+             * any further bytes from the host are interpreted as
+             * SLIP frames. */
+            r_ok();
+            slip_set_mode(want);
+        } else {
+            cdc_print(slip_get_mode() == MODE_SLIP ? "\r\nSLIP\r\n" : "\r\nMODEM\r\n");
+            r_ok();
+        }
     } else if (!strcmp(key, "DNS") && val && eq) {
         cmd_dns(val);
     } else if (!strcmp(key, "PING") && val && eq) {
@@ -675,10 +692,20 @@ static void exec(char *line) {
 
 static void on_cdc_rx(int itf, cdcacm_event_t *event) {
     (void)event;
-    uint8_t buf[64];
+    /* Drain in MTU-sized chunks. SLIP MTU is 1500; CDC RX FIFO is
+     * sized to hold a full SLIP frame, so this loop typically does
+     * one big read per callback. */
+    static uint8_t buf[2048];
     size_t got = 0;
     if (tinyusb_cdcacm_read(itf, buf, sizeof buf, &got) != ESP_OK) return;
     if (got == 0) return;
+
+    /* SLIP mode: bytes are SLIP-framed IP packets. Feed them to the
+     * de-framer; nothing else touches them. */
+    if (slip_get_mode() == MODE_SLIP) {
+        slip_feed(buf, got);
+        return;
+    }
 
     if (s_online) {
         /* Online: pipe CDC bytes to TCP with +++ escape + telnet

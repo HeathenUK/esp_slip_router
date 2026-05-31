@@ -13,6 +13,7 @@ idf_component_register(
         "disk.c"
         "modem.c"
         "fat.c"
+        "slip.c"
     INCLUDE_DIRS "."
     REQUIRES
         # Networking / WiFi
@@ -40,4 +41,6 @@ idf_component_register(
         esp_tinyusb
         # mDNS for dosongle.local.
         mdns
+        # GPIO for the BOOT-button mode toggle.
+        esp_driver_gpio
 )
