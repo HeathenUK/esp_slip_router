@@ -24,6 +24,8 @@ idf_component_register(
         esp_http_server
         # OTA -- in-app firmware updates served from POST /ota.
         app_update
+        # esp_timer_get_time() -- microsecond timer for MSC callback timing.
+        esp_timer
         # Storage -- wear-levelled FAT partition for the MSC dev disk.
         wear_levelling
         spi_flash

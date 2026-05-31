@@ -29,6 +29,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "esp_timer.h"
 #include "wear_levelling.h"
 
 #include "tusb.h"
@@ -57,14 +58,27 @@ static wl_handle_t s_wl = WL_INVALID_HANDLE;
 static uint32_t    s_block_count = 0;   /* in 512-byte logical blocks */
 static SemaphoreHandle_t s_io_mutex = NULL;
 
-/* Write-back cache: holds one WL sector. RAM merge for same-sector
- * writes; evict-and-load on sector change. */
-static uint8_t  s_wb_cache[WB_CACHE_BYTES];
-static uint32_t s_wb_sect_base = 0;
-static bool     s_wb_have      = false;
-static bool     s_wb_dirty     = false;
-static uint32_t s_wb_merge_count = 0;
-static uint32_t s_wb_evict_count = 0;
+/* Write-back cache: N slots, each holds one WL sector. The host's
+ * typical write pattern (FAT update + data cluster + dir entry) hits
+ * 3-4 distinct sectors interleaved; with multiple slots none of those
+ * forces a flash eviction on the critical SCSI path. With one slot
+ * (the previous design), eviction fired on almost every write, each
+ * taking the full ~67 ms erase+program. CHUSB's per-CBW timeout
+ * fires below that, causing DOS-side hangs.
+ *
+ * 4 slots × 4 KB = 16 KB RAM. Free heap is ~225 KB; cost is trivial. */
+#define WB_SLOTS 4
+typedef struct {
+    uint8_t  data[WB_CACHE_BYTES];
+    uint32_t sect_base;
+    uint64_t last_use_us;   /* esp_timer_get_time() of last hit -- for LRU */
+    bool     have;
+    bool     dirty;
+} wb_slot_t;
+
+static wb_slot_t s_wb[WB_SLOTS];
+static uint32_t  s_wb_merge_count = 0;
+static uint32_t  s_wb_evict_count = 0;
 
 /* Per-callback counters. Single-writer (TinyUSB task on CPU1), readers
  * (HTTP handler on CPU0) get an atomic uint32_t load; values may be
@@ -82,61 +96,101 @@ static volatile uint32_t s_last_lba      = 0;   /* last READ or WRITE LBA */
 static volatile uint32_t s_last_size     = 0;
 static volatile char     s_last_op       = '-'; /* 'R', 'W', 'T', 'S' */
 
-/* ---- cache helpers ---- */
+/* Per-callback latency tracking. Hypothesis: a single slow flash op
+ * pushes past CHUSB's per-CBW timeout and the DOS-side state machine
+ * aborts. The hot-path cost is two esp_timer_get_time() calls and a
+ * compare per callback -- ~150 ns total, well below the noise floor
+ * for a SCSI command rate. */
+static volatile uint32_t s_max_write_us       = 0;
+static volatile uint32_t s_max_write_lba      = 0;
+static volatile uint32_t s_slow_write_count   = 0; /* writes > 50 ms */
+static volatile uint32_t s_max_read_us        = 0;
+#define SLOW_WRITE_THRESHOLD_US 50000U
 
-static esp_err_t wb_flush_to_flash(void) {
-    if (!s_wb_have || !s_wb_dirty) return ESP_OK;
+/* ---- cache helpers (multi-slot) ---- */
+
+/* Flush one specific slot to flash, if it's dirty. */
+static esp_err_t wb_flush_slot(wb_slot_t *s) {
+    if (!s->have || !s->dirty) return ESP_OK;
     if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
     size_t sect = wl_sector_size(s_wl);
     if (sect > WB_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
 
-    esp_err_t e = wl_erase_range(s_wl, s_wb_sect_base, sect);
+    esp_err_t e = wl_erase_range(s_wl, s->sect_base, sect);
     if (e != ESP_OK) {
         disk_logf("[wb] flush erase fail base=0x%x sect=%u err=%d (%s)",
-                  (unsigned)s_wb_sect_base, (unsigned)sect, e, esp_err_to_name(e));
+                  (unsigned)s->sect_base, (unsigned)sect, e, esp_err_to_name(e));
         return e;
     }
-    e = wl_write(s_wl, s_wb_sect_base, s_wb_cache, sect);
+    e = wl_write(s_wl, s->sect_base, s->data, sect);
     if (e != ESP_OK) {
         disk_logf("[wb] flush write fail base=0x%x sect=%u err=%d (%s)",
-                  (unsigned)s_wb_sect_base, (unsigned)sect, e, esp_err_to_name(e));
+                  (unsigned)s->sect_base, (unsigned)sect, e, esp_err_to_name(e));
         return e;
     }
-    s_wb_dirty = false;
+    s->dirty = false;
     return ESP_OK;
 }
 
-static void wb_invalidate(void) {
-    s_wb_have      = false;
-    s_wb_dirty     = false;
-    s_wb_sect_base = 0;
+static void wb_slot_invalidate(wb_slot_t *s) {
+    s->have      = false;
+    s->dirty     = false;
+    s->sect_base = 0;
 }
 
-static esp_err_t wb_load_sector(uint32_t sect_base) {
-    if (s_wb_have && s_wb_dirty && s_wb_sect_base != sect_base) {
-        disk_logf("[wb] BUG: wb_load_sector(0x%x) while dirty at 0x%x",
-                  (unsigned)sect_base, (unsigned)s_wb_sect_base);
-        return ESP_ERR_INVALID_STATE;
+/* Find a slot that currently holds `sect_base`, or NULL. */
+static wb_slot_t *wb_find(uint32_t sect_base) {
+    for (int i = 0; i < WB_SLOTS; ++i) {
+        if (s_wb[i].have && s_wb[i].sect_base == sect_base) return &s_wb[i];
     }
+    return NULL;
+}
+
+/* Allocate a slot to hold `sect_base`: prefer an empty slot; otherwise
+ * pick the least-recently-used one (flushing it if dirty). The chosen
+ * slot is left empty -- caller is responsible for populating it. */
+static esp_err_t wb_alloc_slot(uint32_t sect_base, wb_slot_t **out) {
+    (void)sect_base;
+    /* Empty slot wins. */
+    for (int i = 0; i < WB_SLOTS; ++i) {
+        if (!s_wb[i].have) { *out = &s_wb[i]; return ESP_OK; }
+    }
+    /* Evict the LRU (smallest last_use_us). */
+    wb_slot_t *victim = &s_wb[0];
+    for (int i = 1; i < WB_SLOTS; ++i) {
+        if (s_wb[i].last_use_us < victim->last_use_us) victim = &s_wb[i];
+    }
+    esp_err_t e = wb_flush_slot(victim);
+    if (e != ESP_OK) return e;
+    s_wb_evict_count++;
+    wb_slot_invalidate(victim);
+    *out = victim;
+    return ESP_OK;
+}
+
+/* Read one full WL sector from flash into the given slot. */
+static esp_err_t wb_load_into_slot(wb_slot_t *s, uint32_t sect_base) {
     size_t sect = wl_sector_size(s_wl);
     if (sect > WB_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
-
-    esp_err_t e = wl_read(s_wl, sect_base, s_wb_cache, sect);
+    esp_err_t e = wl_read(s_wl, sect_base, s->data, sect);
     if (e != ESP_OK) {
         disk_logf("[wb] load fail base=0x%x sect=%u err=%d (%s)",
                   (unsigned)sect_base, (unsigned)sect, e, esp_err_to_name(e));
         return e;
     }
-    s_wb_have      = true;
-    s_wb_dirty     = false;
-    s_wb_sect_base = sect_base;
+    s->have      = true;
+    s->dirty     = false;
+    s->sect_base = sect_base;
     return ESP_OK;
 }
 
-static esp_err_t wb_flush_and_invalidate(void) {
-    esp_err_t e = wb_flush_to_flash();
-    wb_invalidate();
-    return e;
+/* Flush all dirty slots. Called on eject (START_STOP_UNIT with eject=1). */
+static esp_err_t wb_flush_all(void) {
+    for (int i = 0; i < WB_SLOTS; ++i) {
+        esp_err_t e = wb_flush_slot(&s_wb[i]);
+        if (e != ESP_OK) return e;
+    }
+    return ESP_OK;
 }
 
 /* ---- format detection + first-boot mkfs ---- */
@@ -381,10 +435,10 @@ bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, boo
     s_cb_start_stop++;
     s_last_op = 'S';
     if (load_eject && !start) {
-        /* Eject: flush the cache so the host doesn't lose the last
-         * <=4 KB of writes if we reset before the next eviction. */
+        /* Eject: flush ALL dirty slots so the host doesn't lose any
+         * data still in RAM if we reset before the next eviction. */
         xSemaphoreTake(s_io_mutex, portMAX_DELAY);
-        esp_err_t e = wb_flush_and_invalidate();
+        esp_err_t e = wb_flush_all();
         xSemaphoreGive(s_io_mutex);
         if (e != ESP_OK) {
             disk_logf("[wb] eject flush err=%d (%s)", e, esp_err_to_name(e));
@@ -399,6 +453,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
     s_last_op = 'R';
     s_last_lba = lba;
     s_last_size = bufsize;
+    int64_t t0 = esp_timer_get_time();
     if (s_wl == WL_INVALID_HANDLE) return -1;
 
     uint32_t addr = lba * (uint32_t)MSC_BLOCK_SIZE + offset;
@@ -418,10 +473,12 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
         size_t chunk     = sect - sect_off;
         if (chunk > remaining) chunk = remaining;
 
-        if (s_wb_have && s_wb_sect_base == sect_base) {
-            /* Hit: dirty cache may contain bytes that aren't on flash
-             * yet -- serve from RAM so the host sees a consistent view. */
-            memcpy(dst, s_wb_cache + sect_off, chunk);
+        wb_slot_t *hit = wb_find(sect_base);
+        if (hit) {
+            /* Cache hit: dirty data may not be on flash yet -- always
+             * serve from RAM so the host sees a consistent view. */
+            memcpy(dst, hit->data + sect_off, chunk);
+            hit->last_use_us = (uint64_t)esp_timer_get_time();
         } else {
             esp_err_t e = wl_read(s_wl, addr, dst, chunk);
             if (e != ESP_OK) {
@@ -434,6 +491,10 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
         addr += chunk; dst += chunk; remaining -= chunk;
     }
     xSemaphoreGive(s_io_mutex);
+    {
+        uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+        if (dt > s_max_read_us) s_max_read_us = dt;
+    }
     return (int32_t)bufsize;
 }
 
@@ -443,6 +504,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
     s_last_op = 'W';
     s_last_lba = lba;
     s_last_size = bufsize;
+    int64_t t0 = esp_timer_get_time();
     if (s_wl == WL_INVALID_HANDLE) return -1;
 
     uint32_t addr = lba * (uint32_t)MSC_BLOCK_SIZE + offset;
@@ -468,43 +530,51 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
         size_t chunk     = sect - sect_off;
         if (chunk > remaining) chunk = remaining;
 
-        if (s_wb_have && s_wb_sect_base == sect_base) {
-            /* Same cached sector: RAM merge, no flash op. */
-            memcpy(s_wb_cache + sect_off, src, chunk);
-            s_wb_dirty = true;
+        wb_slot_t *slot = wb_find(sect_base);
+        if (slot) {
+            /* Hit: pure RAM merge, no flash op. The eviction (and the
+             * 67 ms erase+program latency that goes with it) was
+             * deferred to when this slot eventually gets reused. */
+            memcpy(slot->data + sect_off, src, chunk);
+            slot->dirty = true;
+            slot->last_use_us = (uint64_t)esp_timer_get_time();
             s_wb_merge_count++;
         } else {
-            /* Different sector. Flush the existing one if dirty, then
-             * load the new one -- unless this write is a full-sector
-             * overwrite, in which case we skip the load. */
-            if (s_wb_have && s_wb_dirty) {
-                esp_err_t e = wb_flush_to_flash();
-                if (e != ESP_OK) {
-                    xSemaphoreGive(s_io_mutex);
-                    return -1;
-                }
-                s_wb_evict_count++;
+            /* Miss. Allocate a slot (may flush a dirty victim). */
+            esp_err_t e = wb_alloc_slot(sect_base, &slot);
+            if (e != ESP_OK) {
+                xSemaphoreGive(s_io_mutex);
+                return -1;
             }
             if (sect_off == 0 && chunk == sect) {
-                memcpy(s_wb_cache, src, sect);
-                s_wb_have      = true;
-                s_wb_dirty     = true;
-                s_wb_sect_base = sect_base;
+                /* Full-sector overwrite: skip the read. */
+                memcpy(slot->data, src, sect);
+                slot->have      = true;
+                slot->dirty     = true;
+                slot->sect_base = sect_base;
             } else {
-                wb_invalidate();
-                esp_err_t e = wb_load_sector(sect_base);
+                e = wb_load_into_slot(slot, sect_base);
                 if (e != ESP_OK) {
                     xSemaphoreGive(s_io_mutex);
                     return -1;
                 }
-                memcpy(s_wb_cache + sect_off, src, chunk);
-                s_wb_dirty = true;
+                memcpy(slot->data + sect_off, src, chunk);
+                slot->dirty = true;
             }
+            slot->last_use_us = (uint64_t)esp_timer_get_time();
         }
 
         addr += chunk; src += chunk; remaining -= chunk;
     }
     xSemaphoreGive(s_io_mutex);
+    {
+        uint32_t dt = (uint32_t)(esp_timer_get_time() - t0);
+        if (dt > s_max_write_us) {
+            s_max_write_us  = dt;
+            s_max_write_lba = lba;
+        }
+        if (dt > SLOW_WRITE_THRESHOLD_US) s_slow_write_count++;
+    }
     return (int32_t)bufsize;
 }
 
@@ -558,18 +628,22 @@ void tud_resume_cb(void) {
 /* ---- JSON snapshot for /usb-stats ---- */
 
 size_t disk_stats_json(char *out, size_t cap) {
+    unsigned dirty = 0;
+    for (int i = 0; i < WB_SLOTS; ++i) if (s_wb[i].dirty) dirty++;
     int n = snprintf(out, cap,
         "{\"counts\":{\"tur\":%u,\"read\":%u,\"write\":%u,\"scsi\":%u,\"start_stop\":%u"
         ",\"mount\":%u,\"umount\":%u,\"suspend\":%u,\"resume\":%u}"
         ",\"last\":{\"op\":\"%c\",\"lba\":%u,\"size\":%u}"
-        ",\"wb\":{\"merges\":%u,\"evicts\":%u,\"dirty\":%s,\"sect_base\":%u}}\n",
+        ",\"timing_us\":{\"max_write\":%u,\"max_write_lba\":%u,\"slow_writes\":%u,\"max_read\":%u}"
+        ",\"wb\":{\"slots\":%u,\"merges\":%u,\"evicts\":%u,\"dirty_slots\":%u}}\n",
         (unsigned)s_cb_tur, (unsigned)s_cb_read, (unsigned)s_cb_write,
         (unsigned)s_cb_scsi, (unsigned)s_cb_start_stop,
         (unsigned)s_cb_mount, (unsigned)s_cb_umount,
         (unsigned)s_cb_suspend, (unsigned)s_cb_resume,
         s_last_op, (unsigned)s_last_lba, (unsigned)s_last_size,
-        (unsigned)s_wb_merge_count, (unsigned)s_wb_evict_count,
-        s_wb_dirty ? "true" : "false",
-        (unsigned)s_wb_sect_base);
+        (unsigned)s_max_write_us, (unsigned)s_max_write_lba,
+        (unsigned)s_slow_write_count, (unsigned)s_max_read_us,
+        (unsigned)WB_SLOTS, (unsigned)s_wb_merge_count, (unsigned)s_wb_evict_count,
+        dirty);
     return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
