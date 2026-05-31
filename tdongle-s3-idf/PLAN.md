@@ -254,13 +254,17 @@ it later.
 `AT$DISK=device|usb` from old build also not ported -- the new
 ownership model is per-op, no persistent "device-side" state.
 
-### Phase 3 — SLIP framing + lwIP NAPT (after 1c)
+### Phase 3 — SLIP framing + lwIP NAPT — done
 
-Port `tdongle-s3/src/main.cpp`'s SLIP intake/output paths. Use
-lwIP's SLIP netif. Enable NAPT on the INTERNAL netif (the SLIP
-side), NOT the WAN-side STA. See memory `esp-idf-napt-api-inverted`.
-`pbuf_alloc(PBUF_RAW, ...)` silently breaks forwarding to
-Ethernet; use `PBUF_IP`. See memory `slip-pbuf-headroom-forwarding`.
+`slip.c`: RFC 1055 framing on CDC, lwIP netif at 192.168.240.1/24
+point-to-point, NAPT on the SLIP (internal) netif. Bulk memcpy on
+both encode/decode paths; CDC FIFOs bumped to 2048 to hold a full
+SLIP MTU. Four mode-switch triggers (HTTP /mode, AT$MODE=, GPIO0
+long-press, magic frame "MODE=MODEM" inside the SLIP stream),
+LinkMode persisted to NVS.
+
+Untested at commit time: actual SLIP traffic from DOS via FOSSLIP.
+Architecture is in place; user verifies with their host stack.
 
 ### Phase 4 — HID typing DSL
 
