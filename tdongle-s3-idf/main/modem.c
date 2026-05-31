@@ -602,6 +602,34 @@ static void handle_dollar(char *s) {
     if (!strcmp(key, "WIFI")) {
         if (val && eq)        cmd_wifi_set(val);
         else                  { cmd_wifi_query(); r_ok(); }
+    } else if (!strcmp(key, "STATS")) {
+        if (val && eq) {
+            /* AT$STATS=0 -- zero the SLIP counters. The harness
+             * brackets each test with a clear-and-run-and-read so
+             * before/after deltas isolate the test's own traffic. */
+            if (!strcmp(val, "0")) {
+                /* slip.c uses volatile uint32_ts; race-free single-
+                 * store overwrite is fine. */
+                slip_stats_clear();
+                r_ok();
+            } else {
+                r_error();
+            }
+        } else {
+            char line[160];
+            snprintf(line, sizeof line,
+                "\r\n"
+                "slip.pkts_to_host    %u\r\n"
+                "slip.pkts_from_host  %u\r\n"
+                "slip.bytes_to_host   %u\r\n"
+                "slip.bytes_from_host %u\r\n",
+                (unsigned)slip_stat_pkts_to_host(),
+                (unsigned)slip_stat_pkts_from_host(),
+                (unsigned)slip_stat_bytes_to_host(),
+                (unsigned)slip_stat_bytes_from_host());
+            cdc_print(line);
+            r_ok();
+        }
     } else if (!strcmp(key, "MODE")) {
         if (val && eq) {
             LinkMode want = (LinkMode)-1;

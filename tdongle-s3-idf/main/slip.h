@@ -41,6 +41,7 @@ uint32_t slip_stat_pkts_to_host(void);
 uint32_t slip_stat_pkts_from_host(void);
 uint32_t slip_stat_bytes_to_host(void);
 uint32_t slip_stat_bytes_from_host(void);
+void     slip_stats_clear(void);
 
 #ifdef __cplusplus
 }

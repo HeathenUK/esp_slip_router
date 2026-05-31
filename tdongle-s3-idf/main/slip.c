@@ -389,3 +389,10 @@ uint32_t slip_stat_pkts_to_host(void)    { return s_pkts_to_host; }
 uint32_t slip_stat_pkts_from_host(void)  { return s_pkts_from_host; }
 uint32_t slip_stat_bytes_to_host(void)   { return s_bytes_to_host; }
 uint32_t slip_stat_bytes_from_host(void) { return s_bytes_from_host; }
+
+void slip_stats_clear(void) {
+    s_pkts_to_host    = 0;
+    s_pkts_from_host  = 0;
+    s_bytes_to_host   = 0;
+    s_bytes_from_host = 0;
+}
