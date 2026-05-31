@@ -29,6 +29,7 @@
 #include "class/hid/hid_device.h"
 
 #include "disk.h"
+#include "modem.h"
 
 #include "hal/usb_serial_jtag_ll.h"
 #include "hal/usb_wrap_ll.h"
@@ -217,9 +218,15 @@ esp_err_t usb_start(void) {
         return err;
     }
 
-    /* Redirect stdout/printf/ESP_LOG to the CDC interface so we have a
-     * console once the host attaches. */
-    esp_tusb_init_console(TINYUSB_CDC_ACM_0);
+    /* The Hayes AT modem owns CDC0. esp_log output would interleave
+     * with AT responses on the same interface, so we DO NOT call
+     * esp_tusb_init_console here -- diagnostics go through the disk
+     * log ring buffer (GET /disk-log) instead. */
+    err = modem_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "modem_init: %s", esp_err_to_name(err));
+        return err;
+    }
 
     ESP_LOGI(TAG, "composite USB up: MSC + HID + CDC, serial=%s", s_serial_str);
     return ESP_OK;
