@@ -42,4 +42,4 @@ idf_build_set_property(COMPILE_DEFINITIONS "-DIP_NAPT_TIMEOUT_MS_UDP=30000" APPE
 # Bump lwIP's pbuf pool so burst RX from the SLIP host has headroom.
 # Default IDF is 16; bumping to 32 costs ~24 KB BSS. PBUF_POOL_SIZE is
 # not exposed as Kconfig either, hence the -D override.
-idf_build_set_property(COMPILE_DEFINITIONS "-DPBUF_POOL_SIZE=32" APPEND)
+idf_build_set_property(COMPILE_DEFINITIONS "-DPBUF_POOL_SIZE=64" APPEND)

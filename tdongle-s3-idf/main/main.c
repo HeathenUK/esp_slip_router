@@ -220,6 +220,43 @@ static esp_err_t h_type_log(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* GET /otadata -- dump the two ota_data sectors raw. Lets us see
+ * whether esp_ota_set_boot_partition actually wrote a new seq.
+ * Each sector starts with esp_ota_select_entry_t: { uint32_t ota_seq;
+ * uint8_t seq_label[20]; uint32_t ota_state; uint32_t crc; }. */
+static esp_err_t h_otadata(httpd_req_t *req) {
+    const esp_partition_t *p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, NULL);
+    if (!p) return send_text(req, "404 Not Found", "text/plain", "no otadata\n");
+
+    uint8_t s0[32] = {0}, s1[32] = {0};
+    esp_partition_read(p, 0, s0, 32);
+    esp_partition_read(p, p->erase_size, s1, 32);
+
+    uint32_t seq0, state0, crc0, seq1, state1, crc1;
+    memcpy(&seq0,   s0,     4);
+    memcpy(&state0, s0+24,  4);
+    memcpy(&crc0,   s0+28,  4);
+    memcpy(&seq1,   s1,     4);
+    memcpy(&state1, s1+24,  4);
+    memcpy(&crc1,   s1+28,  4);
+
+    char buf[512];
+    int n = snprintf(buf, sizeof buf,
+        "otadata @ 0x%lx (erase_size=%lu)\n"
+        "sect0: seq=0x%08lx state=0x%08lx crc=0x%08lx\n"
+        "sect1: seq=0x%08lx state=0x%08lx crc=0x%08lx\n"
+        "\n"
+        "seq active selection: highest non-0xFFFFFFFF wins.\n"
+        "Running partition is determined by (seq - 1) %% ota_app_count.\n",
+        (unsigned long)p->address, (unsigned long)p->erase_size,
+        (unsigned long)seq0, (unsigned long)state0, (unsigned long)crc0,
+        (unsigned long)seq1, (unsigned long)state1, (unsigned long)crc1);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
+}
+
 /* GET /partitions -- dump OTA partition layout + which one is running +
  * which one the bootloader will pick next + each app partition's state
  * (NEW / PENDING_VERIFY / VALID / INVALID / ABORTED / UNDEFINED).
@@ -323,8 +360,19 @@ static esp_err_t h_ota(httpd_req_t *req) {
 
     int64_t t_begin = esp_timer_get_time();
     esp_ota_handle_t h = 0;
-    esp_err_t be = esp_ota_begin(next, OTA_SIZE_UNKNOWN, &h);
-    disk_logf("ota: esp_ota_begin -> %d (%lld us)",
+    /* Use OTA_WITH_SEQUENTIAL_WRITES. Defers erase to esp_ota_write
+     * which erases each sector lazily just before its first write.
+     * - No 15 s upfront full-partition erase (which the OTA_SIZE_UNKNOWN
+     *   path triggered, blowing the TCP window during recv).
+     * - No risk of writing past an undersized erased range (which the
+     *   explicit-size path risks: image > ALIGN_UP(declared,4096) bytes
+     *   land on un-erased flash, NOR-AND-only corrupts the image,
+     *   bootloader rejects it on next boot and falls back to the
+     *   previous partition -- net effect: set_boot_partition returns
+     *   ESP_OK but the slot never actually flips.)
+     * This is what Espressif's own esp_https_ota uses as its default. */
+    esp_err_t be = esp_ota_begin(next, OTA_WITH_SEQUENTIAL_WRITES, &h);
+    disk_logf("ota: esp_ota_begin(SEQ) -> %d (%lld us)",
               (int)be, (long long)(esp_timer_get_time() - t_begin));
     if (be != ESP_OK)
         return send_text(req, "500 Internal Server Error", "text/plain",

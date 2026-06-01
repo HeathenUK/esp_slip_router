@@ -811,15 +811,11 @@ static void handle_dollar(char *s) {
         const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
         if (!next) { cdc_print("\r\nOTA NOPART\r\n"); r_error(); return; }
         esp_ota_handle_t h = 0;
-        /* Pass OTA_SIZE_UNKNOWN, not the actual size -- this matches what
-         * the working HTTP OTA path does. Passing the explicit size made
-         * the boot partition flip silently fail: esp_ota_set_boot_partition
-         * returned ESP_OK but the bootloader kept choosing the previous
-         * (VALID) partition on the next reboot. Symptom: flash.sh
-         * reported success, post-reboot AT echoed back, but /status
-         * showed the previous git version. Burned a session on this.
-         * See [[ota-size-unknown]]. */
-        if (esp_ota_begin(next, OTA_SIZE_UNKNOWN, &h) != ESP_OK) {
+        /* OTA_WITH_SEQUENTIAL_WRITES: erase per-sector lazily inside
+         * esp_ota_write. No upfront 15 s full-partition erase, no risk
+         * of writing past an undersized erased range. See h_ota in
+         * main.c for the full reasoning. */
+        if (esp_ota_begin(next, OTA_WITH_SEQUENTIAL_WRITES, &h) != ESP_OK) {
             cdc_print("\r\nOTA BEGIN-FAIL\r\n"); r_error(); return;
         }
         cdc_print("\r\nOTA READY\r\n");
