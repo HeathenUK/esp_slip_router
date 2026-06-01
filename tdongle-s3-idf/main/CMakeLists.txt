@@ -15,6 +15,7 @@ idf_component_register(
         "fat.c"
         "slip.c"
         "dns_forwarder.c"
+        "kbd.c"
     INCLUDE_DIRS "."
     REQUIRES
         # Networking / WiFi

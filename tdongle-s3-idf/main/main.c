@@ -51,6 +51,7 @@
 #include "fat.h"
 #include "slip.h"
 #include "dns_forwarder.h"
+#include "kbd.h"
 
 /* First-flash bootstrap WiFi credentials. The file `wifi_creds.h` is
  * gitignored and locally created. NVS-stored creds always take
@@ -175,6 +176,48 @@ static esp_err_t h_status(httpd_req_t *req) {
         (unsigned long)esp_get_minimum_free_heap_size());
     (void)n;
     return send_text(req, "200 OK", "application/json", buf);
+}
+
+/* POST /type -- body is the HID typing DSL string (see kbd.h). Plain
+ * ASCII goes through, <TOKEN> for special keys, <CTRL+x>/<ALT+x>/<SHIFT+x>
+ * for combos, <DELAY=ms> for inter-keystroke pauses, "<<" for literal '<'.
+ * Returns "OK\n" + bytes consumed, or "ERROR\n" on parse failure. */
+static esp_err_t h_type(httpd_req_t *req) {
+    int total = req->content_len;
+    if (total <= 0)
+        return send_text(req, "411 Length Required", "text/plain",
+                         "need Content-Length\n");
+    if (total > 4096)
+        return send_text(req, "413 Payload Too Large", "text/plain",
+                         "type body capped at 4096 B\n");
+    char *body = malloc((size_t)total + 1);
+    if (!body)
+        return send_text(req, "500 Internal Server Error", "text/plain",
+                         "alloc fail\n");
+    int got = 0;
+    while (got < total) {
+        int r = httpd_req_recv(req, body + got, (size_t)(total - got));
+        if (r <= 0) { free(body); return ESP_FAIL; }
+        got += r;
+    }
+    body[got] = 0;
+    int n = kbd_type(body, got);
+    free(body);
+    if (n < 0)
+        return send_text(req, "400 Bad Request", "text/plain",
+                         "DSL parse error (see /type-log)\n");
+    char ok[32];
+    snprintf(ok, sizeof ok, "OK %d\n", n);
+    return send_text(req, "200 OK", "text/plain", ok);
+}
+
+/* GET /type-log -- recent HID-typing events. Ring buffer; small. */
+static esp_err_t h_type_log(httpd_req_t *req) {
+    static char buf[6144];
+    int n = kbd_log_dump(buf, sizeof buf);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
 }
 
 /* GET /partitions -- dump OTA partition layout + which one is running +
@@ -499,7 +542,7 @@ static void httpd_start_once(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     cfg.stack_size       = 8192;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 24;
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 2;
     cfg.send_wait_timeout = 2;
@@ -524,6 +567,8 @@ static void httpd_start_once(void) {
         { .uri = "/mode",      .method = HTTP_GET,    .handler = h_mode,      .user_ctx = NULL },
         { .uri = "/slip-stats",.method = HTTP_GET,    .handler = h_slip_stats,.user_ctx = NULL },
         { .uri = "/partitions",.method = HTTP_GET,    .handler = h_partitions,.user_ctx = NULL },
+        { .uri = "/type",      .method = HTTP_POST,   .handler = h_type,      .user_ctx = NULL },
+        { .uri = "/type-log",  .method = HTTP_GET,    .handler = h_type_log,  .user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
         httpd_register_uri_handler(s_httpd, &routes[i]);

@@ -53,6 +53,7 @@
 
 #include "disk.h"   /* disk_logf */
 #include "slip.h"
+#include "kbd.h"
 
 #define TAG "modem"
 
@@ -853,6 +854,13 @@ static void handle_dollar(char *s) {
         cdc_print("\r\nOTA OK\r\n");
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
+    } else if (!strcmp(key, "TYPE") && val && eq) {
+        /* AT$TYPE=<string> -- send <string> via the USB HID keyboard.
+         * See kbd.h for the token DSL (<ENTER>, <F1>, <CTRL+C>,
+         * <DELAY=ms>, etc). */
+        int n = kbd_type(val, (int)strlen(val));
+        if (n < 0) { r_error(); return; }
+        r_ok();
     } else if (!strcmp(key, "HELP")) {
         cdc_print(
             "\r\n"
@@ -867,6 +875,7 @@ static void handle_dollar(char *s) {
             "AT$PING=host       TCP-handshake ping\r\n"
             "AT$SCAN            list visible networks\r\n"
             "AT$NETIF           dump netif state\r\n"
+            "AT$TYPE=<str>      send keystrokes via HID keyboard (DSL)\r\n"
             "AT$RESET           reboot the dongle\r\n"
             "AT$HELP            this help\r\n"
         );
