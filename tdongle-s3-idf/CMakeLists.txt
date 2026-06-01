@@ -30,3 +30,16 @@ if(NOT _iram_patch_rc EQUAL 0)
     message(FATAL_ERROR "tools/apply_iram_patches.sh failed (rc=${_iram_patch_rc}):\n${_iram_patch_out}${_iram_patch_err}")
 endif()
 message(STATUS "${_iram_patch_out}")
+
+# lwIP NAPT UDP entries default to a 2-second timeout, which is short
+# enough that a DNS response with mild latency can arrive after the
+# reverse-mapping entry has been GC'd. Bump it for any UDP traffic
+# (DNS, NTP, etc.) routed via SLIP+NAPT. lwIP doesn't expose this
+# constant as Kconfig, so we override via global compile-defs that
+# propagate to every component (including lwip).
+idf_build_set_property(COMPILE_DEFINITIONS "-DIP_NAPT_TIMEOUT_MS_UDP=30000" APPEND)
+
+# Bump lwIP's pbuf pool so burst RX from the SLIP host has headroom.
+# Default IDF is 16; bumping to 32 costs ~24 KB BSS. PBUF_POOL_SIZE is
+# not exposed as Kconfig either, hence the -D override.
+idf_build_set_property(COMPILE_DEFINITIONS "-DPBUF_POOL_SIZE=64" APPEND)
