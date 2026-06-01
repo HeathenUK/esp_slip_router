@@ -131,11 +131,12 @@ CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 # TCP RX window. 65535 was too generous for this target: a 1 MB Hayes
 # fetch with a macOS host (~100 KB/s CDC drain) saw lwIP buffer the
 # full window-worth of in-flight data behind the slow drain, taking
-# min_free_heap to 728 bytes. 32 KB still lets us run a full BDP at
-# the macOS CDC rate (RTT * cap ~= 10 KB) and halves the worst-case
-# heap held during downloads. CDC is the bottleneck, not TCP window,
-# so this doesn't slow real-world throughput on our target hosts.
-CONFIG_LWIP_TCP_WND_DEFAULT=32768
+# min_free_heap to 728 bytes. 16 KB still lets us run a full BDP at
+# the macOS CDC rate (RTT*cap ~= 10 KB on internet, much less on LAN)
+# and quarters the worst-case heap held during downloads vs the
+# default. CDC is the bottleneck, not TCP window, so this doesn't
+# slow real-world throughput on our target hosts.
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
 # Send buffer (per-pcb queue lwIP will accept from the app before
 # blocking send()). Default IDF v5.5 is 5760 (4*MSS) which caps the
 # upload BDP at ~5.6 KB in-flight -- enough for 56 Kbps but throttles

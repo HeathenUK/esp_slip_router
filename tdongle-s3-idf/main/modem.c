@@ -388,7 +388,21 @@ static void tn_start(void) {
  * the way to recv() is the correct behaviour there. */
 static inline void to_cdc(const void *buf, size_t n) {
     if (!s_to_cdc || n == 0) return;
-    xStreamBufferSend(s_to_cdc, buf, n, pdMS_TO_TICKS(500));
+    /* Drain n bytes fully into the StreamBuffer; retry the tail if the
+     * ring is full (slow CHUSB / macOS host). Previously a single
+     * xStreamBufferSend with 500 ms timeout would return short and the
+     * caller (modem_data_task) ignored the return -- the unwritten tail
+     * was silently dropped, truncating the byte stream the host sees.
+     * Bail early if s_online drops (ATH or peer close) so we don't
+     * spin forever holding telnet IAC bytes the host will never read. */
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t off = 0;
+    while (off < n) {
+        size_t w = xStreamBufferSend(s_to_cdc, p + off, n - off,
+                                     pdMS_TO_TICKS(100));
+        off += w;
+        if (w == 0 && !s_online) break;
+    }
 }
 
 /* CDC pump (consumer side). Lives parallel to the recv loop so a CDC
@@ -406,7 +420,27 @@ static void modem_cdc_pump_task(void *arg) {
     while (s_online || (s_to_cdc && xStreamBufferBytesAvailable(s_to_cdc) > 0)) {
         size_t n = xStreamBufferReceive(s_to_cdc, buf, sizeof buf,
                                         pdMS_TO_TICKS(50));
-        if (n > 0) cdc_write(buf, n);
+        if (n > 0) {
+            /* Drain n bytes fully -- cdc_write has a 500 ms internal
+             * deadline and returns the number it actually managed to
+             * push. If the host (CHUSB / macOS) was slow draining the
+             * USB IN endpoint, cdc_write would return short, the
+             * tail would be silently lost, and the TCP stream the
+             * host sees gets corrupted in the middle (HTTP body /
+             * telnet payload truncated). Retry the tail until either
+             * we drain it all or the host has gone away. The producer
+             * (modem_data_task) is already back-pressured by
+             * xStreamBufferSend so this can never run unbounded. */
+            size_t off = 0;
+            while (off < n) {
+                size_t w = cdc_write(buf + off, n - off);
+                off += w;
+                if (w == 0) {
+                    if (!tud_cdc_n_connected(0)) break;
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+            }
+        }
     }
     s_cdc_pump_task = NULL;
     vTaskDelete(NULL);
@@ -571,7 +605,47 @@ static void do_local_echo(const uint8_t *buf, size_t n) {
  * also stall its OUT EP rather than letting bytes pile up nowhere. */
 static void online_push_bytes(const uint8_t *buf, size_t n) {
     if (!s_to_tcp || n == 0) return;
-    xStreamBufferSend(s_to_tcp, buf, n, pdMS_TO_TICKS(500));
+    /* Drain n bytes fully -- same rationale as to_cdc(). The producer
+     * is on_cdc_rx on the TinyUSB task; blocking here back-pressures
+     * the USB OUT endpoint (host stops sending), which is what we
+     * want when modem_tcp_pump can't keep up with send() to a slow
+     * peer. Bail early if s_online drops. */
+    size_t off = 0;
+    while (off < n) {
+        size_t w = xStreamBufferSend(s_to_tcp, buf + off, n - off,
+                                     pdMS_TO_TICKS(100));
+        off += w;
+        if (w == 0 && !s_online) break;
+    }
+}
+
+/* Drain a chunk to the TCP socket, retrying short sends until either
+ * the whole chunk has gone out or the socket has been closed under us
+ * (ATH, peer close). Without this, send() returning short on a tight
+ * lwIP TX window silently truncates the byte stream the server sees
+ * -- a half-written HTTP request hangs the server until it gives up.
+ * Caller is the modem_tcp_pump_task, which has no time pressure --
+ * the CDC RX path is already back-pressured by xStreamBufferSend so
+ * we can wait as long as we need to. */
+static void tcp_send_all(const uint8_t *buf, size_t n) {
+    size_t off = 0;
+    while (off < n && s_online && s_sock >= 0) {
+        int w = send(s_sock, buf + off, n - off, 0);
+        if (w > 0) {
+            off += (size_t)w;
+            continue;
+        }
+        if (w == 0) break;
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+        /* Hard error -- log and bail; the data task's recv() will
+         * pick up the disconnect and fire NO CARRIER. */
+        disk_logf("tcp_send_all: send err=%d off=%u/%u", errno,
+                  (unsigned)off, (unsigned)n);
+        break;
+    }
 }
 
 /* ---- CDC -> TCP pump (consumer side) ----
@@ -598,7 +672,7 @@ static void modem_tcp_pump_task(void *arg) {
                 (s_plus_count > 0 || (now - s_last_data_us) > GUARD_US)) {
                 /* Hold the +'s back until we know whether the escape
                  * completes (3 +'s + 1 s silence) or breaks. */
-                if (txlen) { send(s_sock, txbuf, txlen, 0); txlen = 0; }
+                if (txlen) { tcp_send_all(txbuf, txlen); txlen = 0; }
                 s_plus_count++;
                 s_plus_time_us = now;
                 continue;
@@ -617,10 +691,10 @@ static void modem_tcp_pump_task(void *arg) {
             s_last_data_us = now;
 
             if (txlen >= sizeof txbuf - 2) {
-                send(s_sock, txbuf, txlen, 0); txlen = 0;
+                tcp_send_all(txbuf, txlen); txlen = 0;
             }
         }
-        if (txlen) send(s_sock, txbuf, txlen, 0);
+        if (txlen) tcp_send_all(txbuf, txlen);
     }
     s_tcp_pump_task = NULL;
     vTaskDelete(NULL);
@@ -834,9 +908,13 @@ static void cmd_dial_impl(const char *arg) {
 
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (sock < 0) { freeaddrinfo(res); r_nocarrier(); return; }
-    struct timeval tv = { .tv_sec = 20, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    /* 20 s timeouts for the connect() itself. Once we're in the data
+     * phase, modem_data_task overrides RCVTIMEO to 100 ms and tcp_send_all
+     * relies on a bounded SNDTIMEO (3 s) so the pump task doesn't block
+     * forever if the TCP window stays closed. */
+    struct timeval ctv = { .tv_sec = 20, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &ctv, sizeof ctv);
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof ctv);
 
     if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         close(sock);
@@ -848,6 +926,12 @@ static void cmd_dial_impl(const char *arg) {
 
     int yes = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes);
+    /* Shrink the post-connect SNDTIMEO so tcp_send_all can't be wedged
+     * for 20 s on a closed TCP window. 3 s is enough for transient
+     * lwIP queue-full while still letting the pump task retry on a
+     * sensible cadence. */
+    struct timeval stv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof stv);
     /* SO_RCVBUF used to be set to 32 KB here, but lwIP's recv accept
      * queue then grew on top of the advertised TCP window -- a 1 MB
      * Hayes fetch on a slow CDC drain pushed peak heap to 728 bytes
@@ -862,14 +946,45 @@ static void cmd_dial_impl(const char *arg) {
     s_last_data_us = esp_timer_get_time();
     disk_logf("dial: connected sock=%d peer=%s telnet=%d", sock, s_peer, s_telnet);
 
-    /* Probe usbterm for its actual terminal size BEFORE going online,
-     * so the first NAWS subnegotiation carries the right dimensions
-     * and the cursor-park artifact lands before CONNECT (not mid-
-     * session). on_cdc_rx is still in command-mode dispatch here, but
-     * the CPR interceptor at the top of that handler swallows the
-     * reply before any AT parsing sees it. Non-responding peers
-     * (DOSBox/null-modem, ATNET0 raw) time out at CPR_TIMEOUT_US and
-     * we fall back to the 80x24 defaults. */
+    /* IMPORTANT ORDERING for the async dial path. Because this function
+     * runs on a worker task off the TinyUSB CPU, on_cdc_rx can fire on
+     * CPU1 at any moment a host byte arrives. The host (PROFILE.EXE,
+     * usbterm, etc.) sees CONNECT and immediately starts sending data
+     * (a GET request, login, etc.), so we MUST have:
+     *
+     *   1. Stream buffers reset       (before any producer can write)
+     *   2. CPR probe + handshake      (before pump tasks exist so the
+     *                                  CPR reply doesn't race the
+     *                                  freshly-spawned tcp pump)
+     *   3. s_online = true            (so spawned pump tasks don't
+     *                                  short-circuit on their main
+     *                                  loop condition)
+     *   4. tn_start                   (telnet IAC -- only meaningful
+     *                                  in telnet mode)
+     *   5. Spawn pump tasks           (now everything they need is
+     *                                  set up, and the pipeline can
+     *                                  drain the moment data arrives)
+     *   6. r_connect                  (CONNECT printed last -- once
+     *                                  this lands, the host will send
+     *                                  bytes and on_cdc_rx pushes to
+     *                                  a stream that has a running
+     *                                  consumer).
+     *
+     * The prior order had r_connect before the reset+spawn block,
+     * which created a real race: PROFILE sees CONNECT -> sends GET ->
+     * on_cdc_rx queues to s_to_tcp on CPU1 -> cmd_dial_task on CPU0
+     * concurrently runs xStreamBufferReset(s_to_tcp) and DISCARDS the
+     * GET bytes. The server never sees the request and PROFILE times
+     * out reading the HTTP status. */
+
+    /* (1) Streams reset while no concurrent producers exist. */
+    xStreamBufferReset(s_to_cdc);
+    xStreamBufferReset(s_to_tcp);
+
+    /* (2) CPR probe -- usbterm answers via on_cdc_rx's CPR interceptor.
+     *     Gated on s_telnet; skipped for ATNET0 (raw HTTP, etc.).
+     *     Runs BEFORE pump spawn so the CPR reply bytes don't race
+     *     against modem_tcp_pump_task starting to drain s_to_tcp. */
     if (s_telnet) {
         disk_logf("dial: tn_query_size");
         tn_query_size();
@@ -880,32 +995,53 @@ static void cmd_dial_impl(const char *arg) {
         s_cpr_pending = false;
     }
 
+    /* (3) Flip online flag BEFORE spawning data task; modem_data_task's
+     *     main loop is `while (s_online && s_sock >= 0)`, so if we
+     *     spawned it with s_online=false it would exit on the first
+     *     iteration. */
     s_online = true;
+
+    /* (4) Telnet handshake to server (no-op when s_telnet is false). */
     disk_logf("dial: tn_start");
     tn_start();
-    disk_logf("dial: r_connect");
-    r_connect();
-    disk_logf("dial: spawning pumps");
 
-    /* Allocate the producer/consumer pipeline. modem_data_task does
-     * recv() + telnet/+++ processing on whichever core; modem_cdc_pump
-     * drains the StreamBuffer + cdc_write on CPU1 (where TinyUSB lives,
-     * so no cross-core IPC on the FIFO hand-off). Decouples WiFi RX
-     * from USB CDC push -- a CDC stall doesn't starve recv() and a
-     * slow recv doesn't idle the CDC. */
-    /* Streams are pre-allocated in modem_init -- just reset them so
-     * a re-dial starts with empty rings. modem_init returns failure
-     * if it couldn't allocate, so reaching here implies both exist. */
-    xStreamBufferReset(s_to_cdc);
-    xStreamBufferReset(s_to_tcp);
-    xTaskCreatePinnedToCore(modem_cdc_pump_task, "modem_cdc",
-                            3072, NULL, 16, &s_cdc_pump_task, 1);
-    xTaskCreatePinnedToCore(modem_tcp_pump_task, "modem_tcp",
-                            3072, NULL, 16, &s_tcp_pump_task, 0);
-    xTaskCreatePinnedToCore(modem_data_task, "modem_data",
-                            4096, NULL, 16, &s_data_task, 0);
-    disk_logf("dial: pumps spawned free=%u",
+    /* (5) Spawn pumps. They start running immediately; modem_tcp_pump
+     *     can already drain s_to_tcp (empty), and modem_data_task can
+     *     already recv on the socket.
+     *
+     *     Validate each xTaskCreate -- under heap pressure (16 KB-ish
+     *     free at this point) any of these could fail. A half-spawned
+     *     pipeline silently drops bytes (producer with no consumer,
+     *     consumer with no producer), so on failure we tear back down
+     *     cleanly and emit NO CARRIER instead of leaving the host
+     *     waiting for data that will never come. */
+    disk_logf("dial: spawning pumps free=%u",
               (unsigned)esp_get_free_heap_size());
+    BaseType_t r1 = xTaskCreatePinnedToCore(modem_cdc_pump_task, "modem_cdc",
+                                            3072, NULL, 16, &s_cdc_pump_task, 1);
+    BaseType_t r2 = xTaskCreatePinnedToCore(modem_tcp_pump_task, "modem_tcp",
+                                            3072, NULL, 16, &s_tcp_pump_task, 0);
+    BaseType_t r3 = xTaskCreatePinnedToCore(modem_data_task, "modem_data",
+                                            4096, NULL, 16, &s_data_task, 0);
+    if (r1 != pdPASS || r2 != pdPASS || r3 != pdPASS) {
+        disk_logf("dial: pump spawn fail r1=%d r2=%d r3=%d free=%u",
+                  (int)r1, (int)r2, (int)r3,
+                  (unsigned)esp_get_free_heap_size());
+        /* Setting s_online=false makes any pumps that DID spawn drop
+         * out of their main loops on the next iteration. They'll
+         * self-delete and clear their handle pointers. We don't
+         * vTaskDelete them here -- the loop guard does it cleanly. */
+        s_online = false;
+        close(s_sock); s_sock = -1;
+        s_peer[0] = 0;
+        r_nocarrier();
+        return;
+    }
+
+    /* (6) CONNECT only after the pipeline is fully up. */
+    disk_logf("dial: r_connect (free=%u)",
+              (unsigned)esp_get_free_heap_size());
+    r_connect();
 }
 
 /* Worker task wrapper: run cmd_dial_impl off the TinyUSB task so DNS +
