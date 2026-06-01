@@ -305,6 +305,7 @@ static esp_err_t h_disk_log(httpd_req_t *req) {
  * Matches the protocol the arduino-esp32 build exposed, so dosongle.sh
  * ota works against this firmware too. */
 static esp_err_t h_ota(httpd_req_t *req) {
+    disk_logf("ota: h_ota entered, content_len=%d", req->content_len);
     int total = req->content_len;
     if (total <= 0)
         return send_text(req, "411 Length Required", "text/plain",
@@ -314,12 +315,18 @@ static esp_err_t h_ota(httpd_req_t *req) {
     if (!next)
         return send_text(req, "500 Internal Server Error", "text/plain",
                          "no OTA partition\n");
+    disk_logf("ota: target partition %s @ 0x%lx size=0x%lx",
+              next->label, (unsigned long)next->address, (unsigned long)next->size);
     if ((size_t)total > next->size)
         return send_text(req, "413 Payload Too Large", "text/plain",
                          "exceeds OTA slot size\n");
 
+    int64_t t_begin = esp_timer_get_time();
     esp_ota_handle_t h = 0;
-    if (esp_ota_begin(next, OTA_SIZE_UNKNOWN, &h) != ESP_OK)
+    esp_err_t be = esp_ota_begin(next, OTA_SIZE_UNKNOWN, &h);
+    disk_logf("ota: esp_ota_begin -> %d (%lld us)",
+              (int)be, (long long)(esp_timer_get_time() - t_begin));
+    if (be != ESP_OK)
         return send_text(req, "500 Internal Server Error", "text/plain",
                          "esp_ota_begin failed\n");
 
@@ -331,15 +338,37 @@ static esp_err_t h_ota(httpd_req_t *req) {
 
     int got = 0;
     bool ok = true;
+    int next_log = 32 * 1024;
+    int64_t t_start = esp_timer_get_time();
+    disk_logf("ota: begin, total=%d", total);
     while (got < total) {
         int want = total - got;
         if (want > 2048) want = 2048;
         int r = httpd_req_recv(req, (char *)buf, want);
-        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
-        if (r <= 0) { ok = false; break; }
-        if (esp_ota_write(h, buf, (size_t)r) != ESP_OK) { ok = false; break; }
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            disk_logf("ota: recv TIMEOUT at got=%d (continuing)", got);
+            continue;
+        }
+        if (r <= 0) {
+            disk_logf("ota: recv err r=%d at got=%d (fatal)", r, got);
+            ok = false; break;
+        }
+        int64_t t0 = esp_timer_get_time();
+        esp_err_t we = esp_ota_write(h, buf, (size_t)r);
+        int64_t dt = esp_timer_get_time() - t0;
+        if (we != ESP_OK) {
+            disk_logf("ota: write fail rc=%d at got=%d", (int)we, got);
+            ok = false; break;
+        }
         got += r;
+        if (got >= next_log) {
+            int64_t elapsed = esp_timer_get_time() - t_start;
+            disk_logf("ota: got=%d (%lld us elapsed; last write %lld us)",
+                      got, (long long)elapsed, (long long)dt);
+            next_log += 32 * 1024;
+        }
     }
+    disk_logf("ota: loop exit ok=%d got=%d/%d", ok ? 1 : 0, got, total);
     free(buf);
 
     if (!ok || got != total) {
@@ -552,6 +581,13 @@ static void httpd_start_once(void) {
      * never block recv anywhere near this long). */
     cfg.recv_wait_timeout = 10;
     cfg.send_wait_timeout = 10;
+    /* Pin httpd to CPU1 so esp_ota_write doesn't share CPU0 with
+     * WiFi/lwIP. With them on the same core, OTA's flash erase
+     * starves the lwIP task, ACKs back up, Mac retransmits/resets
+     * at ~168 KB. (CDC/TinyUSB are also on CPU1 but mostly idle when
+     * not transferring; httpd's bursts of flash-write CPU work are
+     * isolated to CPU1, leaving CPU0 free for WiFi-driven ACKs.) */
+    cfg.core_id = 1;
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed");
         s_httpd = NULL;

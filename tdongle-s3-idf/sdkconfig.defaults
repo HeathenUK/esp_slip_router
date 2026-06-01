@@ -116,12 +116,17 @@ CONFIG_TINYUSB_DESC_CUSTOM_PID=0x4023
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 
-# WiFi/lwIP performance tuning (TCP RX bandwidth). Verified to move
-# dongle->Mac CDC throughput from ~75 KB/s to 100-200 KB/s on a 1 MB
-# HTTP GET via Hayes ATDT. Per Espressif perf docs + retrohun/mTCP
-# research. Each one is cheap (small heap/IRAM cost).
-CONFIG_LWIP_TCP_WND_DEFAULT=65535
-CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+# WiFi/lwIP performance tuning. Kept the cheap+universal wins
+# (IRAM opts, WiFi dynamic RX buf bump). TCP_WND_DEFAULT + RECVMBOX
+# bumps gave a peak throughput jump but exposed an underlying issue:
+# esp_ota_begin can block for ~15 s in our setup (flash mutex contention
+# with the MSC write-back cache + IDF's OTA partition validation). With
+# the bigger window, Mac dumps 64 KB into lwIP during that block, the
+# TCP retransmit timer fires before h_ota's recv loop ever runs, and
+# the upload dies at ~168 KB. Reverting TCP_WND/RECVMBOX to defaults
+# limits Mac to ~5.7 KB unacked, which survives the 15 s pause.
+# See [[ota-esp-ota-begin-blocking]] for the bigger fix (pre-erase the
+# inactive OTA partition at boot).
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
 CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION=y
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
