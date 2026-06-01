@@ -801,6 +801,12 @@ static void wifi_start(void) {
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    /* Disable WiFi power save BEFORE start. Default mode is
+     * WIFI_PS_MIN_MODEM which sleeps the radio between beacons --
+     * fine for low-power, costs throughput on TCP streams because
+     * the AP buffers ACK-driven flows during sleep windows. We're
+     * USB-powered, so the power savings aren't worth the latency. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start());
     /* Max TX power -- same rationale as the arduino-esp32 build:
      * stub PCB antenna, sits far from APs. +19.5 dBm is the chip max. */

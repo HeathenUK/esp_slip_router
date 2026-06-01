@@ -47,7 +47,10 @@ CONFIG_HTTPD_MAX_URI_LEN=256
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n
 
 # WiFi -- station-only, station-host-side WiFi for our IP path.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+# STATIC_RX_BUFFER_NUM=16 lets RX_BA_WIN go up to 32 (IDF enforces
+# RX_BA_WIN <= 2*STATIC_RX_BUFFER_NUM). Matches Espressif's "Iperf rank"
+# defaults.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 
@@ -126,5 +129,15 @@ CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
 CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION=y
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+# 802.11n Block-ACK receive window. Default 6 is conservative; 32 is
+# Espressif's "Iperf rank" recommendation (requires
+# STATIC_RX_BUFFER_NUM>=16, satisfied above).
+CONFIG_ESP_WIFI_RX_BA_WIN=32
+# Pin lwIP TCP/IP task to CPU0 alongside the WiFi driver task, so TCP
+# segment processing doesn't bounce between cores. Without this, lwIP
+# runs on whichever core happens to be free, often forcing
+# cross-core IPC against the WiFi RX task.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+# CONFIG_LWIP_TCPIP_TASK_AFFINITY_NO_AFFINITY is not set
 # (CDC TX FIFO stays at 2048 -- bumping to 16384 made best case worse,
 # the FIFO isn't where the throughput is being lost.)
