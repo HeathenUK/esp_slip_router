@@ -50,6 +50,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 
 #include "disk.h"   /* disk_logf */
 #include "slip.h"
@@ -97,6 +98,16 @@ static int       s_sock = -1;
 static volatile bool s_online = false;
 static char      s_peer[96] = {0};       /* "host:port" string for AT$STATUS */
 static TaskHandle_t s_data_task = NULL;
+static TaskHandle_t s_cdc_pump_task = NULL;
+
+/* Pipeline: producer (modem_data_task, recv-side, telnet IAC + +++
+ * detection) pushes bytes into s_to_cdc; consumer (modem_cdc_pump_task,
+ * CDC-side) drains and calls cdc_write. Decouples WiFi RX from USB CDC
+ * push, so a CDC FIFO stall doesn't block recv() and vice versa.
+ * 8 KB is enough to absorb ~80 ms of WiFi RX at 100 KB/s while CDC
+ * drains; bigger doesn't help once steady-state. */
+#define DATA_STREAM_BYTES 8192
+static StreamBufferHandle_t s_to_cdc = NULL;
 
 /* +++ escape sequence detector. Hayes rule: 1 s of guard, then exactly
  * three '+' within 1 s, then 1 s of guard with no other data. */
@@ -247,6 +258,30 @@ static void tn_start(void) {
 /* ---- TCP -> CDC pump (drains payload bytes, runs telnet IAC machine
  * inline so option negotiation never reaches the user terminal) ---- */
 
+/* Helper: push bytes to the CDC pipeline. Producer side. Blocks
+ * (with a generous timeout) only if the StreamBuffer is full, which
+ * means the CDC drain side is genuinely behind -- back-pressure all
+ * the way to recv() is the correct behaviour there. */
+static inline void to_cdc(const void *buf, size_t n) {
+    if (!s_to_cdc || n == 0) return;
+    xStreamBufferSend(s_to_cdc, buf, n, pdMS_TO_TICKS(500));
+}
+
+/* CDC pump (consumer side). Lives parallel to the recv loop so a CDC
+ * FIFO stall doesn't starve WiFi RX. Exits when online mode ends AND
+ * the pipeline has drained. */
+static void modem_cdc_pump_task(void *arg) {
+    (void)arg;
+    static uint8_t buf[1024];
+    while (s_online || (s_to_cdc && xStreamBufferBytesAvailable(s_to_cdc) > 0)) {
+        size_t n = xStreamBufferReceive(s_to_cdc, buf, sizeof buf,
+                                        pdMS_TO_TICKS(50));
+        if (n > 0) cdc_write(buf, n);
+    }
+    s_cdc_pump_task = NULL;
+    vTaskDelete(NULL);
+}
+
 static void modem_data_task(void *arg) {
     (void)arg;
     /* Loose 100 ms poll. The recv timeout means we wake periodically
@@ -266,9 +301,9 @@ static void modem_data_task(void *arg) {
         int n = recv(s_sock, inbuf, sizeof inbuf, 0);
         if (n > 0 && !s_telnet) {
             /* Binary fast path: skip the per-byte IAC state machine when
-             * telnet is off -- push inbuf straight to CDC. Phase 2 (HTTP)
-             * hits this. */
-            cdc_write(inbuf, (size_t)n);
+             * telnet is off -- push inbuf straight into the CDC pipeline.
+             * Phase 2 (HTTP) hits this. */
+            to_cdc(inbuf, (size_t)n);
         } else if (n > 0) {
             size_t outlen = 0;
             for (int i = 0; i < n; ++i) {
@@ -278,13 +313,13 @@ static void modem_data_task(void *arg) {
                         if (ch == TN_IAC) s_tstate = T_IAC;
                         else {
                             outbuf[outlen++] = ch;
-                            if (outlen >= sizeof outbuf) { cdc_write(outbuf, outlen); outlen = 0; }
+                            if (outlen >= sizeof outbuf) { to_cdc(outbuf, outlen); outlen = 0; }
                         }
                         break;
                     case T_IAC:
                         if (ch == TN_IAC) {
                             outbuf[outlen++] = TN_IAC;
-                            if (outlen >= sizeof outbuf) { cdc_write(outbuf, outlen); outlen = 0; }
+                            if (outlen >= sizeof outbuf) { to_cdc(outbuf, outlen); outlen = 0; }
                             s_tstate = T_DATA;
                         } else if (ch == TN_WILL || ch == TN_WONT || ch == TN_DO || ch == TN_DONT) {
                             s_tcmd = ch; s_tstate = T_OPT;
@@ -310,7 +345,7 @@ static void modem_data_task(void *arg) {
                         break;
                 }
             }
-            if (outlen) cdc_write(outbuf, outlen);
+            if (outlen) to_cdc(outbuf, outlen);
         } else if (n == 0) {
             peer_closed = true;
             break;
@@ -324,6 +359,10 @@ static void modem_data_task(void *arg) {
         int64_t now = esp_timer_get_time();
         if (s_plus_count == 3 && (now - s_plus_time_us) > GUARD_US) {
             s_plus_count = 0;
+            /* Wait for the CDC pipeline to fully drain before printing
+             * OK, so any in-flight data lands before the prompt. */
+            while (s_to_cdc && xStreamBufferBytesAvailable(s_to_cdc) > 0)
+                vTaskDelay(pdMS_TO_TICKS(2));
             s_online = false;
             r_ok();
             break;
@@ -331,6 +370,9 @@ static void modem_data_task(void *arg) {
     }
 
     if (peer_closed) {
+        /* Same drain wait so NO CARRIER doesn't race with pending payload. */
+        while (s_to_cdc && xStreamBufferBytesAvailable(s_to_cdc) > 0)
+            vTaskDelay(pdMS_TO_TICKS(2));
         s_online = false;
         if (s_sock >= 0) { close(s_sock); s_sock = -1; }
         s_peer[0] = 0;
@@ -619,10 +661,18 @@ static void cmd_dial(const char *arg) {
     tn_start();
     r_connect();
 
-    /* Spawn the TCP -> CDC pump task. CPU1 with priority below
-     * TinyUSB (so CDC RX callbacks preempt this when CDC has data). */
+    /* Allocate the producer/consumer pipeline. modem_data_task does
+     * recv() + telnet/+++ processing on whichever core; modem_cdc_pump
+     * drains the StreamBuffer + cdc_write on CPU1 (where TinyUSB lives,
+     * so no cross-core IPC on the FIFO hand-off). Decouples WiFi RX
+     * from USB CDC push -- a CDC stall doesn't starve recv() and a
+     * slow recv doesn't idle the CDC. */
+    if (!s_to_cdc) s_to_cdc = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
+    else xStreamBufferReset(s_to_cdc);
+    xTaskCreatePinnedToCore(modem_cdc_pump_task, "modem_cdc",
+                            3072, NULL, 16, &s_cdc_pump_task, 1);
     xTaskCreatePinnedToCore(modem_data_task, "modem_data",
-                            4096, NULL, 16, &s_data_task, 1);
+                            4096, NULL, 16, &s_data_task, 0);
 }
 
 /* ---- exec one AT line (command mode only) ---- */
@@ -912,9 +962,14 @@ static void exec(char *line) {
         case 'O': {
             if (s_sock >= 0) {
                 s_online = true;
+                if (!s_to_cdc) s_to_cdc = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
+                if (!s_cdc_pump_task) {
+                    xTaskCreatePinnedToCore(modem_cdc_pump_task, "modem_cdc",
+                                            3072, NULL, 16, &s_cdc_pump_task, 1);
+                }
                 if (!s_data_task) {
                     xTaskCreatePinnedToCore(modem_data_task, "modem_data",
-                                            4096, NULL, 16, &s_data_task, 1);
+                                            4096, NULL, 16, &s_data_task, 0);
                 }
                 r_connect();
             } else {

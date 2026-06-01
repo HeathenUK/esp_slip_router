@@ -43,3 +43,13 @@ idf_build_set_property(COMPILE_DEFINITIONS "-DIP_NAPT_TIMEOUT_MS_UDP=30000" APPE
 # Default IDF is 16; bumping to 32 costs ~24 KB BSS. PBUF_POOL_SIZE is
 # not exposed as Kconfig either, hence the -D override.
 idf_build_set_property(COMPILE_DEFINITIONS "-DPBUF_POOL_SIZE=64" APPEND)
+
+# CDC bulk endpoint buffer. Default for full-speed USB is 64 bytes
+# (matches MaxPacketSize). Bumping to 512 lets the TinyUSB driver
+# queue 8 max-sized USB packets internally before needing the host
+# to drain them, reducing IRQ pressure and the per-packet ACK-cycle
+# latency that was capping CDC throughput. Reported as ~3x gain on
+# upstream TinyUSB / esp_tinyusb (esp-usb #54 / #212). Not exposed
+# as Kconfig in esp_tinyusb 1.4.5; the override is safe because the
+# TinyUSB CDC header uses #ifndef before its default.
+idf_build_set_property(COMPILE_DEFINITIONS "-DCFG_TUD_CDC_EP_BUFSIZE=512" APPEND)

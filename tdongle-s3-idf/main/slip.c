@@ -88,6 +88,13 @@ static volatile uint32_t s_pkts_to_host    = 0;
 static volatile uint32_t s_pkts_from_host  = 0;
 static volatile uint32_t s_bytes_to_host   = 0;
 static volatile uint32_t s_bytes_from_host = 0;
+/* pbuf_alloc failures on RX -- smoking gun if lwIP's pbuf pool is
+ * being exhausted by burst SLIP packets faster than tcpip_thread can
+ * drain them. */
+static volatile uint32_t s_pbuf_alloc_fails = 0;
+/* tx_truncs: encoded packet exceeded s_txbuf and we returned ERR_BUF.
+ * Should be 0 unless somehow a >~1.5K IP packet appears. */
+static volatile uint32_t s_tx_truncs       = 0;
 
 /* ---- TX: lwIP -> SLIP-encode -> CDC ---- */
 
@@ -112,7 +119,7 @@ static err_t slip_output(struct netif *nif, struct pbuf *p, const ip4_addr_t *ip
             uint16_t j = i;
             while (j < q->len && d[j] != SLIP_END && d[j] != SLIP_ESC) ++j;
             size_t run = (size_t)(j - i);
-            if (n + run + 2 > sizeof s_txbuf) return ERR_BUF;
+            if (n + run + 2 > sizeof s_txbuf) { s_tx_truncs++; return ERR_BUF; }
             memcpy(s_txbuf + n, d + i, run);
             n += run;
             if (j < q->len) {
@@ -182,7 +189,12 @@ static void slip_deliver(const uint8_t *data, size_t len) {
      * NAPT forwarding to Ethernet (etharp_output prepends 14 bytes
      * via pbuf_header(-14), which silently fails on PBUF_RAW). */
     struct pbuf *p = pbuf_alloc(PBUF_IP, len, PBUF_POOL);
-    if (!p) { disk_logf("[slip] pbuf alloc fail (%u B)", (unsigned)len); return; }
+    if (!p) {
+        s_pbuf_alloc_fails++;
+        disk_logf("[slip] pbuf alloc fail #%u (%u B)",
+                  (unsigned)s_pbuf_alloc_fails, (unsigned)len);
+        return;
+    }
     pbuf_take(p, data, len);
     if (s_slip_nif.input(p, &s_slip_nif) != ERR_OK) {
         pbuf_free(p);
@@ -391,8 +403,13 @@ uint32_t slip_stat_bytes_to_host(void)   { return s_bytes_to_host; }
 uint32_t slip_stat_bytes_from_host(void) { return s_bytes_from_host; }
 
 void slip_stats_clear(void) {
-    s_pkts_to_host    = 0;
-    s_pkts_from_host  = 0;
-    s_bytes_to_host   = 0;
-    s_bytes_from_host = 0;
+    s_pkts_to_host     = 0;
+    s_pkts_from_host   = 0;
+    s_bytes_to_host    = 0;
+    s_bytes_from_host  = 0;
+    s_pbuf_alloc_fails = 0;
+    s_tx_truncs        = 0;
 }
+
+uint32_t slip_stat_pbuf_fails(void) { return s_pbuf_alloc_fails; }
+uint32_t slip_stat_tx_truncs(void)  { return s_tx_truncs; }

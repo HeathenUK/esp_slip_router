@@ -83,7 +83,7 @@ def main():
         time.sleep(0.5)
         r = send_at(p, "AT$WIFI?", 0.8)
         m = re.search(r"IP:\s+(\d+\.\d+\.\d+\.\d+)", r)
-        if m and "status: connected" in r:
+        if m and re.search(r"status:\s+connected", r):
             dongle_ip = m.group(1); break
     if not dongle_ip:
         print(f"[-] WiFi never connected. Last: {r!r}"); return 2

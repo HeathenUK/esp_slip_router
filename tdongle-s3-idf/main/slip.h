@@ -41,6 +41,11 @@ uint32_t slip_stat_pkts_to_host(void);
 uint32_t slip_stat_pkts_from_host(void);
 uint32_t slip_stat_bytes_to_host(void);
 uint32_t slip_stat_bytes_from_host(void);
+/* pbuf pool exhaustion on RX -- non-zero means SLIP packets are
+ * being dropped before reaching lwIP. */
+uint32_t slip_stat_pbuf_fails(void);
+/* tx_buf overrun on SLIP encode -- should be 0 in normal use. */
+uint32_t slip_stat_tx_truncs(void);
 void     slip_stats_clear(void);
 
 #ifdef __cplusplus
