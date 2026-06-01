@@ -544,8 +544,14 @@ static void httpd_start_once(void) {
     cfg.stack_size       = 8192;
     cfg.max_uri_handlers = 24;
     cfg.lru_purge_enable = true;
-    cfg.recv_wait_timeout = 2;
-    cfg.send_wait_timeout = 2;
+    /* 2 s was the default; OTA upload kept stalling at ~168 KB because
+     * Mac bursts a 64 KB window then waits for ACKs while the dongle is
+     * busy in esp_ota_write, recv blocks longer than 2 s, httpd kills
+     * the connection. 10 s leaves comfortable margin for slow flash
+     * writes during OTA without affecting interactive endpoints (they
+     * never block recv anywhere near this long). */
+    cfg.recv_wait_timeout = 10;
+    cfg.send_wait_timeout = 10;
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed");
         s_httpd = NULL;
