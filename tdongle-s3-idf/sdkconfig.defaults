@@ -56,6 +56,15 @@ CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 # API is inverted from typical NAT (see memory esp-idf-napt-api-inverted).
 CONFIG_LWIP_IP_FORWARD=y
 CONFIG_LWIP_IPV4_NAPT=y
+# (IP_NAPT_TIMEOUT_MS_UDP is bumped from 2000 -> 30000 via build-time -D
+# in CMakeLists.txt -- lwIP doesn't expose it as Kconfig.)
+#
+# PBUF_POOL_SIZE isn't a Kconfig in IDF -- overridden via build-time -D
+# in CMakeLists.txt to 32 (vs default 16).
+#
+# lwIP TCPIP enqueue mailbox. If burst RX overruns this, tcpip_thread
+# misses packets the same as a pbuf fail. Bigger = more headroom.
+CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 
 # TinyUSB / esp_tinyusb -- composite MSC + HID(1) + CDC(1). The
 # descriptor itself is hand-rolled in usb.c since esp_tinyusb's stock
@@ -106,3 +115,15 @@ CONFIG_TINYUSB_DESC_CUSTOM_PID=0x4023
 # Compiler / runtime tuning
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
+
+# WiFi/lwIP performance tuning (TCP RX bandwidth). Verified to move
+# dongle->Mac CDC throughput from ~75 KB/s to 100-200 KB/s on a 1 MB
+# HTTP GET via Hayes ATDT. Per Espressif perf docs + retrohun/mTCP
+# research. Each one is cheap (small heap/IRAM cost).
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION=y
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+# (CDC TX FIFO stays at 2048 -- bumping to 16384 made best case worse,
+# the FIFO isn't where the throughput is being lost.)
