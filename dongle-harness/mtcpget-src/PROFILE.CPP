@@ -730,13 +730,20 @@ static void phase_2_hayes( const char *url )
     }
 
     // Cleanup: +++ guard, ATH
+    log_print( "phase2: cleanup begin\n" );
     wait_ms( 1200 );
+    log_print( "phase2: wait1 done\n" );
     fos_send_str( g_port, "+++" );
+    log_print( "phase2: +++ sent\n" );
     wait_ms( 1500 );
+    log_print( "phase2: wait2 done\n" );
     fos_drain( g_port, 200 );
+    log_print( "phase2: drain1 done\n" );
     fos_send_str( g_port, "ATH\r" );
+    log_print( "phase2: ATH sent\n" );
     wait_ms( 300 );
     fos_drain( g_port, 100 );
+    log_print( "phase2: cleanup end\n" );
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,11 +1071,14 @@ int main( int argc, char **argv )
 
     phase_0_baseline();
     phase_1_slip_udp();
+    log_print( "main: about to enter phase 2\n" );
     phase_2_hayes( url_inet );
+    log_print( "main: back from phase 2\n" );
 
     // Phases 3 + 4 share one FOSSLIP install + one mTCP init. Loading
     // FOSSLIP and bringing up mTCP per-phase doesn't work reliably -- the
     // unload + reload + reinit sequence corrupts state.
+    log_print( "main: about to log_section for phases 3+4\n" );
     log_section( "PHASES 3+4 -- mTCP setup" );
     if ( mtcp_session_setup() == 0 ) {
         mtcp_run_phase( "PHASE 3 -- mTCP HTTP via LAN",      url_lan );

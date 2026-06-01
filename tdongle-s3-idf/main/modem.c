@@ -105,9 +105,10 @@ static TaskHandle_t s_tcp_pump_task = NULL;
  * detection) pushes bytes into s_to_cdc; consumer (modem_cdc_pump_task,
  * CDC-side) drains and calls cdc_write. Decouples WiFi RX from USB CDC
  * push, so a CDC FIFO stall doesn't block recv() and vice versa.
- * 8 KB is enough to absorb ~80 ms of WiFi RX at 100 KB/s while CDC
- * drains; bigger doesn't help once steady-state. */
-#define DATA_STREAM_BYTES 8192
+ * 16 KB absorbs ~160 ms of WiFi RX at 100 KB/s, enough headroom that
+ * a slow CHUSB drain on the DOS side never stalls the recv() loop
+ * even when the host is doing other work between INT 14h calls. */
+#define DATA_STREAM_BYTES 16384
 static StreamBufferHandle_t s_to_cdc = NULL;
 /* Reverse pipeline: producer is on_cdc_rx (TinyUSB task, CPU1) pushing
  * raw bytes into s_to_tcp; consumer is modem_tcp_pump_task (CPU0)
@@ -138,9 +139,6 @@ static volatile int64_t  s_plus_time_us  = 0;
 #define OPT_NAWS   31
 #define TT_IS      0
 #define TT_SEND    1
-#define TERM_TYPE  "ANSI"
-#define TERM_COLS  80
-#define TERM_ROWS  25
 
 /* Telnet RX state machine -- this is what we feed bytes-from-TCP into
  * to strip the IAC negotiation noise before relaying payload to CDC. */
@@ -152,6 +150,54 @@ static uint8_t s_sbbuf[16];
 static uint8_t s_sblen  = 0;
 /* Tracked option flags so we don't echo the same WILL/DO repeatedly. */
 static uint8_t s_remote_on[32], s_local_on[32], s_local_offered[32];
+/* NVT CR-NUL collapse: when remote isn't BINARY, a NUL immediately
+ * following a CR is the "bare CR" wire encoding and must be dropped
+ * before delivery to usbterm. Tracks "last byte emitted to outbuf
+ * was a CR" -- cleared on any non-CR output. */
+static bool    s_prev_was_cr = false;
+/* Local-echo / password-safety state. See TELNET-LOCAL-ECHO-2026-06-01.md. */
+static volatile bool s_remote_ever_echoed = false;
+#define LECHO_AUTO 0
+#define LECHO_ON   1
+#define LECHO_OFF  2
+static uint8_t s_lecho_mode = LECHO_AUTO;
+
+/* Terminal advertised via telnet NAWS / TTYPE. Auto-detected at dial
+ * time via a DSR-CPR probe over CDC (see tn_query_size); usbterm
+ * answers natively, so no usbterm-side contract is needed. Manual
+ * AT$NAWS=cols,rows / AT$TTYPE=name remain as overrides for hosts
+ * that don't answer CPR (DOSBox/null-modem, ATNET0 raw peers). On
+ * probe timeout we fall back to 80x24 -- the VT100 NVT default and
+ * what usbterm's author recommended in
+ * TELNET-LOCAL-ECHO-2026-06-01.md. */
+static uint16_t s_term_cols = 80;
+static uint16_t s_term_rows = 24;
+static char     s_term_type[32] = "ANSI";
+
+/* CPR (cursor-position-report) probe state. While pending, on_cdc_rx
+ * intercepts incoming bytes and feeds them into the parser instead
+ * of routing to SLIP / online / AT command paths. Times out so a
+ * non-responding peer (DOSBox nullmodem, dumb device) doesn't wedge
+ * the dial. */
+static volatile bool s_cpr_pending = false;
+static int64_t       s_cpr_deadline_us = 0;
+static uint8_t       s_cpr_buf[32];
+static size_t        s_cpr_len = 0;
+#define CPR_TIMEOUT_US (500 * 1000)
+
+/* AT dial runs off the TinyUSB task on a one-shot worker so DNS +
+ * TCP connect + CPR wait don't starve CDC servicing -- under the
+ * CH375 host, ~800+ ms of CDC quiet at high inbound rates can
+ * escalate from NAK to chip-side timeout and trip the host's
+ * disconnect-and-re-enumerate cascade. (Diagnosed cross-referencing
+ * dongle on_cdc_rx + CHUSB chusb.c:2503 / ACTIVE_LOST path.)
+ *
+ * s_at_busy gates re-entry: any AT command issued while a dial is
+ * in flight gets ERROR, matching today's effective behaviour (today
+ * the TinyUSB task is blocked so no command runs anyway). */
+static volatile bool s_at_busy = false;
+static char          s_dial_arg[128];
+static TaskHandle_t  s_dial_task = NULL;
 static inline bool bget(uint8_t *a, uint8_t o) { return a[o >> 3] & (1 << (o & 7)); }
 static inline void bset(uint8_t *a, uint8_t o) { a[o >> 3] |=  (1 << (o & 7)); }
 static inline void bclr(uint8_t *a, uint8_t o) { a[o >> 3] &= ~(1 << (o & 7)); }
@@ -203,8 +249,67 @@ static bool tn_offer_local(uint8_t o)   { return o == OPT_BINARY || o == OPT_SGA
 static void tn_offer_will(uint8_t opt) {
     if (!bget(s_local_offered, opt)) { bset(s_local_offered, opt); tn_send3(TN_WILL, opt); }
 }
+/* Fire a DSR-CPR probe at usbterm to discover its current row/col size.
+ * Park the cursor at extreme bottom-right (usbterm clamps to its usable
+ * region) and ask for a cursor-position report. usbterm's reply
+ * (ESC[<rows>;<cols>R) is captured by the on_cdc_rx interceptor below.
+ * Caller waits briefly for s_cpr_pending to clear before proceeding. */
+static void tn_query_size(void) {
+    s_cpr_pending = true;
+    s_cpr_len = 0;
+    s_cpr_deadline_us = esp_timer_get_time() + CPR_TIMEOUT_US;
+    /* Bottom-right park + DSR-CPR. Two CSI sequences, 11 bytes total. */
+    cdc_print("\x1b[999;999H\x1b[6n");
+}
+
+/* Feed bytes received while s_cpr_pending into the CPR parser. State is
+ * a simple scan for ESC '[' <digits> ';' <digits> 'R'. Anything before
+ * the ESC is discarded (so prompt fragments don't confuse the parser).
+ * Returns the number of bytes consumed; caller should NOT process those
+ * via the regular CDC paths. */
+static size_t cpr_feed(const uint8_t *buf, size_t n) {
+    size_t i = 0;
+    while (i < n && s_cpr_pending) {
+        uint8_t b = buf[i++];
+        if (s_cpr_len == 0) {
+            if (b == 0x1B) s_cpr_buf[s_cpr_len++] = b;
+            /* else: drop noise before ESC */
+        } else if (s_cpr_len < sizeof s_cpr_buf - 1) {
+            s_cpr_buf[s_cpr_len++] = b;
+            if (b == 'R') {
+                /* ESC [ rows ; cols R */
+                s_cpr_buf[s_cpr_len] = 0;
+                long rows = 0, cols = 0;
+                if (s_cpr_buf[1] == '[' &&
+                    sscanf((const char *)s_cpr_buf + 2, "%ld;%ld", &rows, &cols) == 2 &&
+                    rows >= 1 && rows <= 65535 &&
+                    cols >= 1 && cols <= 65535) {
+                    s_term_rows = (uint16_t)rows;
+                    s_term_cols = (uint16_t)cols;
+                }
+                s_cpr_pending = false;
+                s_cpr_len = 0;
+                break;
+            }
+        } else {
+            /* Overflow without finding R -- give up, treat the rest as
+             * normal input. Caller will fall back to defaults. */
+            s_cpr_pending = false;
+            s_cpr_len = 0;
+            /* Pretend we didn't consume this byte so caller re-processes. */
+            return i - 1;
+        }
+    }
+    return i;
+}
+
 static void tn_send_naws(void) {
-    uint8_t b[] = {TN_IAC, TN_SB, OPT_NAWS, 0, TERM_COLS, 0, TERM_ROWS, TN_IAC, TN_SE};
+    uint8_t b[] = {
+        TN_IAC, TN_SB, OPT_NAWS,
+        (uint8_t)(s_term_cols >> 8), (uint8_t)(s_term_cols & 0xFF),
+        (uint8_t)(s_term_rows >> 8), (uint8_t)(s_term_rows & 0xFF),
+        TN_IAC, TN_SE
+    };
     if (s_sock >= 0) send(s_sock, b, sizeof b, 0);
 }
 static void tn_after_local_enable(uint8_t opt) {
@@ -213,6 +318,12 @@ static void tn_after_local_enable(uint8_t opt) {
 static void tn_handle_neg(uint8_t c, uint8_t opt) {
     switch (c) {
         case TN_WILL:
+            /* Password-safety latch: a "server ever said WILL ECHO" in
+             * this session disables auto-local-echo for the rest of
+             * the dial. After login the server typically sends WONT
+             * ECHO before a password prompt; the strict "echo when
+             * remote isn't echoing" rule would leak the password. */
+            if (opt == OPT_ECHO) s_remote_ever_echoed = true;
             if (tn_accept_remote(opt)) {
                 if (!bget(s_remote_on, opt)) { bset(s_remote_on, opt); tn_send3(TN_DO, opt); }
             } else {
@@ -243,7 +354,7 @@ static void tn_handle_sb(void) {
         uint8_t hdr[] = {TN_IAC, TN_SB, OPT_TTYPE, TT_IS};
         if (s_sock >= 0) {
             send(s_sock, hdr, sizeof hdr, 0);
-            send(s_sock, (const uint8_t *)TERM_TYPE, strlen(TERM_TYPE), 0);
+            send(s_sock, (const uint8_t *)s_term_type, strlen(s_term_type), 0);
             uint8_t tail[] = {TN_IAC, TN_SE};
             send(s_sock, tail, sizeof tail, 0);
         }
@@ -253,6 +364,8 @@ static void tn_start(void) {
     memset(s_remote_on, 0, sizeof s_remote_on);
     memset(s_local_on, 0, sizeof s_local_on);
     memset(s_local_offered, 0, sizeof s_local_offered);
+    s_remote_ever_echoed = false;
+    s_prev_was_cr = false;
     s_sblen = 0; s_tstate = T_DATA;
     if (!s_telnet) return;
     /* Opener: offer the options that make a BBS session clean. */
@@ -279,7 +392,13 @@ static inline void to_cdc(const void *buf, size_t n) {
  * the pipeline has drained. */
 static void modem_cdc_pump_task(void *arg) {
     (void)arg;
-    static uint8_t buf[1024];
+    /* 2 KB drains: one chunk equals one full prior CDC TX FIFO, so
+     * each cdc_write call moves a "USB-transfer-worth" of data in
+     * one go and the per-call flush overhead amortizes over more
+     * bytes. With TX_BUFSIZE=4096 the ring still has 2 KB headroom
+     * for a USB IN transfer in flight while we stage the next
+     * chunk -- continuous bulk-IN pipelining, no idle slots. */
+    static uint8_t buf[2048];
     while (s_online || (s_to_cdc && xStreamBufferBytesAvailable(s_to_cdc) > 0)) {
         size_t n = xStreamBufferReceive(s_to_cdc, buf, sizeof buf,
                                         pdMS_TO_TICKS(50));
@@ -318,14 +437,24 @@ static void modem_data_task(void *arg) {
                 switch (s_tstate) {
                     case T_DATA:
                         if (ch == TN_IAC) s_tstate = T_IAC;
-                        else {
+                        else if (ch == 0x00 && s_prev_was_cr &&
+                                 !bget(s_remote_on, OPT_BINARY)) {
+                            /* NVT CR-NUL collapses to CR -- drop the NUL.
+                             * Without this, hosts like BSD telnetd would
+                             * leak \0 bytes through to usbterm after every
+                             * bare CR. Skipped in BINARY mode where the
+                             * NUL is real data. */
+                            s_prev_was_cr = false;
+                        } else {
                             outbuf[outlen++] = ch;
+                            s_prev_was_cr = (ch == 0x0D);
                             if (outlen >= sizeof outbuf) { to_cdc(outbuf, outlen); outlen = 0; }
                         }
                         break;
                     case T_IAC:
                         if (ch == TN_IAC) {
                             outbuf[outlen++] = TN_IAC;
+                            s_prev_was_cr = false;
                             if (outlen >= sizeof outbuf) { to_cdc(outbuf, outlen); outlen = 0; }
                             s_tstate = T_DATA;
                         } else if (ch == TN_WILL || ch == TN_WONT || ch == TN_DO || ch == TN_DONT) {
@@ -387,6 +516,46 @@ static void modem_data_task(void *arg) {
     }
     s_data_task = NULL;
     vTaskDelete(NULL);
+}
+
+/* Whether the dongle should locally echo CDC RX back to the host in
+ * data mode. AUTO follows the negotiated state with a "remote ever
+ * WILL'd ECHO" latch so the password-prompt flow (server WILL ECHO ->
+ * login -> server WONT ECHO) doesn't leak the password. ON / OFF are
+ * explicit overrides settable via AT$LECHO. See
+ * TELNET-LOCAL-ECHO-2026-06-01.md for the full rationale. */
+static inline bool local_echo_active(void) {
+    if (s_lecho_mode == LECHO_OFF) return false;
+    if (s_lecho_mode == LECHO_ON)  return s_telnet && s_online;
+    return s_telnet && s_online &&
+           !bget(s_remote_on, OPT_ECHO) &&
+           !s_remote_ever_echoed;
+}
+
+/* Echo CDC RX bytes back to the host per local-echo rules. Called only
+ * when local_echo_active() is true. */
+static void do_local_echo(const uint8_t *buf, size_t n) {
+    uint8_t out[64];
+    size_t  o = 0;
+    bool    bin = bget(s_local_on, OPT_BINARY);
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t b = buf[i];
+        if (o + 4 > sizeof out) { cdc_write(out, o); o = 0; }
+        if (b >= 0x20 && b <= 0x7E) {
+            out[o++] = b;
+        } else if (b == '\r') {
+            out[o++] = '\r'; out[o++] = '\n';
+        } else if (b == 0x08 || b == 0x7F) {
+            /* Destructive BS: usbterm treats lone 0x08 as cursor-left
+             * only, so emit BS-space-BS to actually erase the glyph. */
+            out[o++] = 0x08; out[o++] = ' '; out[o++] = 0x08;
+        } else if (bin && b >= 0x80) {
+            out[o++] = b;
+        }
+        /* All other controls (IAC, NUL, LF, ESC, etc.) are skipped -- the
+         * server's response will paint them if they have meaning. */
+    }
+    if (o) cdc_write(out, o);
 }
 
 /* ---- CDC -> TCP push (producer side, called from on_cdc_rx) ---- */
@@ -628,13 +797,10 @@ static void cmd_netif(void) {
 
 /* ---- ATD: dial a host:port ---- */
 
-static void cmd_dial(const char *arg) {
-    /* Strip Hayes dial-type modifier (T/P/R). */
-    while (*arg == ' ' || *arg == '\t') arg++;
-    if (*arg == 'T' || *arg == 'P' || *arg == 'R') arg++;
-    while (*arg == ' ' || *arg == '\t') arg++;
-    if (!*arg) { r_error(); return; }
-
+/* Worker that does the heavy dial work off the TinyUSB task.
+ * Reads the dial argument from s_dial_arg (populated by cmd_dial under
+ * the s_at_busy guard, so no concurrent writer). */
+static void cmd_dial_impl(const char *arg) {
     char host[80];
     uint16_t port = 23;     /* Hayes default = telnet */
     const char *colon = strrchr(arg, ':');
@@ -688,6 +854,23 @@ static void cmd_dial(const char *arg) {
     snprintf(s_peer, sizeof s_peer, "%s:%u", host, (unsigned)port);
     s_plus_count = 0;
     s_last_data_us = esp_timer_get_time();
+
+    /* Probe usbterm for its actual terminal size BEFORE going online,
+     * so the first NAWS subnegotiation carries the right dimensions
+     * and the cursor-park artifact lands before CONNECT (not mid-
+     * session). on_cdc_rx is still in command-mode dispatch here, but
+     * the CPR interceptor at the top of that handler swallows the
+     * reply before any AT parsing sees it. Non-responding peers
+     * (DOSBox/null-modem, ATNET0 raw) time out at CPR_TIMEOUT_US and
+     * we fall back to the 80x24 defaults. */
+    if (s_telnet) {
+        tn_query_size();
+        while (s_cpr_pending && esp_timer_get_time() < s_cpr_deadline_us) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        s_cpr_pending = false;
+    }
+
     s_online = true;
     tn_start();
     r_connect();
@@ -708,6 +891,47 @@ static void cmd_dial(const char *arg) {
                             3072, NULL, 16, &s_tcp_pump_task, 0);
     xTaskCreatePinnedToCore(modem_data_task, "modem_data",
                             4096, NULL, 16, &s_data_task, 0);
+}
+
+/* Worker task wrapper: run cmd_dial_impl off the TinyUSB task so DNS +
+ * connect + CPR wait don't block CDC servicing. Clears the busy gate
+ * when done (result codes already emitted by cmd_dial_impl). */
+static void cmd_dial_task_fn(void *arg) {
+    (void)arg;
+    cmd_dial_impl(s_dial_arg);
+    s_at_busy = false;
+    s_dial_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* Thin synchronous wrapper called from exec(). Does the cheap syntax
+ * checks inline (so a malformed ATD gets an immediate ERROR) and then
+ * hands off to cmd_dial_task_fn for the slow work. */
+static void cmd_dial(const char *arg) {
+    while (*arg == ' ' || *arg == '\t') arg++;
+    if (*arg == 'T' || *arg == 'P' || *arg == 'R') arg++;
+    while (*arg == ' ' || *arg == '\t') arg++;
+    if (!*arg) { r_error(); return; }
+    if (s_at_busy || s_dial_task) { r_error(); return; }
+
+    size_t n = strnlen(arg, sizeof s_dial_arg);
+    if (n >= sizeof s_dial_arg) { r_error(); return; }
+    memcpy(s_dial_arg, arg, n);
+    s_dial_arg[n] = 0;
+
+    s_at_busy = true;
+    /* CPU0 keeps the worker off the TinyUSB CPU (1); lwIP also lives
+     * on CPU0 so getaddrinfo/connect/recv all stay local. Stack 4 KB
+     * matches modem_data_task and covers getaddrinfo's lwIP buffers. */
+    BaseType_t ok = xTaskCreatePinnedToCore(cmd_dial_task_fn, "at_dial",
+                                            4096, NULL, 15,
+                                            &s_dial_task, 0);
+    if (ok != pdPASS) {
+        s_at_busy = false;
+        s_dial_task = NULL;
+        r_error();
+    }
+    /* Result code (CONNECT / NO CARRIER) is emitted by cmd_dial_impl. */
 }
 
 /* ---- exec one AT line (command mode only) ---- */
@@ -942,6 +1166,60 @@ static void handle_dollar(char *s) {
         int n = kbd_type(val, (int)strlen(val));
         if (n < 0) { r_error(); return; }
         r_ok();
+    } else if (!strcmp(key, "LECHO")) {
+        /* AT$LECHO=AUTO|ON|OFF -- override the data-mode local-echo
+         * policy. AUTO is the negotiated rule with the password-safety
+         * latch; ON bypasses the latch; OFF disables echo regardless.
+         * See TELNET-LOCAL-ECHO-2026-06-01.md. */
+        if (val && eq) {
+            if      (!strcasecmp(val, "AUTO")) s_lecho_mode = LECHO_AUTO;
+            else if (!strcasecmp(val, "ON"))   s_lecho_mode = LECHO_ON;
+            else if (!strcasecmp(val, "OFF"))  s_lecho_mode = LECHO_OFF;
+            else { r_error(); return; }
+            r_ok();
+        } else {
+            const char *m = (s_lecho_mode == LECHO_ON)  ? "ON"  :
+                            (s_lecho_mode == LECHO_OFF) ? "OFF" : "AUTO";
+            cdc_print("\r\nLECHO="); cdc_print(m); cdc_print("\r\n");
+            r_ok();
+        }
+    } else if (!strcmp(key, "NAWS")) {
+        /* AT$NAWS=cols,rows -- usbterm declares its terminal size for
+         * telnet NAWS subnegotiation. Bare AT$NAWS queries. */
+        if (val && eq) {
+            char *comma = strchr(val, ',');
+            if (!comma) { r_error(); return; }
+            *comma = 0;
+            long c = strtol(val, NULL, 10);
+            long r = strtol(comma + 1, NULL, 10);
+            if (c < 1 || c > 65535 || r < 1 || r > 65535) { r_error(); return; }
+            s_term_cols = (uint16_t)c;
+            s_term_rows = (uint16_t)r;
+            /* Live update: if connected and the server has DO'd NAWS,
+             * push a fresh subnegotiation so the prompt redraws. */
+            if (s_online && bget(s_local_on, OPT_NAWS)) tn_send_naws();
+            r_ok();
+        } else {
+            char line[32];
+            snprintf(line, sizeof line, "\r\n%u,%u\r\n",
+                     (unsigned)s_term_cols, (unsigned)s_term_rows);
+            cdc_print(line);
+            r_ok();
+        }
+    } else if (!strcmp(key, "TTYPE")) {
+        /* AT$TTYPE=name -- usbterm declares the terminal type used in
+         * telnet TTYPE subnegotiation (replaces the hard-coded "ANSI").
+         * Bare AT$TTYPE queries. */
+        if (val && eq) {
+            size_t vn = strnlen(val, sizeof s_term_type - 1);
+            if (vn == 0) { r_error(); return; }
+            memcpy(s_term_type, val, vn);
+            s_term_type[vn] = 0;
+            r_ok();
+        } else {
+            cdc_print("\r\n"); cdc_print(s_term_type); cdc_print("\r\n");
+            r_ok();
+        }
     } else if (!strcmp(key, "HELP")) {
         cdc_print(
             "\r\n"
@@ -957,6 +1235,9 @@ static void handle_dollar(char *s) {
             "AT$SCAN            list visible networks\r\n"
             "AT$NETIF           dump netif state\r\n"
             "AT$TYPE=<str>      send keystrokes via HID keyboard (DSL)\r\n"
+            "AT$LECHO=mode     data-mode local echo (AUTO/ON/OFF)\r\n"
+            "AT$NAWS=cols,rows  declare terminal size for telnet NAWS\r\n"
+            "AT$TTYPE=name      declare terminal type for telnet TTYPE\r\n"
             "AT$RESET           reboot the dongle\r\n"
             "AT$HELP            this help\r\n"
         );
@@ -970,6 +1251,12 @@ static void exec(char *line) {
     char *p = strip_at(line);
     if (!p) return;                 /* non-AT line: silent */
     if (!*p) { r_ok(); return; }    /* bare AT */
+
+    /* Dial worker in flight: reject other commands rather than let
+     * them race against cmd_dial_impl's s_sock / s_online / s_peer
+     * writes. Matches today's effective behaviour where the TinyUSB
+     * task is blocked during ATDT anyway. */
+    if (s_at_busy) { r_error(); return; }
 
     switch (*p) {
         case 'E': s_echo    = (p[1] != '0'); r_ok(); return;
@@ -1061,6 +1348,25 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
     if (tinyusb_cdcacm_read(itf, buf, sizeof buf, &got) != ESP_OK) return;
     if (got == 0) return;
 
+    /* CPR probe in flight (just-dialed): consume the reply before any
+     * other path sees it. Stale probes time out via the deadline so a
+     * non-responding peer doesn't permanently eat input. */
+    if (s_cpr_pending) {
+        if (esp_timer_get_time() > s_cpr_deadline_us) {
+            s_cpr_pending = false;
+            s_cpr_len = 0;
+            /* fall through; the bytes we just received belong to the
+             * normal path (likely server greeting / AT input). */
+        } else {
+            size_t consumed = cpr_feed(buf, got);
+            if (consumed >= got) return;
+            /* Parser bailed out mid-buffer (overflow); reprocess the
+             * remaining tail through the normal paths. */
+            memmove(buf, buf + consumed, got - consumed);
+            got -= consumed;
+        }
+    }
+
     /* SLIP mode: bytes are SLIP-framed IP packets. Feed them to the
      * de-framer; nothing else touches them. */
     if (slip_get_mode() == MODE_SLIP) {
@@ -1069,8 +1375,11 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
     }
 
     if (s_online) {
-        /* Online: pipe CDC bytes to TCP with +++ escape + telnet
-         * IAC/CRLF handling. */
+        /* Online: echo locally if the remote isn't echoing (gated by
+         * AT$LECHO), then pipe CDC bytes to TCP with +++ escape +
+         * telnet IAC/CRLF handling. on_cdc_rx and cdc_write both run
+         * on CPU1, so the echo path stays intra-core. */
+        if (local_echo_active()) do_local_echo(buf, got);
         online_push_bytes(buf, got);
         return;
     }

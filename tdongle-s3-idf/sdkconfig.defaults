@@ -80,7 +80,11 @@ CONFIG_TINYUSB_CDC_COUNT=1
 # Larger means fewer "FIFO full, wait + flush" stalls inside slip_output
 # / slip_feed when DOS pushes a burst.
 CONFIG_TINYUSB_CDC_RX_BUFSIZE=2048
-CONFIG_TINYUSB_CDC_TX_BUFSIZE=2048
+# TX FIFO at 4096: lets the consumer task push 2 KB at a time without
+# splitting (matched to its drain chunk below) and still leaves a full
+# 2 KB of headroom in the ring while a USB IN transfer is in flight.
+# Costs 2 KB of BSS over the prior 2048 setting.
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=4096
 CONFIG_TINYUSB_HID_COUNT=1
 
 # Pin TinyUSB to CPU1. WiFi/lwIP/HTTPD/main all live on CPU0 by IDF
