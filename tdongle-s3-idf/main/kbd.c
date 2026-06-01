@@ -22,9 +22,9 @@
 
 /* ---- in-memory typing log (small ring, like disk-log but separate) ---- */
 
-#define KBD_LOG_LINES    48
-#define KBD_LOG_LINE_LEN 128   /* prefix "<seq> " + 96 msg + slack */
-#define KBD_LOG_MSG_LEN  96
+#define KBD_LOG_LINES    16    /* was 48 -- SRAM trim 2026-06-01 */
+#define KBD_LOG_LINE_LEN 96    /* was 128 -- prefix + 72-byte msg */
+#define KBD_LOG_MSG_LEN  72
 
 static portMUX_TYPE s_log_mux = portMUX_INITIALIZER_UNLOCKED;
 static char         s_log[KBD_LOG_LINES][KBD_LOG_LINE_LEN];

@@ -86,13 +86,19 @@ static SemaphoreHandle_t s_io_mutex = NULL;
  *
  * Slot count is the headroom for the host to burst writes faster
  * than the worker can drain to flash (worker rate ~15 sectors/sec).
- * At 16 slots × 4 KB = 64 KB RAM, the host can burst ~64 KB before
- * any callback has to wait on the worker. DISKTEST's 78-write run
- * with 8 slots saw 8 slow writes from cache saturation; 16 leaves
- * comfortable margin. The previous 32-slot setting (128 KB) was
- * starving WiFi heap -- the dev disk is bursty, not sustained, so
- * trading some burst headroom for WiFi reliability is the right
- * call on this target. */
+ *
+ * SIZING HISTORY: 32 (128 KB) -> 16 (64 KB) -> 8 (32 KB) -> 10 (40 KB)
+ *                  -> 16 (64 KB).
+ *
+ * Returned to 16 slots after WB_SLOTS=10 started crashing during
+ * sustained MSC writes from CHUSB. The dial-path heap squeeze that
+ * forced us off 16 originally is now fixed by (a) pre-allocating the
+ * modem stream buffers at modem_init (boot, when heap is highest)
+ * rather than first-dial, (b) halving TCP_WND_DEFAULT to 32 KB, and
+ * (c) removing the spurious setsockopt(SO_RCVBUF, 32 KB) override
+ * that was layering on top of TCP_WND. With those landed, the
+ * dial-time low-water heap with 16 slots is comfortable, and CHUSB
+ * gets its full historical 64 KB burst headroom back. */
 #define WB_SLOTS 16
 
 typedef enum {

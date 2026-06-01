@@ -40,9 +40,14 @@ message(STATUS "${_iram_patch_out}")
 idf_build_set_property(COMPILE_DEFINITIONS "-DIP_NAPT_TIMEOUT_MS_UDP=30000" APPEND)
 
 # Bump lwIP's pbuf pool so burst RX from the SLIP host has headroom.
-# Default IDF is 16; bumping to 32 costs ~24 KB BSS. PBUF_POOL_SIZE is
-# not exposed as Kconfig either, hence the -D override.
-idf_build_set_property(COMPILE_DEFINITIONS "-DPBUF_POOL_SIZE=64" APPEND)
+# Default IDF is 16; 32 strikes the right balance for this target.
+# SIZING HISTORY: 16 (default) -> 64 (was starving heap on the 1 MB
+# Hayes transfer, dropping free heap to <1 KB) -> 32. PBUF_POOL is
+# heap-allocated by memp_init -- each entry is ~PBUF_POOL_BUFSIZE
+# (TCP_MSS + lwIP header ≈ 1.5 KB), so 32 entries cost ~48 KB heap
+# at init versus ~96 KB at 64. PBUF_POOL_SIZE is not exposed as
+# Kconfig in IDF, hence the -D override.
+idf_build_set_property(COMPILE_DEFINITIONS "-DPBUF_POOL_SIZE=32" APPEND)
 
 # CDC bulk endpoint buffer. Default for full-speed USB is 64 bytes
 # (matches MaxPacketSize). Bumping to 512 lets the TinyUSB driver

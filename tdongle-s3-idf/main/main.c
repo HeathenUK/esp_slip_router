@@ -98,15 +98,38 @@ static const char *reset_reason_name(esp_reset_reason_t rr) {
  * RAM-resident; persists across DOS/host crashes but lost on dongle
  * reset (which is exactly the diagnostic we want -- on reset, the new
  * init line includes the previous reset_reason). Pulled via GET
- * /disk-log so all events are inspectable without a UART. */
+ * /disk-log so all events are inspectable without a UART.
+ *
+ * Mirrored to an RTC_NOINIT buffer so that pre-panic entries survive
+ * a soft reset (which includes PANIC). On boot, if the RTC ring's
+ * magic checks out, dump_rtc_log_on_boot() drains the survived
+ * entries back into the live disk_log so they appear via /disk-log
+ * before the new init line. Magic+seq are then cleared so a clean
+ * subsequent reboot doesn't double-print. */
 
-#define DISK_LOG_LINES        64
-#define DISK_LOG_LINE_LEN     160      /* prefix "<seq> " + 128 msg + slack */
-#define DISK_LOG_MSG_LEN      128
+#define DISK_LOG_LINES        48       /* was 64 -- SRAM trim 2026-06-01 */
+#define DISK_LOG_LINE_LEN     128      /* was 160 -- prefix + 96-byte msg */
+#define DISK_LOG_MSG_LEN      96
+#define RTC_LOG_LINES         32       /* smaller -- RTC SLOW is precious */
+#define RTC_LOG_LINE_LEN      128      /* was 144 -- match DISK_LOG_LINE_LEN */
+#define RTC_LOG_MAGIC         0x5044AB1Eu   /* "DiskAble", invented */
 
 static portMUX_TYPE s_disk_log_mux = portMUX_INITIALIZER_UNLOCKED;
 static char         s_disk_log[DISK_LOG_LINES][DISK_LOG_LINE_LEN];
 static uint32_t     s_disk_log_seq = 0;
+
+/* RTC_NOINIT_ATTR places the variable in RTC SLOW memory and skips
+ * zero-init at boot, so it survives any soft reset (PANIC, SW). Lost
+ * only on power cycle or hard reset (which we never use). Each entry
+ * is a single line of formatted text matching the disk_log shape. */
+static RTC_NOINIT_ATTR uint32_t s_rtc_log_magic;
+static RTC_NOINIT_ATTR uint32_t s_rtc_log_seq;
+static RTC_NOINIT_ATTR char     s_rtc_log[RTC_LOG_LINES][RTC_LOG_LINE_LEN];
+
+/* Used during dump_rtc_log_on_boot() to suppress the RTC mirror -- if
+ * we DID mirror the dumped lines back, the next boot would re-dump
+ * them with another "[pre-reset]" prefix and so on indefinitely. */
+static bool s_disk_log_suppress_rtc = false;
 
 void disk_logf(const char *fmt, ...) {
     char msg[DISK_LOG_MSG_LEN];
@@ -119,11 +142,41 @@ void disk_logf(const char *fmt, ...) {
     uint32_t seq = ++s_disk_log_seq;
     snprintf(s_disk_log[seq % DISK_LOG_LINES], DISK_LOG_LINE_LEN,
              "%" PRIu32 " %s", seq, msg);
+    if (!s_disk_log_suppress_rtc) {
+        /* RTC mirror -- same critical section so seq order is consistent
+         * if disk_logf is called concurrently from multiple cores. */
+        s_rtc_log_magic = RTC_LOG_MAGIC;
+        s_rtc_log_seq   = seq;
+        snprintf(s_rtc_log[seq % RTC_LOG_LINES], RTC_LOG_LINE_LEN,
+                 "%" PRIu32 " %s", seq, msg);
+    }
     portEXIT_CRITICAL(&s_disk_log_mux);
 
     /* Also mirror to the standard ESP log so it shows up in the
      * USB-Serial-JTAG console if a developer has it attached. */
     ESP_LOGI(TAG, "[log] %s", msg);
+}
+
+/* Pull surviving disk_log entries out of the RTC mirror on boot. Call
+ * this BEFORE the new init line so the post-mortem trail appears
+ * first in the dumped log. RTC mirror is suppressed during the dump
+ * so the replayed "[pre-reset]" lines don't write back to RTC and
+ * cause an infinite re-prefix loop on subsequent boots. */
+static void dump_rtc_log_on_boot(void) {
+    if (s_rtc_log_magic != RTC_LOG_MAGIC) return;   /* cold boot or garbage */
+    uint32_t last = s_rtc_log_seq;
+    /* Clear FIRST so even if we crash mid-dump the next boot starts
+     * clean -- no risk of repeated "[pre-reset]" wrapping. */
+    s_rtc_log_magic = 0;
+    s_rtc_log_seq   = 0;
+    if (last == 0) return;
+    uint32_t first = (last > RTC_LOG_LINES) ? (last - RTC_LOG_LINES + 1) : 1;
+    s_disk_log_suppress_rtc = true;
+    for (uint32_t i = first; i <= last; ++i) {
+        const char *line = s_rtc_log[i % RTC_LOG_LINES];
+        if (line[0]) disk_logf("[pre-reset] %s", line);
+    }
+    s_disk_log_suppress_rtc = false;
 }
 
 /* ===== HTTP handlers ================================================= */
@@ -844,6 +897,9 @@ void app_main(void) {
 #if CONFIG_SPIRAM
         psram = esp_psram_get_size();
 #endif
+        /* Drain any pre-reset disk_log entries from RTC NOINIT first
+         * so the post-mortem trail lands before the new init line. */
+        dump_rtc_log_on_boot();
         disk_logf("init: reset=%s jedec=0x%06lx vendor=%s psram=%u auto_suspend=%s",
                   reset_reason_name(esp_reset_reason()),
                   (unsigned long)jedec, vendor, (unsigned)psram,

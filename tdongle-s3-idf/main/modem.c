@@ -105,10 +105,14 @@ static TaskHandle_t s_tcp_pump_task = NULL;
  * detection) pushes bytes into s_to_cdc; consumer (modem_cdc_pump_task,
  * CDC-side) drains and calls cdc_write. Decouples WiFi RX from USB CDC
  * push, so a CDC FIFO stall doesn't block recv() and vice versa.
- * 16 KB absorbs ~160 ms of WiFi RX at 100 KB/s, enough headroom that
- * a slow CHUSB drain on the DOS side never stalls the recv() loop
- * even when the host is doing other work between INT 14h calls. */
-#define DATA_STREAM_BYTES 16384
+ *
+ * 8 KB per stream, 2 streams = 16 KB heap. We tried 16 KB each (32 KB
+ * total) for more CHUSB-side absorption but that combined with the
+ * dial worker stack pushed first-dial allocations past free heap on
+ * boot (panic at xStreamBufferCreate returning NULL -> pump task
+ * derefs NULL handle). 8 KB absorbs ~80 ms of WiFi RX at 100 KB/s,
+ * which empirically is enough. */
+#define DATA_STREAM_BYTES 8192
 static StreamBufferHandle_t s_to_cdc = NULL;
 /* Reverse pipeline: producer is on_cdc_rx (TinyUSB task, CPU1) pushing
  * raw bytes into s_to_tcp; consumer is modem_tcp_pump_task (CPU0)
@@ -844,16 +848,19 @@ static void cmd_dial_impl(const char *arg) {
 
     int yes = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes);
-    /* Bigger socket RX buffer means lwIP can hold more in-flight TCP
-     * data while the CDC pipe drains. lwIP clamps to its own ceilings,
-     * but asking for 32 KB gets us as much as it'll give. */
-    int rxbuf = 32 * 1024;
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rxbuf, sizeof rxbuf);
+    /* SO_RCVBUF used to be set to 32 KB here, but lwIP's recv accept
+     * queue then grew on top of the advertised TCP window -- a 1 MB
+     * Hayes fetch on a slow CDC drain pushed peak heap to 728 bytes
+     * free. Letting it default to TCP_WND_DEFAULT (32 KB) caps total
+     * in-flight at one window's worth, halving the peak heap held
+     * during downloads with no observable throughput impact (CDC,
+     * not TCP, is the bottleneck). */
 
     s_sock = sock;
     snprintf(s_peer, sizeof s_peer, "%s:%u", host, (unsigned)port);
     s_plus_count = 0;
     s_last_data_us = esp_timer_get_time();
+    disk_logf("dial: connected sock=%d peer=%s telnet=%d", sock, s_peer, s_telnet);
 
     /* Probe usbterm for its actual terminal size BEFORE going online,
      * so the first NAWS subnegotiation carries the right dimensions
@@ -864,16 +871,21 @@ static void cmd_dial_impl(const char *arg) {
      * (DOSBox/null-modem, ATNET0 raw) time out at CPR_TIMEOUT_US and
      * we fall back to the 80x24 defaults. */
     if (s_telnet) {
+        disk_logf("dial: tn_query_size");
         tn_query_size();
         while (s_cpr_pending && esp_timer_get_time() < s_cpr_deadline_us) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+        disk_logf("dial: cpr done cols=%u rows=%u", s_term_cols, s_term_rows);
         s_cpr_pending = false;
     }
 
     s_online = true;
+    disk_logf("dial: tn_start");
     tn_start();
+    disk_logf("dial: r_connect");
     r_connect();
+    disk_logf("dial: spawning pumps");
 
     /* Allocate the producer/consumer pipeline. modem_data_task does
      * recv() + telnet/+++ processing on whichever core; modem_cdc_pump
@@ -881,16 +893,19 @@ static void cmd_dial_impl(const char *arg) {
      * so no cross-core IPC on the FIFO hand-off). Decouples WiFi RX
      * from USB CDC push -- a CDC stall doesn't starve recv() and a
      * slow recv doesn't idle the CDC. */
-    if (!s_to_cdc) s_to_cdc = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
-    else xStreamBufferReset(s_to_cdc);
-    if (!s_to_tcp) s_to_tcp = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
-    else xStreamBufferReset(s_to_tcp);
+    /* Streams are pre-allocated in modem_init -- just reset them so
+     * a re-dial starts with empty rings. modem_init returns failure
+     * if it couldn't allocate, so reaching here implies both exist. */
+    xStreamBufferReset(s_to_cdc);
+    xStreamBufferReset(s_to_tcp);
     xTaskCreatePinnedToCore(modem_cdc_pump_task, "modem_cdc",
                             3072, NULL, 16, &s_cdc_pump_task, 1);
     xTaskCreatePinnedToCore(modem_tcp_pump_task, "modem_tcp",
                             3072, NULL, 16, &s_tcp_pump_task, 0);
     xTaskCreatePinnedToCore(modem_data_task, "modem_data",
                             4096, NULL, 16, &s_data_task, 0);
+    disk_logf("dial: pumps spawned free=%u",
+              (unsigned)esp_get_free_heap_size());
 }
 
 /* Worker task wrapper: run cmd_dial_impl off the TinyUSB task so DNS +
@@ -898,7 +913,9 @@ static void cmd_dial_impl(const char *arg) {
  * when done (result codes already emitted by cmd_dial_impl). */
 static void cmd_dial_task_fn(void *arg) {
     (void)arg;
+    disk_logf("dial_task: enter arg=\"%s\"", s_dial_arg);
     cmd_dial_impl(s_dial_arg);
+    disk_logf("dial_task: cmd_dial_impl returned, clearing busy");
     s_at_busy = false;
     s_dial_task = NULL;
     vTaskDelete(NULL);
@@ -921,8 +938,11 @@ static void cmd_dial(const char *arg) {
 
     s_at_busy = true;
     /* CPU0 keeps the worker off the TinyUSB CPU (1); lwIP also lives
-     * on CPU0 so getaddrinfo/connect/recv all stay local. Stack 4 KB
-     * matches modem_data_task and covers getaddrinfo's lwIP buffers. */
+     * on CPU0 so getaddrinfo/connect/recv all stay local. 4 KB stack
+     * matches modem_data_task and is sufficient for getaddrinfo +
+     * connect + the small cdc_print chain (verified empirically --
+     * the panic we chased to "stack overflow" was actually heap
+     * exhaustion at xStreamBufferCreate, not stack). */
     BaseType_t ok = xTaskCreatePinnedToCore(cmd_dial_task_fn, "at_dial",
                                             4096, NULL, 15,
                                             &s_dial_task, 0);
@@ -1426,7 +1446,26 @@ esp_err_t modem_init(void) {
         ESP_LOGE(TAG, "cdc rx cb register: %s", esp_err_to_name(e));
         return e;
     }
-    disk_logf("modem: AT engine ready on CDC0 (E%d V%d N%d)",
-              s_echo?1:0, s_verbose?1:0, s_telnet?1:0);
+
+    /* Pre-allocate the producer/consumer pipeline at init so first-dial
+     * heap pressure can't fail one of them. The dial path's
+     * setsockopt(SO_RCVBUF, 32 KB) grows lwIP's TCP recv buffer and
+     * by the time we'd allocate s_to_tcp inline the free heap was
+     * ~12 KB -- not enough for 8 KB + overhead in a contiguous block.
+     * Allocating here, when boot free heap is highest, guarantees the
+     * rings exist by the time ATDT fires. The rings are session-
+     * resident (reset on each dial), never freed. */
+    if (!s_to_cdc) s_to_cdc = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
+    if (!s_to_tcp) s_to_tcp = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
+    if (!s_to_cdc || !s_to_tcp) {
+        ESP_LOGE(TAG, "modem stream alloc fail to_cdc=%p to_tcp=%p free=%u",
+                 (void *)s_to_cdc, (void *)s_to_tcp,
+                 (unsigned)esp_get_free_heap_size());
+        return ESP_ERR_NO_MEM;
+    }
+
+    disk_logf("modem: AT engine ready on CDC0 (E%d V%d N%d) streams=%uB",
+              s_echo?1:0, s_verbose?1:0, s_telnet?1:0,
+              (unsigned)DATA_STREAM_BYTES);
     return ESP_OK;
 }

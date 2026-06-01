@@ -128,14 +128,21 @@ CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 # esp_https_ota default; defers erase to per-sector lazy inside
 # esp_ota_write, so no 15 s upfront block to fight with the TCP
 # window). All four wins are real and reliable together.
-CONFIG_LWIP_TCP_WND_DEFAULT=65535
+# TCP RX window. 65535 was too generous for this target: a 1 MB Hayes
+# fetch with a macOS host (~100 KB/s CDC drain) saw lwIP buffer the
+# full window-worth of in-flight data behind the slow drain, taking
+# min_free_heap to 728 bytes. 32 KB still lets us run a full BDP at
+# the macOS CDC rate (RTT * cap ~= 10 KB) and halves the worst-case
+# heap held during downloads. CDC is the bottleneck, not TCP window,
+# so this doesn't slow real-world throughput on our target hosts.
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
 # Send buffer (per-pcb queue lwIP will accept from the app before
 # blocking send()). Default IDF v5.5 is 5760 (4*MSS) which caps the
 # upload BDP at ~5.6 KB in-flight -- enough for 56 Kbps but throttles
-# anything faster. Match TCP_WND_DEFAULT (65535) so the dongle can
-# pipeline a full window of upload data before lwIP back-pressures
-# the modem_tcp_pump_task. SND_QUEUELEN scales from SND_BUF/MSS so
-# the pbuf-count ceiling moves with it (no separate Kconfig needed).
+# anything faster. 65535 lets the dongle pipeline a full window of
+# upload data before lwIP back-pressures the modem_tcp_pump_task.
+# SND_QUEUELEN scales from SND_BUF/MSS so the pbuf-count ceiling
+# moves with it (no separate Kconfig needed).
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
