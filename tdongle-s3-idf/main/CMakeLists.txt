@@ -14,6 +14,7 @@ idf_component_register(
         "modem.c"
         "fat.c"
         "slip.c"
+        "dns_forwarder.c"
     INCLUDE_DIRS "."
     REQUIRES
         # Networking / WiFi

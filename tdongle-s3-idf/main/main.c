@@ -49,6 +49,7 @@
 #include "disk.h"
 #include "fat.h"
 #include "slip.h"
+#include "dns_forwarder.h"
 
 /* First-flash bootstrap WiFi credentials. The file `wifi_creds.h` is
  * gitignored and locally created. NVS-stored creds always take
@@ -374,6 +375,30 @@ static esp_err_t h_fs_delete(httpd_req_t *req) {
     return send_text(req, "200 OK", "text/plain", "OK\n");
 }
 
+/* GET /slip-stats -- SLIP path counters as JSON. Pollable over WiFi
+ * while a SLIP test is running on DOS; diff two snapshots to derive
+ * the live byte/packet rate. pbuf_fails > 0 is a smoking gun (lwIP
+ * pool exhausted by burst RX); tx_truncs > 0 means an IP packet
+ * exceeded our SLIP TX buffer. */
+static esp_err_t h_slip_stats(httpd_req_t *req) {
+    char buf[256];
+    int n = snprintf(buf, sizeof buf,
+        "{\"mode\":\"%s\""
+        ",\"pkts_to_host\":%u,\"pkts_from_host\":%u"
+        ",\"bytes_to_host\":%u,\"bytes_from_host\":%u"
+        ",\"pbuf_alloc_fails\":%u,\"tx_truncs\":%u}\n",
+        slip_get_mode() == MODE_SLIP ? "SLIP" : "MODEM",
+        (unsigned)slip_stat_pkts_to_host(),
+        (unsigned)slip_stat_pkts_from_host(),
+        (unsigned)slip_stat_bytes_to_host(),
+        (unsigned)slip_stat_bytes_from_host(),
+        (unsigned)slip_stat_pbuf_fails(),
+        (unsigned)slip_stat_tx_truncs());
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, (n > 0 && (size_t)n < sizeof buf) ? n : 0);
+    return ESP_OK;
+}
+
 /* POST /mode?to=SLIP|MODEM -- runtime mode switch from the WiFi
  * side. Always available (independent of CDC) so a stuck SLIP mode
  * with no DOS-side recovery can be unstuck via curl. Persisted to
@@ -446,6 +471,7 @@ static void httpd_start_once(void) {
         { .uri = "/fs/*",      .method = HTTP_DELETE, .handler = h_fs_delete, .user_ctx = NULL },
         { .uri = "/mode",      .method = HTTP_POST,   .handler = h_mode,      .user_ctx = NULL },
         { .uri = "/mode",      .method = HTTP_GET,    .handler = h_mode,      .user_ctx = NULL },
+        { .uri = "/slip-stats",.method = HTTP_GET,    .handler = h_slip_stats,.user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
         httpd_register_uri_handler(s_httpd, &routes[i]);
@@ -634,6 +660,10 @@ void app_main(void) {
         if (e != ESP_OK)
             disk_logf("slip_init failed: %s", esp_err_to_name(e));
     }
+
+    /* DNS forwarder on the SLIP netif IP. Bypasses NAPT for DNS so
+     * mTCP queries don't depend on the UDP NAT mapping surviving. */
+    dns_forwarder_init();
 
     /* USB up at boot. Phase 1a deferred this behind POST /usb-start
      * as a safety scaffold while the JTAG -> OTG PHY-mux switch and

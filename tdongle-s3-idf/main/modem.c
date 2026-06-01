@@ -254,21 +254,25 @@ static void modem_data_task(void *arg) {
     struct timeval rcv_tv = { .tv_sec = 0, .tv_usec = 100 * 1000 };
     setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof rcv_tv);
 
-    uint8_t inbuf[512];
-    uint8_t outbuf[512];
+    /* Sized to the CDC TX FIFO (2 KB) so one recv() worth of bytes fits
+     * in a single FIFO drain without spinning on backpressure -- bumping
+     * higher costs SRAM that WiFi heap needs more. outbuf only used on
+     * the telnet path; binary path pushes inbuf directly. */
+    static uint8_t inbuf[2048];
+    static uint8_t outbuf[2048];
     bool peer_closed = false;
 
     while (s_online && s_sock >= 0) {
         int n = recv(s_sock, inbuf, sizeof inbuf, 0);
-        if (n > 0) {
+        if (n > 0 && !s_telnet) {
+            /* Binary fast path: skip the per-byte IAC state machine when
+             * telnet is off -- push inbuf straight to CDC. Phase 2 (HTTP)
+             * hits this. */
+            cdc_write(inbuf, (size_t)n);
+        } else if (n > 0) {
             size_t outlen = 0;
             for (int i = 0; i < n; ++i) {
                 uint8_t ch = inbuf[i];
-                if (!s_telnet) {
-                    outbuf[outlen++] = ch;
-                    if (outlen >= sizeof outbuf) { cdc_write(outbuf, outlen); outlen = 0; }
-                    continue;
-                }
                 switch (s_tstate) {
                     case T_DATA:
                         if (ch == TN_IAC) s_tstate = T_IAC;
@@ -494,21 +498,30 @@ static void cmd_ping(const char *host) {
 
 static void cmd_scan(void) {
     cdc_print("\r\nscanning...\r\n");
+    /* The wifi event handler reconnects-on-disconnect aggressively, so a
+     * scan started while connect-retry is in flight returns ESP_ERR_WIFI_STATE.
+     * Disconnect first and the next reconnect attempt will fire after we
+     * finish; this lets scan succeed even when creds are wrong. */
+    esp_wifi_disconnect();
     wifi_scan_config_t sc = {0};
-    if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
-        cdc_print("scan failed\r\n");
+    esp_err_t e = esp_wifi_scan_start(&sc, true);
+    if (e != ESP_OK) {
+        char b[64];
+        snprintf(b, sizeof b, "scan failed (%s)\r\n", esp_err_to_name(e));
+        cdc_print(b);
         r_error();
         return;
     }
     uint16_t n = 0;
     esp_wifi_scan_get_ap_num(&n);
     if (n > 24) n = 24;
-    wifi_ap_record_t *ap = calloc(n, sizeof *ap);
-    if (!ap) { r_error(); return; }
-    esp_wifi_scan_get_ap_records(&n, ap);
     char line[128];
     snprintf(line, sizeof line, "%u networks:\r\n", (unsigned)n);
     cdc_print(line);
+    if (n == 0) { r_ok(); return; }
+    wifi_ap_record_t *ap = calloc(n, sizeof *ap);
+    if (!ap) { cdc_print("calloc fail\r\n"); r_error(); return; }
+    esp_wifi_scan_get_ap_records(&n, ap);
     for (uint16_t i = 0; i < n; ++i) {
         snprintf(line, sizeof line,
                  "  %-32.32s  ch=%-2u  rssi=%4d  auth=%u\r\n",
@@ -590,6 +603,11 @@ static void cmd_dial(const char *arg) {
 
     int yes = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes);
+    /* Bigger socket RX buffer means lwIP can hold more in-flight TCP
+     * data while the CDC pipe drains. lwIP clamps to its own ceilings,
+     * but asking for 32 KB gets us as much as it'll give. */
+    int rxbuf = 32 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rxbuf, sizeof rxbuf);
 
     s_sock = sock;
     snprintf(s_peer, sizeof s_peer, "%s:%u", host, (unsigned)port);
@@ -612,7 +630,12 @@ static char *strip_at(char *line) {
     if (line[0] != 'A' && line[0] != 'a') return NULL;
     if (line[1] != 'T' && line[1] != 't') return NULL;
     char *rest = line + 2;
-    for (char *p = rest; *p; ++p) *p = (char)toupper((unsigned char)*p);
+    /* Uppercase the command part only -- stop at '=' so case-sensitive
+     * values (passwords, URLs, SSIDs) survive intact. Without this,
+     * AT$PASS=Crusty jugglers landed in NVS as CRUSTY JUGGLERS and
+     * WPA2 auth silently failed. */
+    for (char *p = rest; *p && *p != '='; ++p)
+        *p = (char)toupper((unsigned char)*p);
     return rest;
 }
 

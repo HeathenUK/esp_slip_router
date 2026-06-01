@@ -86,11 +86,14 @@ static SemaphoreHandle_t s_io_mutex = NULL;
  *
  * Slot count is the headroom for the host to burst writes faster
  * than the worker can drain to flash (worker rate ~15 sectors/sec).
- * At 32 slots × 4 KB = 128 KB RAM, the host can burst ~128 KB
- * before any callback has to wait on the worker. DISKTEST's
- * 78-write run with 8 slots saw 8 slow writes from cache
- * saturation -- 32 slots leaves clear margin. */
-#define WB_SLOTS 32
+ * At 16 slots × 4 KB = 64 KB RAM, the host can burst ~64 KB before
+ * any callback has to wait on the worker. DISKTEST's 78-write run
+ * with 8 slots saw 8 slow writes from cache saturation; 16 leaves
+ * comfortable margin. The previous 32-slot setting (128 KB) was
+ * starving WiFi heap -- the dev disk is bursty, not sustained, so
+ * trading some burst headroom for WiFi reliability is the right
+ * call on this target. */
+#define WB_SLOTS 16
 
 typedef enum {
     SLOT_EMPTY    = 0,

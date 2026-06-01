@@ -10,7 +10,9 @@
 #   dongle: \r\nOTA OK\r\n          ← then esp_restart, new fw boots
 #
 # Usage:  ./flash.sh [firmware.bin]
-#   defaults to ../tdongle-s3/.pio/build/dos/firmware.bin
+#   defaults to ../tdongle-s3-idf/build/tdongle_s3.bin (the active IDF
+#   build). The arduino-esp32 build at ../tdongle-s3/.pio/build/dos/
+#   is no longer the production path -- if you need it, pass explicitly.
 #   Note: firmware.bin (app only), NOT firmware.factory.bin — OTA can't
 #   replace the bootloader from the running app.
 #
@@ -25,7 +27,7 @@ if [ "${1:-}" = "--boot" ]; then
     exec "$HERE/flash-bootloader.sh" "${2:-}"
 fi
 
-FW="${1:-$HERE/../tdongle-s3/.pio/build/dos/firmware.bin}"
+FW="${1:-$HERE/../tdongle-s3-idf/build/tdongle_s3.bin}"
 [ -f "$FW" ] || { echo "flash: no firmware at $FW" >&2; exit 1; }
 
 # Match either the original CDC-only build's tty (F412FA44AC4C1) or the
