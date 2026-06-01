@@ -255,9 +255,8 @@ static void modem_data_task(void *arg) {
     setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof rcv_tv);
 
     /* Sized to the CDC TX FIFO (2 KB) so one recv() worth of bytes fits
-     * in a single FIFO drain without spinning on backpressure -- bumping
-     * higher costs SRAM that WiFi heap needs more. outbuf only used on
-     * the telnet path; binary path pushes inbuf directly. */
+     * in a single FIFO drain without spinning on backpressure. outbuf
+     * only used on the telnet path; binary path pushes inbuf directly. */
     static uint8_t inbuf[2048];
     static uint8_t outbuf[2048];
     bool peer_closed = false;
@@ -383,6 +382,8 @@ static void online_push_bytes(const uint8_t *buf, size_t n) {
 /* ---- AT$ command handlers ---- */
 
 static esp_err_t save_wifi_creds(const char *ssid, const char *pass) {
+    disk_logf("nvs/cmd_wifi_set-save: ssid=\"%s\" pass-len=%zu",
+              ssid, strlen(pass));
     nvs_handle_t h;
     esp_err_t e = nvs_open("slip-router", NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
@@ -653,14 +654,36 @@ static void handle_dollar(char *s) {
         else if (val && qm)   { cmd_wifi_query(); r_ok(); }
         else {
             /* Bare AT$WIFI -- reconnect with stored creds. */
+            /* Reload SSID + PASS from NVS and push into the running WiFi
+             * config. esp_wifi_set_config is normally only called at
+             * boot in wifi_start(); without this, AT$SSID= / AT$PASS=
+             * writes to NVS that never reach the radio until a reset,
+             * which surprised the user (and the old arduino-esp32 build
+             * applied them immediately via WiFi.begin()). */
+            char ssid[33] = {0}, pass[65] = {0};
+            size_t ns = sizeof ssid, np = sizeof pass;
+            nvs_handle_t hr;
+            if (nvs_open("slip-router", NVS_READONLY, &hr) == ESP_OK) {
+                nvs_get_str(hr, "ssid", ssid, &ns);
+                nvs_get_str(hr, "pass", pass, &np);
+                nvs_close(hr);
+            }
+            wifi_config_t wc = {0};
+            size_t n = strnlen(ssid, sizeof wc.sta.ssid);
+            memcpy(wc.sta.ssid, ssid, n);
+            n = strnlen(pass, sizeof wc.sta.password);
+            memcpy(wc.sta.password, pass, n);
+            wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
             cdc_print("\r\nreconnecting...\r\n");
             esp_wifi_disconnect();
+            esp_wifi_set_config(WIFI_IF_STA, &wc);
             esp_wifi_connect();
             r_ok();
         }
     } else if (!strcmp(key, "SSID")) {
         nvs_handle_t h;
         if (val && eq) {
+            disk_logf("nvs/AT$SSID=: writing \"%s\"", val);
             if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) { r_error(); return; }
             nvs_set_str(h, "ssid", val);
             nvs_commit(h); nvs_close(h);
@@ -680,6 +703,7 @@ static void handle_dollar(char *s) {
     } else if (!strcmp(key, "PASS")) {
         nvs_handle_t h;
         if (val && eq) {
+            disk_logf("nvs/AT$PASS=: writing len=%zu", strlen(val));
             if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) { r_error(); return; }
             nvs_set_str(h, "pass", val);
             nvs_commit(h); nvs_close(h);
@@ -786,7 +810,15 @@ static void handle_dollar(char *s) {
         const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
         if (!next) { cdc_print("\r\nOTA NOPART\r\n"); r_error(); return; }
         esp_ota_handle_t h = 0;
-        if (esp_ota_begin(next, (size_t)sz, &h) != ESP_OK) {
+        /* Pass OTA_SIZE_UNKNOWN, not the actual size -- this matches what
+         * the working HTTP OTA path does. Passing the explicit size made
+         * the boot partition flip silently fail: esp_ota_set_boot_partition
+         * returned ESP_OK but the bootloader kept choosing the previous
+         * (VALID) partition on the next reboot. Symptom: flash.sh
+         * reported success, post-reboot AT echoed back, but /status
+         * showed the previous git version. Burned a session on this.
+         * See [[ota-size-unknown]]. */
+        if (esp_ota_begin(next, OTA_SIZE_UNKNOWN, &h) != ESP_OK) {
             cdc_print("\r\nOTA BEGIN-FAIL\r\n"); r_error(); return;
         }
         cdc_print("\r\nOTA READY\r\n");

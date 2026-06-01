@@ -34,6 +34,7 @@
 #include "esp_flash.h"
 #include "esp_psram.h"
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_http_server.h"
@@ -174,6 +175,56 @@ static esp_err_t h_status(httpd_req_t *req) {
         (unsigned long)esp_get_minimum_free_heap_size());
     (void)n;
     return send_text(req, "200 OK", "application/json", buf);
+}
+
+/* GET /partitions -- dump OTA partition layout + which one is running +
+ * which one the bootloader will pick next + each app partition's state
+ * (NEW / PENDING_VERIFY / VALID / INVALID / ABORTED / UNDEFINED).
+ * Diagnostic for "OTA flash succeeded but old firmware still booting":
+ * if the running partition isn't the boot partition, the bootloader
+ * rolled back; the state column says why. */
+static esp_err_t h_partitions(httpd_req_t *req) {
+    const esp_partition_t *run  = esp_ota_get_running_partition();
+    const esp_partition_t *boot = esp_ota_get_boot_partition();
+
+    char buf[1024];
+    int n = 0;
+    n += snprintf(buf+n, sizeof buf - n,
+        "running: %s @ 0x%lx (subtype %d)\n"
+        "boot:    %s @ 0x%lx (subtype %d)\n",
+        run  ? run->label  : "?", (unsigned long)(run  ? run->address  : 0),
+        run  ? run->subtype: -1,
+        boot ? boot->label : "?", (unsigned long)(boot ? boot->address : 0),
+        boot ? boot->subtype: -1);
+
+    esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_APP,
+                                                     ESP_PARTITION_SUBTYPE_ANY, NULL);
+    while (it) {
+        const esp_partition_t *p = esp_partition_get(it);
+        esp_ota_img_states_t st = ESP_OTA_IMG_UNDEFINED;
+        esp_err_t e = esp_ota_get_state_partition(p, &st);
+        const char *sn;
+        switch (st) {
+            case ESP_OTA_IMG_NEW:            sn = "NEW";            break;
+            case ESP_OTA_IMG_PENDING_VERIFY: sn = "PENDING_VERIFY"; break;
+            case ESP_OTA_IMG_VALID:          sn = "VALID";          break;
+            case ESP_OTA_IMG_INVALID:        sn = "INVALID";        break;
+            case ESP_OTA_IMG_ABORTED:        sn = "ABORTED";        break;
+            case ESP_OTA_IMG_UNDEFINED:      sn = "UNDEFINED";      break;
+            default:                         sn = "?";              break;
+        }
+        n += snprintf(buf+n, sizeof buf - n,
+            "  %-8s @ 0x%06lx size=0x%lx state=%s (rc=%d)%s%s\n",
+            p->label, (unsigned long)p->address, (unsigned long)p->size,
+            sn, (int)e,
+            (run  && run->address  == p->address) ? "  <-running" : "",
+            (boot && boot->address == p->address) ? " <-boot"     : "");
+        it = esp_partition_next(it);
+    }
+    esp_partition_iterator_release(it);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_send(req, buf, n);
+    return ESP_OK;
 }
 
 static esp_err_t h_reset(httpd_req_t *req) {
@@ -472,6 +523,7 @@ static void httpd_start_once(void) {
         { .uri = "/mode",      .method = HTTP_POST,   .handler = h_mode,      .user_ctx = NULL },
         { .uri = "/mode",      .method = HTTP_GET,    .handler = h_mode,      .user_ctx = NULL },
         { .uri = "/slip-stats",.method = HTTP_GET,    .handler = h_slip_stats,.user_ctx = NULL },
+        { .uri = "/partitions",.method = HTTP_GET,    .handler = h_partitions,.user_ctx = NULL },
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
         httpd_register_uri_handler(s_httpd, &routes[i]);
@@ -512,12 +564,16 @@ static void load_wifi_creds(char ssid[33], char pass[65]) {
     size_t n;
     ssid[0] = 0; pass[0] = 0;
     s_creds_from_nvs = false;
-    if (nvs_open("slip-router", NVS_READONLY, &h) == ESP_OK) {
-        n = 33; nvs_get_str(h, "ssid", ssid, &n);
-        n = 65; nvs_get_str(h, "pass", pass, &n);
+    esp_err_t e_open = nvs_open("slip-router", NVS_READONLY, &h);
+    esp_err_t e_ssid = ESP_FAIL, e_pass = ESP_FAIL;
+    if (e_open == ESP_OK) {
+        n = 33; e_ssid = nvs_get_str(h, "ssid", ssid, &n);
+        n = 65; e_pass = nvs_get_str(h, "pass", pass, &n);
         nvs_close(h);
         if (ssid[0]) s_creds_from_nvs = true;
     }
+    disk_logf("nvs/load: open=%d ssid=%d \"%s\" pass=%d (%zu B)",
+              (int)e_open, (int)e_ssid, ssid, (int)e_pass, strlen(pass));
     if (!ssid[0]) {
         copy_z(ssid, 33, WIFI_SSID_DEFAULT);
         copy_z(pass, 65, WIFI_PASS_DEFAULT);
@@ -531,6 +587,8 @@ static void load_wifi_creds(char ssid[33], char pass[65]) {
  * the creds didn't already come from NVS (avoids needless flash
  * wear). */
 static void save_wifi_creds_if_new(const char *ssid, const char *pass) {
+    disk_logf("nvs/bootstrap-save: from_nvs=%d ssid[0]=%d \"%s\"",
+              s_creds_from_nvs ? 1 : 0, (int)ssid[0], ssid);
     if (s_creds_from_nvs) return;
     if (!ssid[0]) return;
     nvs_handle_t h;
@@ -540,7 +598,7 @@ static void save_wifi_creds_if_new(const char *ssid, const char *pass) {
     nvs_commit(h);
     nvs_close(h);
     s_creds_from_nvs = true;
-    disk_logf("wifi: bootstrap creds saved to NVS");
+    disk_logf("nvs/bootstrap-save: WROTE ssid=\"%s\"", ssid);
 }
 
 /* The current creds, kept in static storage so the GOT_IP handler can
@@ -553,7 +611,14 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        disk_logf("wifi disconnected; retrying");
+        /* Throttle the "retrying" log to once every ~30s so the disk-log
+         * ring buffer isn't eaten by a tight reconnect loop. */
+        static int64_t s_last_retry_log_us = 0;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s_last_retry_log_us > 30LL * 1000 * 1000) {
+            disk_logf("wifi disconnected; retrying");
+            s_last_retry_log_us = now_us;
+        }
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
