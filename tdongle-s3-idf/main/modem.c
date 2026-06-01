@@ -99,6 +99,7 @@ static volatile bool s_online = false;
 static char      s_peer[96] = {0};       /* "host:port" string for AT$STATUS */
 static TaskHandle_t s_data_task = NULL;
 static TaskHandle_t s_cdc_pump_task = NULL;
+static TaskHandle_t s_tcp_pump_task = NULL;
 
 /* Pipeline: producer (modem_data_task, recv-side, telnet IAC + +++
  * detection) pushes bytes into s_to_cdc; consumer (modem_cdc_pump_task,
@@ -108,6 +109,12 @@ static TaskHandle_t s_cdc_pump_task = NULL;
  * drains; bigger doesn't help once steady-state. */
 #define DATA_STREAM_BYTES 8192
 static StreamBufferHandle_t s_to_cdc = NULL;
+/* Reverse pipeline: producer is on_cdc_rx (TinyUSB task, CPU1) pushing
+ * raw bytes into s_to_tcp; consumer is modem_tcp_pump_task (CPU0)
+ * running the +++ guard / telnet escape / CRLF expansion + send().
+ * Same rationale as s_to_cdc -- a slow send() must not back-pressure
+ * the USB OUT EP all the way to the host. */
+static StreamBufferHandle_t s_to_tcp = NULL;
 
 /* +++ escape sequence detector. Hayes rule: 1 s of guard, then exactly
  * three '+' within 1 s, then 1 s of guard with no other data. */
@@ -382,44 +389,68 @@ static void modem_data_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-/* ---- CDC -> TCP push (called from on_cdc_rx when online) ---- */
+/* ---- CDC -> TCP push (producer side, called from on_cdc_rx) ---- */
 
+/* Hand raw CDC RX bytes off to the TCP pump task. Producer is the
+ * TinyUSB callback on CPU1; consumer runs on CPU0 with lwIP. Same
+ * back-pressure model as to_cdc(): if the stream is full the
+ * TinyUSB task blocks briefly, which is correct -- the host should
+ * also stall its OUT EP rather than letting bytes pile up nowhere. */
 static void online_push_bytes(const uint8_t *buf, size_t n) {
-    if (s_sock < 0) return;
-    uint8_t txbuf[1024];  /* worst case for telnet IAC + CRLF doubling */
-    size_t txlen = 0;
-    int64_t now = esp_timer_get_time();
+    if (!s_to_tcp || n == 0) return;
+    xStreamBufferSend(s_to_tcp, buf, n, pdMS_TO_TICKS(500));
+}
 
-    for (size_t i = 0; i < n; ++i) {
-        uint8_t ch = buf[i];
-        if (ch == '+' && s_plus_count < 3 &&
-            (s_plus_count > 0 || (now - s_last_data_us) > GUARD_US)) {
-            /* Hold the +'s back until we know whether the escape
-             * completes (3 +'s + 1 s silence) or breaks. */
-            if (txlen) { send(s_sock, txbuf, txlen, 0); txlen = 0; }
-            s_plus_count++;
-            s_plus_time_us = now;
-            continue;
-        }
-        /* Any non-'+' (or 4th '+', etc.) breaks the escape: flush the
-         * pending +'s as real data, then process this byte normally. */
-        while (s_plus_count > 0) { txbuf[txlen++] = '+'; s_plus_count--; }
+/* ---- CDC -> TCP pump (consumer side) ----
+ *
+ * Runs on CPU0 with lwIP, so send() doesn't bounce across cores. Does
+ * the per-byte +++ guard, telnet IAC escaping, NVT CR->CRLF expansion
+ * + a coalescing send(). Exits when online drops AND the inbound
+ * stream is drained. */
+static void modem_tcp_pump_task(void *arg) {
+    (void)arg;
+    static uint8_t inbuf[1024];
+    static uint8_t txbuf[2048];  /* 2x for worst-case IAC + CRLF expansion */
 
-        if (s_telnet && ch == 0x0D && !bget(s_local_on, OPT_BINARY)) {
-            /* Telnet NVT CR -> CR LF */
-            txbuf[txlen++] = 0x0D;
-            txbuf[txlen++] = 0x0A;
-        } else {
-            if (s_telnet && ch == TN_IAC) txbuf[txlen++] = TN_IAC;  /* escape */
-            txbuf[txlen++] = ch;
-        }
-        s_last_data_us = now;
+    while (s_online || (s_to_tcp && xStreamBufferBytesAvailable(s_to_tcp) > 0)) {
+        size_t got = xStreamBufferReceive(s_to_tcp, inbuf, sizeof inbuf,
+                                          pdMS_TO_TICKS(50));
+        if (got == 0 || s_sock < 0) continue;
 
-        if (txlen >= sizeof txbuf - 2) {
-            send(s_sock, txbuf, txlen, 0); txlen = 0;
+        size_t txlen = 0;
+        int64_t now = esp_timer_get_time();
+        for (size_t i = 0; i < got; ++i) {
+            uint8_t ch = inbuf[i];
+            if (ch == '+' && s_plus_count < 3 &&
+                (s_plus_count > 0 || (now - s_last_data_us) > GUARD_US)) {
+                /* Hold the +'s back until we know whether the escape
+                 * completes (3 +'s + 1 s silence) or breaks. */
+                if (txlen) { send(s_sock, txbuf, txlen, 0); txlen = 0; }
+                s_plus_count++;
+                s_plus_time_us = now;
+                continue;
+            }
+            /* Any non-'+' (or 4th '+', etc.) breaks the escape: flush
+             * the pending +'s as real data, then process this byte. */
+            while (s_plus_count > 0) { txbuf[txlen++] = '+'; s_plus_count--; }
+
+            if (s_telnet && ch == 0x0D && !bget(s_local_on, OPT_BINARY)) {
+                txbuf[txlen++] = 0x0D;
+                txbuf[txlen++] = 0x0A;
+            } else {
+                if (s_telnet && ch == TN_IAC) txbuf[txlen++] = TN_IAC;
+                txbuf[txlen++] = ch;
+            }
+            s_last_data_us = now;
+
+            if (txlen >= sizeof txbuf - 2) {
+                send(s_sock, txbuf, txlen, 0); txlen = 0;
+            }
         }
+        if (txlen) send(s_sock, txbuf, txlen, 0);
     }
-    if (txlen) send(s_sock, txbuf, txlen, 0);
+    s_tcp_pump_task = NULL;
+    vTaskDelete(NULL);
 }
 
 /* ---- AT$ command handlers ---- */
@@ -669,8 +700,12 @@ static void cmd_dial(const char *arg) {
      * slow recv doesn't idle the CDC. */
     if (!s_to_cdc) s_to_cdc = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
     else xStreamBufferReset(s_to_cdc);
+    if (!s_to_tcp) s_to_tcp = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
+    else xStreamBufferReset(s_to_tcp);
     xTaskCreatePinnedToCore(modem_cdc_pump_task, "modem_cdc",
                             3072, NULL, 16, &s_cdc_pump_task, 1);
+    xTaskCreatePinnedToCore(modem_tcp_pump_task, "modem_tcp",
+                            3072, NULL, 16, &s_tcp_pump_task, 0);
     xTaskCreatePinnedToCore(modem_data_task, "modem_data",
                             4096, NULL, 16, &s_data_task, 0);
 }
@@ -963,9 +998,14 @@ static void exec(char *line) {
             if (s_sock >= 0) {
                 s_online = true;
                 if (!s_to_cdc) s_to_cdc = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
+                if (!s_to_tcp) s_to_tcp = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
                 if (!s_cdc_pump_task) {
                     xTaskCreatePinnedToCore(modem_cdc_pump_task, "modem_cdc",
                                             3072, NULL, 16, &s_cdc_pump_task, 1);
+                }
+                if (!s_tcp_pump_task) {
+                    xTaskCreatePinnedToCore(modem_tcp_pump_task, "modem_tcp",
+                                            3072, NULL, 16, &s_tcp_pump_task, 0);
                 }
                 if (!s_data_task) {
                     xTaskCreatePinnedToCore(modem_data_task, "modem_data",
