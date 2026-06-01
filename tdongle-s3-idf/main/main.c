@@ -258,19 +258,10 @@ static esp_err_t h_type(httpd_req_t *req) {
     free(body);
     if (n < 0)
         return send_text(req, "400 Bad Request", "text/plain",
-                         "DSL parse error (see /type-log)\n");
+                         "DSL parse error (see /disk-log)\n");
     char ok[32];
     snprintf(ok, sizeof ok, "OK %d\n", n);
     return send_text(req, "200 OK", "text/plain", ok);
-}
-
-/* GET /type-log -- recent HID-typing events. Ring buffer; small. */
-static esp_err_t h_type_log(httpd_req_t *req) {
-    static char buf[6144];
-    int n = kbd_log_dump(buf, sizeof buf);
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, buf, n);
-    return ESP_OK;
 }
 
 /* GET /otadata -- dump the two ota_data sectors raw. Lets us see
@@ -711,7 +702,7 @@ static void httpd_start_once(void) {
         { .uri = "/slip-stats",.method = HTTP_GET,    .handler = h_slip_stats,.user_ctx = NULL },
         { .uri = "/partitions",.method = HTTP_GET,    .handler = h_partitions,.user_ctx = NULL },
         { .uri = "/type",      .method = HTTP_POST,   .handler = h_type,      .user_ctx = NULL },
-        { .uri = "/type-log",  .method = HTTP_GET,    .handler = h_type_log,  .user_ctx = NULL },
+        /* /type-log removed -- HID events now go to /disk-log. */
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
         httpd_register_uri_handler(s_httpd, &routes[i]);

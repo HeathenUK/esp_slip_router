@@ -34,9 +34,9 @@ extern "C" {
 
 int kbd_type(const char *s, int len);
 
-/* Copy the recent in-memory typing debug log into `out` as plain text.
- * Returns the number of bytes written, excluding the terminating NUL. */
-int kbd_log_dump(char *out, int outsz);
+/* HID typing events are logged via disk_logf with a "kbd:" prefix and
+ * surface through /disk-log -- there is no longer a separate kbd log
+ * ring or /type-log endpoint (SRAM trim 2026-06-01). */
 
 #ifdef __cplusplus
 }

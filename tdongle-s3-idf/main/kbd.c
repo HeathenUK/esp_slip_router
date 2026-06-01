@@ -20,28 +20,19 @@
 
 #include "disk.h"
 
-/* ---- in-memory typing log (small ring, like disk-log but separate) ---- */
-
-#define KBD_LOG_LINES    16    /* was 48 -- SRAM trim 2026-06-01 */
-#define KBD_LOG_LINE_LEN 96    /* was 128 -- prefix + 72-byte msg */
-#define KBD_LOG_MSG_LEN  72
-
-static portMUX_TYPE s_log_mux = portMUX_INITIALIZER_UNLOCKED;
-static char         s_log[KBD_LOG_LINES][KBD_LOG_LINE_LEN];
-static uint32_t     s_log_seq = 0;
-
+/* ---- typing log ----
+ * Unified into the shared disk_log ring (SRAM trim 2026-06-01): the
+ * kbd module no longer keeps its own ring + HTTP dump buffer. HID
+ * typing events go to disk_logf with a "kbd:" prefix and surface via
+ * /disk-log alongside everything else. Saves ~1.5 KB ring + a 6 KB
+ * HTTP scratch buffer in main.c. */
 static void kbd_logf(const char *fmt, ...) {
-    char line[KBD_LOG_MSG_LEN];
+    char line[80];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
-
-    portENTER_CRITICAL(&s_log_mux);
-    uint32_t seq = ++s_log_seq;
-    snprintf(s_log[seq % KBD_LOG_LINES], KBD_LOG_LINE_LEN, "%lu %s",
-             (unsigned long)seq, line);
-    portEXIT_CRITICAL(&s_log_mux);
+    disk_logf("kbd: %s", line);
 }
 
 static char printable_char(uint8_t c) {
@@ -234,21 +225,3 @@ int kbd_type(const char *s, int len) {
     return len;
 }
 
-int kbd_log_dump(char *out, int outsz) {
-    if (!out || outsz <= 0) return 0;
-
-    portENTER_CRITICAL(&s_log_mux);
-    uint32_t seq = s_log_seq;
-    uint32_t first = (seq > KBD_LOG_LINES) ? (seq - KBD_LOG_LINES + 1) : 1;
-    int n = 0;
-    for (uint32_t cur = first; cur <= seq && n < outsz - 1; ++cur) {
-        int wrote = snprintf(out + n, (size_t)(outsz - n), "%s\n",
-                             s_log[cur % KBD_LOG_LINES]);
-        if (wrote < 0) break;
-        if (wrote >= outsz - n) { n = outsz - 1; break; }
-        n += wrote;
-    }
-    portEXIT_CRITICAL(&s_log_mux);
-    out[n] = 0;
-    return n;
-}

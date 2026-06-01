@@ -133,10 +133,21 @@ CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 # full window-worth of in-flight data behind the slow drain, taking
 # min_free_heap to 728 bytes. 16 KB still lets us run a full BDP at
 # the macOS CDC rate (RTT*cap ~= 10 KB on internet, much less on LAN)
-# and quarters the worst-case heap held during downloads vs the
+# and shrinks the worst-case heap held during downloads vs the
 # default. CDC is the bottleneck, not TCP window, so this doesn't
 # slow real-world throughput on our target hosts.
-CONFIG_LWIP_TCP_WND_DEFAULT=16384
+#
+# 4 KB. The pump tasks are now pre-created at modem_init (persistent,
+# parked between dials) instead of spawned per-dial, so a telnet
+# banner flood on connect can no longer starve task creation. But
+# that makes the three task stacks (~10 KB) permanent, lowering
+# baseline free heap to ~14 KB. During a slow-CDC download (macOS
+# ~100 KB/s, CHUSB ~50 KB/s) the held backlog is TCP_WND of lwIP
+# pbufs + the pre-allocated stream buffer; an 8 KB window took
+# min_free_heap to 220 bytes on a 1 MB fetch. 4 KB (>2*MSS, ~3
+# segments) keeps the download backlog bounded with comfortable
+# headroom. BDP at our CDC rates is <3 KB so no throughput cost. */
+CONFIG_LWIP_TCP_WND_DEFAULT=4096
 # Send buffer (per-pcb queue lwIP will accept from the app before
 # blocking send()). Default IDF v5.5 is 5760 (4*MSS) which caps the
 # upload BDP at ~5.6 KB in-flight -- enough for 56 Kbps but throttles
