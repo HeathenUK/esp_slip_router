@@ -158,6 +158,26 @@ static volatile uint32_t s_max_alloc_wait_us  = 0; /* time blocked waiting on cl
  * normal. */
 static volatile bool    s_dongle_owns = false;
 static volatile int64_t s_last_msc_write_us = 0;
+/* Simulated media-present state. POST /eject sets this false: the next
+ * Test Unit Ready reports "medium not present" (sense 3Ah), so the USB
+ * host (macOS fskit / DOS CHUSB) sees the disk vanish and unmounts it,
+ * clearing the dual-mount hazard WITHOUT a manual diskutil/eject on the
+ * host. POST /mount sets it true again + arms UNIT_ATTENTION so the
+ * host re-detects and remounts. Defaults true (normal removable disk). */
+static volatile bool    s_medium_present = true;
+/* Updated on ANY SCSI callback, including Test Unit Ready. A host
+ * with the volume mounted polls TUR roughly once a second even when
+ * idle, so a recent timestamp here means "the host currently has the
+ * MSC volume mounted." The raw-FAT HTTP handlers use this to refuse
+ * device-side FAT access while the host owns it -- mounting FATFS on
+ * the dongle side while the host's kernel also has the volume mounted
+ * corrupts the FAT and (observed) wedges the single httpd worker on
+ * the contended flash. The dongle can't unmount the host; it can only
+ * decline and tell the caller to unmount first. */
+static volatile int64_t s_last_msc_activity_us = 0;   /* TUR + read + write */
+static volatile int64_t s_last_msc_io_us       = 0;   /* read10 + write10 only */
+#define DISK_HOST_MOUNTED_GUARD_US 3000000  /* 3 s -- ~3 missed TUR polls */
+#define DISK_HOST_IO_GUARD_US      1000000  /* 1 s of actual data transfer */
 
 /* ---- cache helpers (multi-slot, async) ----
  *
@@ -594,10 +614,49 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 }
 
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
-    (void)lun;
     s_cb_tur++;
     s_last_op = 'T';
+    /* Software-ejected: report medium not present so the host unmounts.
+     * Don't stamp the activity heartbeat here -- we WANT disk_host_mounted
+     * to go false promptly while ejected so device-side FAT ops proceed. */
+    if (!s_medium_present) {
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00); /* medium not present */
+        return false;
+    }
+    /* TUR is polled ~1/s by a host that has the volume mounted, even
+     * when idle -- this is our "host has it mounted" heartbeat. */
+    s_last_msc_activity_us = esp_timer_get_time();
     return s_wl != WL_INVALID_HANDLE;
+}
+
+/* True if the USB host appears to have the MSC volume mounted (it
+ * polled TUR or did any SCSI op within the last few seconds). Used to
+ * gate device-side FAT *writes* -- mutating the FAT while any host has
+ * it mounted corrupts it. */
+bool disk_host_mounted(void) {
+    /* If we've software-ejected, the host is locked out at the SCSI
+     * level (TUR returns medium-not-present) and cannot be touching
+     * the FAT regardless of how recently it last polled -- so the
+     * guard is definitionally clear. Without this, the 3 s TUR window
+     * would spuriously block a device-side write for up to 3 s after
+     * an eject. */
+    if (!s_medium_present) return false;
+    return (esp_timer_get_time() - s_last_msc_activity_us)
+           < DISK_HOST_MOUNTED_GUARD_US;
+}
+
+/* True if the host is actively transferring data (a READ10 or WRITE10
+ * within the last second), as opposed to merely mounted-and-idle
+ * (TUR polling only). Used to gate device-side FAT *reads*: a mounted-
+ * idle host (e.g. DOS at the prompt after a program exits) is safe to
+ * read alongside, preserving the "pull PROFILE.LOG over HTTP without
+ * unplugging" workflow; but a host mid-transfer (macOS fskit doing
+ * concurrent prefetch during a large GET) would dual-mount-wedge, so
+ * we refuse those. */
+bool disk_host_active_io(void) {
+    if (!s_medium_present) return false;   /* ejected -> host locked out */
+    return (esp_timer_get_time() - s_last_msc_io_us)
+           < DISK_HOST_IO_GUARD_US;
 }
 
 void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size) {
@@ -631,6 +690,8 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
     s_last_lba = lba;
     s_last_size = bufsize;
     int64_t t0 = esp_timer_get_time();
+    s_last_msc_activity_us = t0;
+    s_last_msc_io_us = t0;
     if (s_wl == WL_INVALID_HANDLE) return -1;
 
     uint32_t addr = lba * (uint32_t)MSC_BLOCK_SIZE + offset;
@@ -722,6 +783,8 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
     s_last_size = bufsize;
     int64_t t0 = esp_timer_get_time();
     s_last_msc_write_us = t0;
+    s_last_msc_activity_us = t0;
+    s_last_msc_io_us = t0;
     if (s_wl == WL_INVALID_HANDLE) return -1;
     if (s_dongle_owns) {
         /* Firmware is mid-FAT-write via the raw-FAT HTTP path.
@@ -909,6 +972,32 @@ void disk_release_to_usb(void) {
      * changed" -- the right code for "I touched the volume." */
     tud_msc_set_sense(0, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
 }
+
+/* Software eject: flush dirty cache to flash, then report medium-not-
+ * present on the next TUR so the USB host unmounts the volume. After
+ * this returns, disk_host_mounted() goes false within the guard window
+ * and device-side FAT ops (HTTP /fs) become safe. Idempotent. */
+void disk_eject(void) {
+    xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+    wb_flush_all_sync();          /* commit anything dirty before "removing" */
+    s_medium_present = false;
+    xSemaphoreGive(s_io_mutex);
+    disk_logf("disk: software eject (medium not present)");
+}
+
+/* Re-present the medium and arm UNIT_ATTENTION so the host re-detects
+ * and remounts. Invalidate the cache first since FATFS-side writes may
+ * have changed flash while the host was away. Idempotent. */
+void disk_mount(void) {
+    xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+    wb_invalidate_all();
+    s_medium_present = true;
+    xSemaphoreGive(s_io_mutex);
+    tud_msc_set_sense(0, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
+    disk_logf("disk: software mount (medium present, UA armed)");
+}
+
+bool disk_medium_present(void) { return s_medium_present; }
 
 /* ---- JSON snapshot for /usb-stats ---- */
 

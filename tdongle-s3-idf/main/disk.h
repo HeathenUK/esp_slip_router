@@ -52,6 +52,34 @@ esp_err_t disk_take_for_firmware(void);
 void      disk_release_to_usb(void);
 bool      disk_dongle_owns(void);
 
+/* True if the USB host currently appears to have the MSC volume
+ * mounted (it polled Test Unit Ready or did any SCSI op within the
+ * last few seconds). Device-side FAT access (HTTP /fs read, write,
+ * list, delete) must refuse while this is true: a second FATFS mount
+ * on the dongle side while the host's kernel also has the volume
+ * mounted corrupts the FAT and wedges the HTTP worker on the
+ * contended flash. The HTTP layer returns 409 Conflict so the caller
+ * unmounts the volume first (the dosongle.sh helper does this). */
+bool      disk_host_mounted(void);
+
+/* True if the host is actively transferring data (READ10/WRITE10
+ * within the last second), vs merely mounted-and-idle. Device-side
+ * FAT *reads* gate on this (not disk_host_mounted) so a mounted-idle
+ * DOS host at the prompt can still serve HTTP log pulls, while a host
+ * mid-transfer (macOS fskit prefetch) is refused to avoid the
+ * dual-mount wedge. */
+bool      disk_host_active_io(void);
+
+/* Software eject / mount. disk_eject() flushes the cache and reports
+ * medium-not-present on the next Test Unit Ready, so the USB host
+ * unmounts the volume (clears the dual-mount hazard without a manual
+ * host-side eject). disk_mount() re-presents the medium + arms
+ * UNIT_ATTENTION so the host remounts. disk_medium_present() reports
+ * the current state. Exposed over HTTP as POST /eject and POST /mount. */
+void      disk_eject(void);
+void      disk_mount(void);
+bool      disk_medium_present(void);
+
 /* fat.c uses this to register the WL handle with FATFS' diskio
  * layer. Returns WL_INVALID_HANDLE before disk_init() completes. */
 #include "wear_levelling.h"

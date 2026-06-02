@@ -519,7 +519,34 @@ static bool list_json_cb(const char *name, uint32_t size, bool is_dir, void *ctx
     return true;
 }
 
+/* Both gates mount FATFS on the dongle side; doing that concurrently
+ * with the host's own FATFS mount on the same WL flash corrupts the
+ * FAT and (observed on macOS fskit, large read) wedges the single
+ * httpd worker indefinitely. Returning 409 fast keeps HTTP responsive
+ * and tells the caller to unmount/eject first.
+ *
+ * Writes use the strict gate (any host mount, incl. idle TUR polling)
+ * -- mutating the FAT while a host has it mounted is never safe.
+ * Reads use the lenient gate (host actively transferring data) so a
+ * mounted-idle DOS host at the prompt can still serve HTTP log pulls,
+ * the documented "pull PROFILE.LOG without unplugging" workflow. */
+static esp_err_t fs_reject_write_if_host_mounted(httpd_req_t *req) {
+    if (disk_host_mounted())
+        return send_text(req, "409 Conflict", "text/plain",
+                         "host has the volume mounted; unmount it first "
+                         "(dosongle.sh, POST /eject, or eject /Volumes/DOSONGLE)\n");
+    return ESP_OK;
+}
+static esp_err_t fs_reject_read_if_host_busy(httpd_req_t *req) {
+    if (disk_host_active_io())
+        return send_text(req, "409 Conflict", "text/plain",
+                         "host is actively using the volume; retry once idle "
+                         "or unmount it (dosongle.sh / POST /eject)\n");
+    return ESP_OK;
+}
+
 static esp_err_t h_list(httpd_req_t *req) {
+    if (fs_reject_read_if_host_busy(req) != ESP_OK) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send_chunk(req, "[\n", 2);
     req->user_ctx = NULL;   /* re-used as "first-entry?" flag inside list_json_cb */
@@ -535,6 +562,7 @@ static esp_err_t fat_out_to_httpd(const void *in, size_t n, void *ctx) {
 }
 
 static esp_err_t h_fs_get(httpd_req_t *req) {
+    if (fs_reject_read_if_host_busy(req) != ESP_OK) return ESP_OK;
     char name[13];
     if (!fat_uri_to_name83(req->uri, name))
         return send_text(req, "400 Bad Request", "text/plain", "bad name (8.3 only)\n");
@@ -559,6 +587,7 @@ static esp_err_t fat_in_from_httpd(void *out, size_t cap, size_t *got, void *ctx
 }
 
 static esp_err_t h_fs_put(httpd_req_t *req) {
+    if (fs_reject_write_if_host_mounted(req) != ESP_OK) return ESP_OK;
     char name[13];
     if (!fat_uri_to_name83(req->uri, name))
         return send_text(req, "400 Bad Request", "text/plain", "bad name (8.3 only)\n");
@@ -575,6 +604,7 @@ static esp_err_t h_fs_put(httpd_req_t *req) {
 }
 
 static esp_err_t h_fs_delete(httpd_req_t *req) {
+    if (fs_reject_write_if_host_mounted(req) != ESP_OK) return ESP_OK;
     char name[13];
     if (!fat_uri_to_name83(req->uri, name))
         return send_text(req, "400 Bad Request", "text/plain", "bad name (8.3 only)\n");
@@ -588,6 +618,24 @@ static esp_err_t h_fs_delete(httpd_req_t *req) {
     if (e != ESP_OK)
         return send_text(req, "500 Internal Server Error", "text/plain", "delete failed\n");
     return send_text(req, "200 OK", "text/plain", "OK\n");
+}
+
+/* POST /eject -- simulate media removal so the USB host unmounts the
+ * volume, clearing the dual-mount hazard for device-side /fs ops.
+ * EFFECTIVE ON macOS (fskit honours medium-not-present). INERT ON
+ * DOS/CHUSB (no post-enum TUR polling on a composite device) -- see
+ * ~/CH375/DOS-EJECT-REMOUNT-IDEAS-2026-06-02.md. */
+static esp_err_t h_eject(httpd_req_t *req) {
+    disk_eject();
+    return send_text(req, "200 OK", "text/plain",
+                     "ejected (host should unmount; macOS only -- DOS needs replug/CHUSB cmd)\n");
+}
+
+/* POST /mount -- re-present the medium + arm UNIT_ATTENTION so the host
+ * remounts. Same macOS-effective / DOS-inert caveat as /eject. */
+static esp_err_t h_mount(httpd_req_t *req) {
+    disk_mount();
+    return send_text(req, "200 OK", "text/plain", "mounted (medium present)\n");
 }
 
 /* GET /slip-stats -- SLIP path counters as JSON. Pollable over WiFi
@@ -702,6 +750,8 @@ static void httpd_start_once(void) {
         { .uri = "/slip-stats",.method = HTTP_GET,    .handler = h_slip_stats,.user_ctx = NULL },
         { .uri = "/partitions",.method = HTTP_GET,    .handler = h_partitions,.user_ctx = NULL },
         { .uri = "/type",      .method = HTTP_POST,   .handler = h_type,      .user_ctx = NULL },
+        { .uri = "/eject",     .method = HTTP_POST,   .handler = h_eject,     .user_ctx = NULL },
+        { .uri = "/mount",     .method = HTTP_POST,   .handler = h_mount,     .user_ctx = NULL },
         /* /type-log removed -- HID events now go to /disk-log. */
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
