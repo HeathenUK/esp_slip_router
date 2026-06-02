@@ -1016,6 +1016,25 @@ void disk_mount(void) {
 
 bool disk_medium_present(void) { return s_medium_present; }
 
+/* Reformat the volume to a clean FAT12 superfloppy at runtime. Wipes
+ * all files -- used to recover from a corrupted FAT (e.g. a dual-access
+ * write that left a broken cluster chain). Holds s_io_mutex so it's
+ * exclusive against the MSC path, invalidates the write-back cache,
+ * rebuilds the filesystem, and arms a media-change so the host re-reads
+ * the fresh FAT. Returns the format result. */
+esp_err_t disk_format(void) {
+    if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
+    disk_logf("disk: runtime FORMAT requested (wipes all files)");
+    xSemaphoreTake(s_io_mutex, portMAX_DELAY);
+    wb_invalidate_all();
+    esp_err_t e = format_partition_superfloppy();
+    wb_invalidate_all();   /* drop anything read during format */
+    s_report_media_change = true;   /* host re-reads on next TUR */
+    xSemaphoreGive(s_io_mutex);
+    disk_logf("disk: runtime FORMAT %s", e == ESP_OK ? "OK" : esp_err_to_name(e));
+    return e;
+}
+
 /* Serialize a device-side FATFS operation against the MSC SCSI path.
  * The MSC read10/write10 callbacks hold s_io_mutex for each op, so a
  * caller that holds it across its whole FATFS mount+read/write runs

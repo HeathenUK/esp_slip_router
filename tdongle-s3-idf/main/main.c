@@ -654,6 +654,17 @@ static esp_err_t h_mount(httpd_req_t *req) {
     return send_text(req, "200 OK", "text/plain", "mounted (medium present)\n");
 }
 
+/* POST /format -- reformat the MSC volume to a clean FAT12 superfloppy.
+ * WIPES ALL FILES. Recovery for a corrupted FAT. */
+static esp_err_t h_format(httpd_req_t *req) {
+    esp_err_t e = disk_format();
+    if (e != ESP_OK)
+        return send_text(req, "500 Internal Server Error", "text/plain",
+                         "format failed\n");
+    return send_text(req, "200 OK", "text/plain",
+                     "formatted: clean FAT12 superfloppy, all files wiped\n");
+}
+
 /* GET /slip-stats -- SLIP path counters as JSON. Pollable over WiFi
  * while a SLIP test is running on DOS; diff two snapshots to derive
  * the live byte/packet rate. pbuf_fails > 0 is a smoking gun (lwIP
@@ -769,6 +780,7 @@ static void httpd_start_once(void) {
         { .uri = "/type",      .method = HTTP_POST,   .handler = h_type,      .user_ctx = NULL },
         { .uri = "/eject",     .method = HTTP_POST,   .handler = h_eject,     .user_ctx = NULL },
         { .uri = "/mount",     .method = HTTP_POST,   .handler = h_mount,     .user_ctx = NULL },
+        { .uri = "/format",    .method = HTTP_POST,   .handler = h_format,    .user_ctx = NULL },
         /* /type-log removed -- HID events now go to /disk-log. */
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)

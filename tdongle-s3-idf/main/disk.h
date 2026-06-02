@@ -80,6 +80,10 @@ void      disk_eject(void);
 void      disk_mount(void);
 bool      disk_medium_present(void);
 
+/* Reformat the volume to a clean FAT12 superfloppy at runtime (wipes
+ * all files). Recovery for a corrupted FAT. Exposed as POST /format. */
+esp_err_t disk_format(void);
+
 /* Serialize a device-side FATFS op against the MSC SCSI path by holding
  * the shared I/O mutex across the whole mount+read/write. Eliminates
  * WL-layer contention with a storming host (the original /fs wedge) and
