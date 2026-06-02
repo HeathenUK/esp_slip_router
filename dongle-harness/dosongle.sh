@@ -78,36 +78,24 @@ dosongle_swap() {
   [[ "$cur" == "$target" ]] || { echo "dosongle_swap: want=$target got=$cur" >&2; return 3; }
 }
 
-# Release the volume from the USB host so device-side FAT access is safe.
+# No forced dismount. The firmware's 409 guard is the safeguard: it
+# refuses /fs reads while the host is actively transferring and /fs
+# writes while the host has the volume mounted, returning fast instead
+# of wedging. Under normal use the host isn't contending (reads while
+# idle are safe; writes happen when the volume isn't host-mounted), so
+# plain ops just work; a 409 is the safety net telling you to retry
+# when idle or unmount manually.
 #
-# The firmware now refuses /fs reads (409) while the host is actively
-# doing block I/O and /fs writes while the host has the volume mounted
-# at all -- a dual FATFS mount corrupts the FAT and can wedge the httpd
-# worker. POST /eject tells the dongle to report medium-not-present, so
-# the host (macOS fskit) unmounts AND its DiskArbitration stops probing
-# the raw block device -- more thorough than `diskutil unmount`, which
-# leaves the kernel still poking the device. We do both on Darwin
-# (diskutil first to drop the mount cleanly, then /eject to stop residual
-# probing), then give the activity guards a beat to clear.
-#
-# NB: /eject is macOS-effective only. On DOS/CHUSB it's inert (CHUSB
-# doesn't poll TUR post-enum on a composite device) -- see
-# ~/CH375/DOS-EJECT-REMOUNT-IDEAS-2026-06-02.md.
-dosongle_host_release() {
-  if [[ "$(uname)" == "Darwin" && -d /Volumes/DOSONGLE ]]; then
-    diskutil unmount /Volumes/DOSONGLE >/dev/null 2>&1 || true
-  fi
-  dosongle_curl_any -X POST "$BASE_URL/eject" >/dev/null 2>&1 || true
-  sleep 1   # let disk_host_mounted()/disk_host_active_io() guards lapse
-}
-
-# Re-present the medium so the host remounts. Pairs with host_release.
-dosongle_host_restore() {
-  dosongle_curl_any -X POST "$BASE_URL/mount" >/dev/null 2>&1 || true
-}
-
-# Back-compat alias -- old callers said mac_unmount.
-dosongle_mac_unmount() { dosongle_host_release; }
+# We deliberately do NOT call POST /eject here: on macOS that's a
+# one-way door (diskarbitrationd tears down the IOMedia node and won't
+# rebuild it from any device-side signal -- verified, even a full USB
+# re-enumeration doesn't bring it back; only a physical replug does).
+# If you genuinely need the host off the volume, `diskutil unmount
+# /Volumes/DOSONGLE` is the reversible host-side primitive (pairs with
+# `diskutil mount`); /eject is reserved as a manual "force off" hammer.
+dosongle_host_release()  { :; }   # retained as no-op for call-site compatibility
+dosongle_host_restore()  { :; }
+dosongle_mac_unmount()   { :; }   # back-compat alias
 
 # Derive the 8.3 uppercase remote name from a local path.
 dosongle_remote_name() {

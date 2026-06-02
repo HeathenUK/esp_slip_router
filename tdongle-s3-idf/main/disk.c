@@ -165,6 +165,15 @@ static volatile int64_t s_last_msc_write_us = 0;
  * host. POST /mount sets it true again + arms UNIT_ATTENTION so the
  * host re-detects and remounts. Defaults true (normal removable disk). */
 static volatile bool    s_medium_present = true;
+/* One-shot: when set, the next Test Unit Ready returns CHECK CONDITION
+ * with UNIT_ATTENTION (28h "not-ready-to-ready, medium may have
+ * changed") instead of GOOD. This is the SCSI media-insertion event a
+ * removable device raises so the host re-reads capacity + block 0 and
+ * remounts -- WITHOUT a USB re-enumeration (so CDC/HID are untouched).
+ * disk_mount() arms it; the next TUR consumes it. Just setting the
+ * sense via tud_msc_set_sense while TUR returns GOOD is NOT enough --
+ * macOS only rebuilds the /dev node on a not-ready->ready TUR edge. */
+static volatile bool    s_report_media_change = false;
 /* Updated on ANY SCSI callback, including Test Unit Ready. A host
  * with the volume mounted polls TUR roughly once a second even when
  * idle, so a recent timestamp here means "the host currently has the
@@ -623,6 +632,14 @@ bool tud_msc_test_unit_ready_cb(uint8_t lun) {
         tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00); /* medium not present */
         return false;
     }
+    /* First TUR after a /mount: raise the media-changed UNIT_ATTENTION so
+     * the host treats it as a fresh insertion and rebuilds the volume.
+     * One-shot -- subsequent TURs report ready. */
+    if (s_report_media_change) {
+        s_report_media_change = false;
+        tud_msc_set_sense(lun, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
+        return false;
+    }
     /* TUR is polled ~1/s by a host that has the volume mounted, even
      * when idle -- this is our "host has it mounted" heartbeat. */
     s_last_msc_activity_us = esp_timer_get_time();
@@ -992,9 +1009,9 @@ void disk_mount(void) {
     xSemaphoreTake(s_io_mutex, portMAX_DELAY);
     wb_invalidate_all();
     s_medium_present = true;
+    s_report_media_change = true;   /* next TUR raises media-changed UA */
     xSemaphoreGive(s_io_mutex);
-    tud_msc_set_sense(0, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
-    disk_logf("disk: software mount (medium present, UA armed)");
+    disk_logf("disk: software mount (medium present, media-change UA armed for next TUR)");
 }
 
 bool disk_medium_present(void) { return s_medium_present; }
