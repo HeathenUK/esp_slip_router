@@ -1016,6 +1016,23 @@ void disk_mount(void) {
 
 bool disk_medium_present(void) { return s_medium_present; }
 
+/* Serialize a device-side FATFS operation against the MSC SCSI path.
+ * The MSC read10/write10 callbacks hold s_io_mutex for each op, so a
+ * caller that holds it across its whole FATFS mount+read/write runs
+ * with zero WL-layer contention -- no slow/wedged interleaving with a
+ * storming host. Bounded acquire: returns false (-> HTTP 409) only if
+ * the MSC path is so busy it never yields the mutex within timeout_ms,
+ * which in practice doesn't happen because each MSC op releases it.
+ * This replaces the host-activity heuristic guard, which spuriously
+ * 409'd whenever a host (macOS) merely polled the LUN. */
+bool disk_fatfs_lock(uint32_t timeout_ms) {
+    if (!s_io_mutex) return false;
+    return xSemaphoreTake(s_io_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+void disk_fatfs_unlock(void) {
+    if (s_io_mutex) xSemaphoreGive(s_io_mutex);
+}
+
 /* ---- JSON snapshot for /usb-stats ---- */
 
 size_t disk_stats_json(char *out, size_t cap) {

@@ -231,3 +231,15 @@ esp_err_t usb_start(void) {
     ESP_LOGI(TAG, "composite USB up: MSC + HID + CDC, serial=%s", s_serial_str);
     return ESP_OK;
 }
+
+void usb_soft_reconnect(unsigned hold_ms) {
+    disk_logf("usb: soft reconnect -- tud_disconnect, hold %ums", hold_ms);
+    /* Drop the D+ pullup: host sees a clean USB device removal. */
+    tud_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(hold_ms));
+    /* Re-assert: host sees a fresh insertion and re-enumerates from
+     * scratch -- new descriptors fetch, fresh storage probe, fresh
+     * diskarbitration session. */
+    tud_connect();
+    disk_logf("usb: soft reconnect -- tud_connect (re-enumerating)");
+}

@@ -42,10 +42,22 @@ static DSTATUS d_status(unsigned char pdrv) { (void)pdrv; return 0; }
 static DRESULT d_read(unsigned char pdrv, unsigned char *buff, uint32_t sector, unsigned count) {
     (void)pdrv;
     /* wl_read takes arbitrary byte ranges -- we just pass through.
-     * Reads don't need RMW. */
+     * Reads don't need RMW.
+     *
+     * Hold the shared I/O mutex for this sector op so it's mutually
+     * exclusive with the MSC read10/write10 path (which also takes it
+     * per op). Same per-op granularity as MSC, so neither side blocks
+     * the other for long -- but the dongle's wl_read never races the
+     * host's at the lower WL lock, which is what wedged the httpd
+     * worker under a storming macOS host. 3 s bounded; on the (in
+     * practice impossible) timeout we fail the sector -> FATFS read
+     * error -> HTTP 500, rather than hang. */
+    if (!disk_fatfs_lock(3000)) return RES_ERROR;
     size_t off = (size_t)sector * FAT_SECTOR_SIZE;
     size_t len = (size_t)count * FAT_SECTOR_SIZE;
-    return (wl_read(s_wl_for_diskio, off, buff, len) == ESP_OK) ? RES_OK : RES_ERROR;
+    DRESULT r = (wl_read(s_wl_for_diskio, off, buff, len) == ESP_OK) ? RES_OK : RES_ERROR;
+    disk_fatfs_unlock();
+    return r;
 }
 
 static DRESULT d_write(unsigned char pdrv, const unsigned char *buff, uint32_t sector, unsigned count) {
@@ -63,10 +75,16 @@ static DRESULT d_write(unsigned char pdrv, const unsigned char *buff, uint32_t s
         size_t chunk   = WL_SECTOR_BYTES - in_wl;
         if (chunk > len) chunk = len;
 
-        if (wl_read(s_wl_for_diskio, wl_off, rmw, WL_SECTOR_BYTES) != ESP_OK) return RES_ERROR;
+        /* Lock per 4 KB block so the read-modify-erase-write is atomic
+         * against the MSC path (a host READ/WRITE mid-RMW would see or
+         * cause a torn block). Same mutex MSC uses; released between
+         * blocks so we don't starve the USB stack. */
+        if (!disk_fatfs_lock(3000)) return RES_ERROR;
+        if (wl_read(s_wl_for_diskio, wl_off, rmw, WL_SECTOR_BYTES) != ESP_OK) { disk_fatfs_unlock(); return RES_ERROR; }
         memcpy(rmw + in_wl, buff, chunk);
-        if (wl_erase_range(s_wl_for_diskio, wl_off, WL_SECTOR_BYTES) != ESP_OK) return RES_ERROR;
-        if (wl_write(s_wl_for_diskio, wl_off, rmw, WL_SECTOR_BYTES) != ESP_OK)  return RES_ERROR;
+        if (wl_erase_range(s_wl_for_diskio, wl_off, WL_SECTOR_BYTES) != ESP_OK) { disk_fatfs_unlock(); return RES_ERROR; }
+        if (wl_write(s_wl_for_diskio, wl_off, rmw, WL_SECTOR_BYTES) != ESP_OK)  { disk_fatfs_unlock(); return RES_ERROR; }
+        disk_fatfs_unlock();
 
         off  += chunk;
         buff += chunk;

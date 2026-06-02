@@ -358,6 +358,39 @@ static esp_err_t h_reset(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* Worker: soft USB unplug/replug. Detached so the HTTP response (over
+ * WiFi, unaffected by the USB drop) returns immediately. */
+static void usb_reconnect_task(void *arg) {
+    unsigned hold_ms = (unsigned)(uintptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(150));   /* let the HTTP 200 flush first */
+    usb_soft_reconnect(hold_ms);
+    vTaskDelete(NULL);
+}
+
+/* POST /usb-reconnect -- firmware-triggered USB unplug/replug. The
+ * remote equivalent of physically replugging: forces the host to fully
+ * tear down and re-enumerate the composite, which clears a stuck
+ * host-side storage/arbitration state (macOS diskarbitrationd) that a
+ * chip reset doesn't. Drops CDC + MSC + HID for ~2 s, then they come
+ * back. Optional ?hold=<ms> (default 2000, clamped 500..5000). */
+static esp_err_t h_usb_reconnect(httpd_req_t *req) {
+    unsigned hold = 2000;
+    char q[32];
+    if (httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK) {
+        char v[8];
+        if (httpd_query_key_value(q, "hold", v, sizeof v) == ESP_OK) {
+            long h = strtol(v, NULL, 10);
+            if (h >= 500 && h <= 5000) hold = (unsigned)h;
+        }
+    }
+    send_text(req, "200 OK", "text/plain",
+              "usb reconnect: dropping USB ~2s then re-enumerating "
+              "(CDC port will blip)\n");
+    xTaskCreate(usb_reconnect_task, "usb_reconn", 3072,
+                (void *)(uintptr_t)hold, 5, NULL);
+    return ESP_OK;
+}
+
 static esp_err_t h_disk_log(httpd_req_t *req) {
     httpd_resp_set_status(req, "200 OK");
     httpd_resp_set_type(req, "text/plain");
@@ -519,34 +552,20 @@ static bool list_json_cb(const char *name, uint32_t size, bool is_dir, void *ctx
     return true;
 }
 
-/* Both gates mount FATFS on the dongle side; doing that concurrently
- * with the host's own FATFS mount on the same WL flash corrupts the
- * FAT and (observed on macOS fskit, large read) wedges the single
- * httpd worker indefinitely. Returning 409 fast keeps HTTP responsive
- * and tells the caller to unmount/eject first.
- *
- * Writes use the strict gate (any host mount, incl. idle TUR polling)
- * -- mutating the FAT while a host has it mounted is never safe.
- * Reads use the lenient gate (host actively transferring data) so a
- * mounted-idle DOS host at the prompt can still serve HTTP log pulls,
- * the documented "pull PROFILE.LOG without unplugging" workflow. */
-static esp_err_t fs_reject_write_if_host_mounted(httpd_req_t *req) {
-    if (disk_host_mounted())
-        return send_text(req, "409 Conflict", "text/plain",
-                         "host has the volume mounted; unmount it first "
-                         "(dosongle.sh, POST /eject, or eject /Volumes/DOSONGLE)\n");
-    return ESP_OK;
-}
-static esp_err_t fs_reject_read_if_host_busy(httpd_req_t *req) {
-    if (disk_host_active_io())
-        return send_text(req, "409 Conflict", "text/plain",
-                         "host is actively using the volume; retry once idle "
-                         "or unmount it (dosongle.sh / POST /eject)\n");
-    return ESP_OK;
-}
+/* The /fs handlers no longer gate on host-activity heuristics. The
+ * original dual-mount wedge (dongle FATFS read racing a storming host's
+ * MSC reads at the WL lock, hanging the httpd worker) is now prevented
+ * structurally: fat.c's diskio takes the shared I/O mutex per sector,
+ * the same mutex the MSC read10/write10 path holds, so the two are
+ * mutually exclusive and never contend at the lower WL layer. Write
+ * coherency against a live host mount is handled by disk_take_for_firmware
+ * (flush + ownership + recent-write 429) inside fat_write. The earlier
+ * disk_host_mounted()/disk_host_active_io() 409 guards were a blunt
+ * heuristic that spuriously blocked all /fs access whenever a host
+ * merely polled the LUN (e.g. macOS diskarbitration probing a volume
+ * it won't even mount) -- removed in favour of the structural lock. */
 
 static esp_err_t h_list(httpd_req_t *req) {
-    if (fs_reject_read_if_host_busy(req) != ESP_OK) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send_chunk(req, "[\n", 2);
     req->user_ctx = NULL;   /* re-used as "first-entry?" flag inside list_json_cb */
@@ -562,7 +581,6 @@ static esp_err_t fat_out_to_httpd(const void *in, size_t n, void *ctx) {
 }
 
 static esp_err_t h_fs_get(httpd_req_t *req) {
-    if (fs_reject_read_if_host_busy(req) != ESP_OK) return ESP_OK;
     char name[13];
     if (!fat_uri_to_name83(req->uri, name))
         return send_text(req, "400 Bad Request", "text/plain", "bad name (8.3 only)\n");
@@ -587,7 +605,6 @@ static esp_err_t fat_in_from_httpd(void *out, size_t cap, size_t *got, void *ctx
 }
 
 static esp_err_t h_fs_put(httpd_req_t *req) {
-    if (fs_reject_write_if_host_mounted(req) != ESP_OK) return ESP_OK;
     char name[13];
     if (!fat_uri_to_name83(req->uri, name))
         return send_text(req, "400 Bad Request", "text/plain", "bad name (8.3 only)\n");
@@ -604,7 +621,6 @@ static esp_err_t h_fs_put(httpd_req_t *req) {
 }
 
 static esp_err_t h_fs_delete(httpd_req_t *req) {
-    if (fs_reject_write_if_host_mounted(req) != ESP_OK) return ESP_OK;
     char name[13];
     if (!fat_uri_to_name83(req->uri, name))
         return send_text(req, "400 Bad Request", "text/plain", "bad name (8.3 only)\n");
@@ -739,6 +755,7 @@ static void httpd_start_once(void) {
         { .uri = "/disk-log",  .method = HTTP_GET,  .handler = h_disk_log,  .user_ctx = NULL },
         { .uri = "/ota",       .method = HTTP_POST, .handler = h_ota,       .user_ctx = NULL },
         { .uri = "/reset",     .method = HTTP_POST, .handler = h_reset,     .user_ctx = NULL },
+        { .uri = "/usb-reconnect", .method = HTTP_POST, .handler = h_usb_reconnect, .user_ctx = NULL },
         { .uri = "/usb-start", .method = HTTP_POST, .handler = h_usb_start, .user_ctx = NULL },
         { .uri = "/usb-stats", .method = HTTP_GET,  .handler = h_usb_stats, .user_ctx = NULL },
         { .uri = "/list",      .method = HTTP_GET,  .handler = h_list,      .user_ctx = NULL },

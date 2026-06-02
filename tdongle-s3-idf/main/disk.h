@@ -80,6 +80,14 @@ void      disk_eject(void);
 void      disk_mount(void);
 bool      disk_medium_present(void);
 
+/* Serialize a device-side FATFS op against the MSC SCSI path by holding
+ * the shared I/O mutex across the whole mount+read/write. Eliminates
+ * WL-layer contention with a storming host (the original /fs wedge) and
+ * replaces the host-activity heuristic guard. Bounded acquire -> false
+ * (HTTP 409) only on genuine timeout. Lock/unlock must be balanced. */
+bool      disk_fatfs_lock(uint32_t timeout_ms);
+void      disk_fatfs_unlock(void);
+
 /* fat.c uses this to register the WL handle with FATFS' diskio
  * layer. Returns WL_INVALID_HANDLE before disk_init() completes. */
 #include "wear_levelling.h"
