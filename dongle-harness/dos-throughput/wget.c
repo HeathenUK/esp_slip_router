@@ -346,7 +346,12 @@ int main(int argc, char **argv)
         {
             unsigned long written = 0UL;
             unsigned long last_byte_ticks, last_progress_ticks;
-            const unsigned long silence_ticks = 90UL;   /* ~5s */
+            /* Silence (no-byte) timeout. With Content-Length we KNOW more is
+             * coming until written==len, so be patient (~15s) -- a slow
+             * consumer (DOS disk write) or a retransmit can open a multi-second
+             * gap near the tail, and bailing at 5s truncated the file. Without
+             * Content-Length the silence IS how we detect EOF, so keep it short. */
+            const unsigned long silence_ticks = have_clen ? 273UL : 90UL; /* 15s / 5s */
             const unsigned long max_ticks = 5460UL;     /* ~300s */
             unsigned char hold[16]; unsigned held = 0;  /* no-clen: defer tail */
             t_body_start = bios_ticks();
@@ -400,12 +405,21 @@ int main(int argc, char **argv)
             {
                 unsigned long body_ticks = t_done - t_body_start;
                 unsigned long centi, tenths_kbps, kb, frac;
+                int incomplete = (have_clen && written < content_length);
                 if (body_ticks == 0UL) body_ticks = 1UL;
                 centi = (body_ticks * 10000UL + 910UL) / 1820UL;
                 tenths_kbps = (written * 1820UL / body_ticks * 10UL) / 102400UL;
                 kb = tenths_kbps / 10UL; frac = tenths_kbps % 10UL;
                 printf("         saved %lu bytes to %s in %lu.%02lus = %lu.%lu KB/s\n",
                        written, outfile, centi/100UL, centi%100UL, kb, frac);
+                if (incomplete) {
+                    /* Never let a partial masquerade as success. The file on
+                     * disk is the bytes we got, but the transfer FAILED. */
+                    fprintf(stderr,
+                        "WGET: INCOMPLETE -- got %lu of %lu bytes (%lu short). File is PARTIAL.\n",
+                        written, content_length, content_length - written);
+                    return 8;
+                }
             }
         }
     }
