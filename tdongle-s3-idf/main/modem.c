@@ -1031,13 +1031,25 @@ static void cmd_dial_impl(const char *arg) {
      * sensible cadence. */
     struct timeval stv = { .tv_sec = 3, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof stv);
-    /* SO_RCVBUF used to be set to 32 KB here, but lwIP's recv accept
-     * queue then grew on top of the advertised TCP window -- a 1 MB
-     * Hayes fetch on a slow CDC drain pushed peak heap to 728 bytes
-     * free. Letting it default to TCP_WND_DEFAULT (32 KB) caps total
-     * in-flight at one window's worth, halving the peak heap held
-     * during downloads with no observable throughput impact (CDC,
-     * not TCP, is the bottleneck). */
+    /* Cap the per-socket receive window (needs LWIP_SO_RCVBUF). This is
+     * THE reliability lever: it HARD-bounds how many pbufs one session can
+     * hold, keeping the heap floor clear of the starvation cliff no matter
+     * how slowly the consumer drains. (Earlier a 32 KB value was set here
+     * and removed because going ABOVE the window grew the accept queue;
+     * going BELOW it -- as we do now -- correctly shrinks the window.)
+     *   - Telnet/interactive (Star Wars, BBSes): 2 KB. The DOS side renders
+     *     ANSI char-by-char and is the real bottleneck; a small window
+     *     flow-controls the server SOON, pacing the stream to the render
+     *     rate (smooth) instead of buffering then bursting (the observed
+     *     freeze-then-jump-ahead), and holds almost no pbufs.
+     *   - Binary/HTTP (WGET): 4 KB, matching the global TCP_WND so a bulk
+     *     fetch still pipelines a full window but can never hold more than
+     *     one window of backlog.
+     * 2026-06-03 reliability reset: a long telnet session with the old
+     * 8 KB window ratcheted the heap floor to ~1.2 KB and the WiFi stack
+     * went intermittently dark. Bounding the window fixes that by design. */
+    int rcvbuf = s_telnet ? 2048 : 4096;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
 
     s_sock = sock;
     snprintf(s_peer, sizeof s_peer, "%s:%u", host, (unsigned)port);

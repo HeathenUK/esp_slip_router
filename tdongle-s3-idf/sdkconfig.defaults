@@ -140,15 +140,20 @@ CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 # trims (fat shared buffer, modem scratch, stream buffer 8192->4096,
 # disk-log ring) raised baseline free to ~25 KB, which re-opened room.
 #
-# 8 KB, validated 2026-06-03 at 240 MHz with a battery (3x sequential
-# 1 MB + a concurrent HTTP-/status-hammer worst case):
-#   ~100-107 KB/s, all md5 OK, min_free 11.7 K normal / 7.5 K under the
-#   concurrent stress, httpd 0 failures, boot heap unaffected (OTA-safe).
-# 12 KB went over the cliff: min_free ~800 B, erratic 15-40 KB/s, and
-# DATA CORRUPTION (pbuf exhaustion dropped bytes). So 8 KB is the
-# validated sweet spot; do not raise without re-running the battery
-# and watching min_free. */
-CONFIG_LWIP_TCP_WND_DEFAULT=8192
+# RELIABILITY RESET 2026-06-03: back to 4 KB (was 8 KB). 8 KB reached
+# ~105 KB/s, but a long telnet session (ASCII Star Wars -- a slow
+# char-by-char consumer) let the window fill and ratcheted the heap floor
+# to ~1.2 KB, at which point the WiFi stack went intermittently dark.
+# "Rock solid" was lost to peak speed. 4 KB halves the held backlog (heap
+# floor back to ~14-16 K) for ~80 KB/s. The per-socket SO_RCVBUF (below +
+# modem.c) then tightens it per use case: 2 KB telnet / 4 KB binary. */
+CONFIG_LWIP_TCP_WND_DEFAULT=4096
+# Per-socket receive-window capping. Lets modem.c size the window to the
+# session type (telnet 2 KB smooth-pacing vs binary 4 KB bulk) -- the
+# reliability lever that hard-bounds pbufs held by one connection. Setting
+# it BELOW TCP_WND shrinks the advertised window (what we want); the old
+# trap was setting it ABOVE, which grew the accept queue.
+CONFIG_LWIP_SO_RCVBUF=y
 # Send buffer (per-pcb queue lwIP will accept from the app before
 # blocking send()). Default IDF v5.5 is 5760 (4*MSS) which caps the
 # upload BDP at ~5.6 KB in-flight -- enough for 56 Kbps but throttles
