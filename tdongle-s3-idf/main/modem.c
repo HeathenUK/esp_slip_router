@@ -270,6 +270,11 @@ static void r_ok(void)         { if (!s_quiet) cdc_print(s_verbose ? "\r\nOK\r\n
 static void r_error(void)      { if (!s_quiet) cdc_print(s_verbose ? "\r\nERROR\r\n"      : "4\r\n"); }
 static void r_connect(void)    { if (!s_quiet) cdc_print(s_verbose ? "\r\nCONNECT\r\n"    : "1\r\n"); }
 static void r_nocarrier(void)  { if (!s_quiet) cdc_print(s_verbose ? "\r\nNO CARRIER\r\n" : "3\r\n"); }
+/* DNS resolution failed -- distinct from a connect-time NO CARRIER so the
+ * host (WGET) can say "host not resolved" instead of a generic failure.
+ * Hayes code 6 = NO DIALTONE, the closest standard "couldn't even start
+ * to dial" semantic to "the name doesn't resolve". */
+static void r_nodialtone(void) { if (!s_quiet) cdc_print(s_verbose ? "\r\nNO DIALTONE\r\n" : "6\r\n"); }
 
 /* ---- telnet helpers ---- */
 
@@ -996,7 +1001,7 @@ static void cmd_dial_impl(const char *arg) {
     struct addrinfo *res = NULL;
     if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
         disk_logf("modem: dial DNS-fail '%s'", host);
-        r_nocarrier();
+        r_nodialtone();   /* distinct from connect-fail NO CARRIER (host shows "not resolved") */
         return;
     }
 
