@@ -128,26 +128,27 @@ CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 # esp_https_ota default; defers erase to per-sector lazy inside
 # esp_ota_write, so no 15 s upfront block to fight with the TCP
 # window). All four wins are real and reliable together.
-# TCP RX window. 65535 was too generous for this target: a 1 MB Hayes
-# fetch with a macOS host (~100 KB/s CDC drain) saw lwIP buffer the
-# full window-worth of in-flight data behind the slow drain, taking
-# min_free_heap to 728 bytes. 16 KB still lets us run a full BDP at
-# the macOS CDC rate (RTT*cap ~= 10 KB on internet, much less on LAN)
-# and shrinks the worst-case heap held during downloads vs the
-# default. CDC is the bottleneck, not TCP window, so this doesn't
-# slow real-world throughput on our target hosts.
+# TCP RX window. Throughput here is window/RTT-bound (proven 2026-06-03
+# by on-dongle counters: cdc_write blocks ~0%, so the consumer is NOT
+# the limit; the dongle just relays what TCP delivers). The window is
+# the lever -- but the held backlog is TCP_WND of lwIP pbufs, so it
+# trades directly against heap, and over-sizing it STARVES the device
+# (which kills BOTH OTA paths -- see the never-starve directive).
 #
-# 4 KB. The pump tasks are now pre-created at modem_init (persistent,
-# parked between dials) instead of spawned per-dial, so a telnet
-# banner flood on connect can no longer starve task creation. But
-# that makes the three task stacks (~10 KB) permanent, lowering
-# baseline free heap to ~14 KB. During a slow-CDC download (macOS
-# ~100 KB/s, CHUSB ~50 KB/s) the held backlog is TCP_WND of lwIP
-# pbufs + the pre-allocated stream buffer; an 8 KB window took
-# min_free_heap to 220 bytes on a 1 MB fetch. 4 KB (>2*MSS, ~3
-# segments) keeps the download backlog bounded with comfortable
-# headroom. BDP at our CDC rates is <3 KB so no throughput cost. */
-CONFIG_LWIP_TCP_WND_DEFAULT=4096
+# History: was 4 KB during the heap crunch (baseline free ~14 KB then;
+# an 8 KB window once took min_free to 220 B). The 2026-06-02 SRAM
+# trims (fat shared buffer, modem scratch, stream buffer 8192->4096,
+# disk-log ring) raised baseline free to ~25 KB, which re-opened room.
+#
+# 8 KB, validated 2026-06-03 at 240 MHz with a battery (3x sequential
+# 1 MB + a concurrent HTTP-/status-hammer worst case):
+#   ~100-107 KB/s, all md5 OK, min_free 11.7 K normal / 7.5 K under the
+#   concurrent stress, httpd 0 failures, boot heap unaffected (OTA-safe).
+# 12 KB went over the cliff: min_free ~800 B, erratic 15-40 KB/s, and
+# DATA CORRUPTION (pbuf exhaustion dropped bytes). So 8 KB is the
+# validated sweet spot; do not raise without re-running the battery
+# and watching min_free. */
+CONFIG_LWIP_TCP_WND_DEFAULT=8192
 # Send buffer (per-pcb queue lwIP will accept from the app before
 # blocking send()). Default IDF v5.5 is 5760 (4*MSS) which caps the
 # upload BDP at ~5.6 KB in-flight -- enough for 56 Kbps but throttles
@@ -159,6 +160,12 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
 CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION=y
+# CPU at full 240 MHz (was IDF-default 160). Zero SRAM cost -- it's a
+# clock. Validated 2026-06-03: Hayes download ~80 -> ~105 KB/s AND made
+# it consistent (160 MHz CPU was itself causing the 47-105 jitter), and
+# it's SAFER under load (faster CPU drains the pbuf backlog quicker:
+# concurrent min_free 5.1 K -> 7.5 K). USB-powered, so power draw is moot.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
 # 802.11n Block-ACK receive window. Default 6 is conservative; 32 is
 # Espressif's "Iperf rank" recommendation (requires

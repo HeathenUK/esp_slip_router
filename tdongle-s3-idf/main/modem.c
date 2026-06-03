@@ -102,6 +102,16 @@ static TaskHandle_t s_data_task = NULL;
 static TaskHandle_t s_cdc_pump_task = NULL;
 static TaskHandle_t s_tcp_pump_task = NULL;
 
+/* --- throughput instrumentation (reset at dial connect, read via ATI) ---
+ * Answers relay-vs-consumer: if s_tp_blk_us is a large fraction of the
+ * session, cdc_write spent the time WAITING for the host to drain the CDC
+ * FIFO => consumer-bound (dongle could feed faster). If blk is ~0 but the
+ * session is slow, the limit is upstream (recv/TCP/relay). */
+static volatile uint32_t s_tp_rx = 0;       /* bytes recv() pulled from TCP */
+static volatile uint32_t s_tp_cdc = 0;      /* bytes cdc_write pushed to host */
+static volatile uint64_t s_tp_blk_us = 0;   /* us cdc_write waited on CDC FIFO space */
+static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
+
 /* Pipeline: producer (modem_data_task, recv-side, telnet IAC + +++
  * detection) pushes bytes into s_to_cdc; consumer (modem_cdc_pump_task,
  * CDC-side) drains and calls cdc_write. Decouples WiFi RX from USB CDC
@@ -217,18 +227,23 @@ static size_t cdc_write(const void *buf, size_t n) {
         if (!tud_cdc_n_connected(0)) break;
         size_t avail = tud_cdc_n_write_available(0);
         if (avail == 0) {
+            int64_t bt = esp_timer_get_time();
             tud_cdc_n_write_flush(0);
             vTaskDelay(pdMS_TO_TICKS(2));
+            s_tp_blk_us += (uint64_t)(esp_timer_get_time() - bt);  /* waiting on host */
             continue;
         }
         size_t chunk = (n - sent) < avail ? (n - sent) : avail;
         size_t w = tud_cdc_n_write(0, p + sent, chunk);
         if (w == 0) {
+            int64_t bt = esp_timer_get_time();
             tud_cdc_n_write_flush(0);
             vTaskDelay(pdMS_TO_TICKS(2));
+            s_tp_blk_us += (uint64_t)(esp_timer_get_time() - bt);
             continue;
         }
         sent += w;
+        s_tp_cdc += (uint32_t)w;
     }
     tud_cdc_n_write_flush(0);
     return sent;
@@ -482,6 +497,7 @@ static void modem_data_task(void *arg) {
 
     while (s_online && s_sock >= 0) {
         int n = recv(s_sock, inbuf, sizeof inbuf, 0);
+        if (n > 0) s_tp_rx += (uint32_t)n;
         if (n > 0 && !s_telnet) {
             /* Binary fast path: skip the per-byte IAC state machine when
              * telnet is off -- push inbuf straight into the CDC pipeline.
@@ -1014,6 +1030,9 @@ static void cmd_dial_impl(const char *arg) {
     xStreamBufferReset(s_to_cdc);
     xStreamBufferReset(s_to_tcp);
 
+    /* Reset throughput counters for this session (read via ATI). */
+    s_tp_rx = 0; s_tp_cdc = 0; s_tp_blk_us = 0; s_tp_start = esp_timer_get_time();
+
     /* (2) Flip online flag BEFORE spawning tasks; modem_data_task's
      *     main loop is `while (s_online && s_sock >= 0)`, so if we
      *     spawned it with s_online=false it would exit on the first
@@ -1418,12 +1437,16 @@ static void exec(char *line) {
         case 'V': s_verbose = (p[1] != '0'); r_ok(); return;
         case 'Q': s_quiet   = (p[1] == '1'); r_ok(); return;
         case 'I': {
-            char b[96];
+            char b[160];
+            int64_t dur = s_tp_start ? (esp_timer_get_time() - s_tp_start) : 0;
             snprintf(b, sizeof b,
-                     "\r\nDOSongle Modem (Phase 1c)\r\nheap free=%u min=%u largest=%u\r\n",
+                     "\r\nDOSongle Modem (Phase 1c)\r\nheap free=%u min=%u largest=%u\r\n"
+                     "tput rx=%u cdc=%u blkus=%llu durus=%lld\r\n",
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)esp_get_minimum_free_heap_size(),
-                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     (unsigned)s_tp_rx, (unsigned)s_tp_cdc,
+                     (unsigned long long)s_tp_blk_us, (long long)dur);
             cdc_print(b);
             r_ok(); return;
         }
