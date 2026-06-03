@@ -53,6 +53,7 @@
 #include "dns_forwarder.h"
 #include "kbd.h"
 #include "display.h"
+#include "modem.h"
 
 /* First-flash bootstrap WiFi credentials. The file `wifi_creds.h` is
  * gitignored and locally created. NVS-stored creds always take
@@ -769,6 +770,26 @@ static esp_err_t h_tasks(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* Last/current call's byte accounting -- localizes any download truncation:
+ * rx = bytes the dongle recv()'d from the TCP socket, cdc = bytes it pushed
+ * to the CDC host. If rx==cdc==Content-Length but the host saved fewer, the
+ * loss is host-side (CHUSB/WGET); if cdc<rx, it's the dongle's CDC write;
+ * if rx<Content-Length, the TCP connection closed early. Counters reset at
+ * each dial, so read this AFTER a transfer and BEFORE the next one. */
+static esp_err_t h_modem_stats(httpd_req_t *req) {
+    uint32_t rx = 0, cdc = 0; uint64_t blk_us = 0;
+    bool online = modem_get_tput(&rx, &cdc, &blk_us);
+    const char *peer = NULL;
+    modem_online_peer(&peer);
+    char buf[256];
+    snprintf(buf, sizeof buf,
+        "{\"online\":%s,\"peer\":\"%.64s\",\"rx_bytes\":%lu,\"cdc_bytes\":%lu,"
+        "\"cdc_block_us\":%llu}\n",
+        online ? "true" : "false", peer ? peer : "",
+        (unsigned long)rx, (unsigned long)cdc, (unsigned long long)blk_us);
+    return send_text(req, "200 OK", "application/json", buf);
+}
+
 static httpd_handle_t s_httpd = NULL;
 
 static void httpd_start_once(void) {
@@ -808,6 +829,7 @@ static void httpd_start_once(void) {
         { .uri = "/usb-start", .method = HTTP_POST, .handler = h_usb_start, .user_ctx = NULL },
         { .uri = "/usb-stats", .method = HTTP_GET,  .handler = h_usb_stats, .user_ctx = NULL },
         { .uri = "/tasks",     .method = HTTP_GET,  .handler = h_tasks,     .user_ctx = NULL },
+        { .uri = "/modem-stats", .method = HTTP_GET, .handler = h_modem_stats, .user_ctx = NULL },
         { .uri = "/list",      .method = HTTP_GET,  .handler = h_list,      .user_ctx = NULL },
         { .uri = "/fs/*",      .method = HTTP_GET,    .handler = h_fs_get,    .user_ctx = NULL },
         { .uri = "/fs/*",      .method = HTTP_PUT,    .handler = h_fs_put,    .user_ctx = NULL },

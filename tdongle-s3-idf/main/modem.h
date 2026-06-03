@@ -29,6 +29,12 @@ esp_err_t modem_init(void);
  * while the call is up). */
 bool modem_online_peer(const char **peer_out);
 
+/* Throughput counters for the last/current call (reset at each dial), for
+ * the /modem-stats diagnostic. rx = bytes recv()'d from the socket, cdc =
+ * bytes pushed to the CDC host, blk_us = us spent waiting on CDC FIFO space.
+ * Any out-param may be NULL. Returns true if a call is currently online. */
+bool modem_get_tput(uint32_t *rx, uint32_t *cdc, uint64_t *blk_us);
+
 #ifdef __cplusplus
 }
 #endif

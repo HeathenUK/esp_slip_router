@@ -265,6 +265,26 @@ static size_t cdc_write(const void *buf, size_t n) {
 static inline void cdc_print(const char *s) { cdc_write(s, strlen(s)); }
 static inline void cdc_byte(uint8_t b)      { cdc_write(&b, 1); }
 
+/* Flush the USB CDC TX FIFO to the host and wait (bounded) for it to
+ * actually EMPTY -- i.e. for the host to have pulled every byte. This is
+ * the difference between "the stream buffer drained into the FIFO" and
+ * "the host received it": tud_cdc_n_write_available() returns the full
+ * FIFO depth only once the host has consumed all in-flight data. Without
+ * this, connection teardown closed while up to a full TX FIFO (~4 KB) of
+ * the file tail was still queued, so HTTP downloads truncated ~8 KB short
+ * at end-of-file (2026-06-03). Bounded to ~2 s so a host that has stopped
+ * reading can never wedge us here. Call only when no other task is writing
+ * CDC (the relay pump must be idle/parked first). */
+static void drain_cdc_fifo(void) {
+    int spins = 0;
+    while (tud_cdc_n_connected(0) && spins++ < 1000) {   /* ~2 s cap */
+        tud_cdc_n_write_flush(0);
+        if (tud_cdc_n_write_available(0) >= CONFIG_TINYUSB_CDC_TX_BUFSIZE)
+            break;                                        /* FIFO empty -> host has it */
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+}
+
 /* ---- result codes ---- */
 static void r_ok(void)         { if (!s_quiet) cdc_print(s_verbose ? "\r\nOK\r\n"         : "0\r\n"); }
 static void r_error(void)      { if (!s_quiet) cdc_print(s_verbose ? "\r\nERROR\r\n"      : "4\r\n"); }
@@ -603,24 +623,36 @@ static void modem_data_task(void *arg) {
         int64_t now = esp_timer_get_time();
         if (s_plus_count == 3 && (now - s_plus_time_us) > GUARD_US) {
             s_plus_count = 0;
-            /* Wait for the CDC pipeline to fully drain before printing
-             * OK, so any in-flight data lands before the prompt. */
+            /* Drain the full CDC pipeline (stream buffer AND USB FIFO) before
+             * printing OK, so all in-flight payload lands before the prompt --
+             * same EOF-tail issue as the peer_closed path. Socket stays open
+             * here (ATO can resume), so we don't close it. */
             while (s_to_cdc && xStreamBufferBytesAvailable(s_to_cdc) > 0)
                 vTaskDelay(pdMS_TO_TICKS(2));
             s_online = false;
+            vTaskDelay(pdMS_TO_TICKS(10));
+            drain_cdc_fifo();
             r_ok();
             break;
         }
     }
 
     if (peer_closed) {
-        /* Same drain wait so NO CARRIER doesn't race with pending payload. */
+        /* Drain the ENTIRE CDC pipeline to the host before closing, in order:
+         *   1. stream buffer -> FIFO   (pump, while s_online still true)
+         *   2. let the pump finish its last in-hand chunk and go idle
+         *   3. FIFO -> host            (drain_cdc_fifo, the EOF-tail fix)
+         * The old code did only (1), so the last FIFO-load of the file was
+         * dropped when we close()'d -- downloads truncated ~8 KB short at EOF. */
         while (s_to_cdc && xStreamBufferBytesAvailable(s_to_cdc) > 0)
             vTaskDelay(pdMS_TO_TICKS(2));
-        s_online = false;
+        s_online = false;                      /* pump parks once s_to_cdc is empty */
+        vTaskDelay(pdMS_TO_TICKS(10));          /* let it write its last chunk + idle */
+        drain_cdc_fifo();                       /* wait for the host to pull the tail */
         if (s_sock >= 0) { close(s_sock); s_sock = -1; }
         s_peer[0] = 0;
         r_nocarrier();
+        drain_cdc_fifo();                       /* and that NO CARRIER lands too */
     }
     /* Loop back to park for the next dial. */
     }
@@ -1662,6 +1694,13 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
 
 bool modem_online_peer(const char **peer_out) {
     if (peer_out) *peer_out = s_peer;
+    return s_online;
+}
+
+bool modem_get_tput(uint32_t *rx, uint32_t *cdc, uint64_t *blk_us) {
+    if (rx)     *rx     = s_tp_rx;
+    if (cdc)    *cdc    = s_tp_cdc;
+    if (blk_us) *blk_us = s_tp_blk_us;
     return s_online;
 }
 
