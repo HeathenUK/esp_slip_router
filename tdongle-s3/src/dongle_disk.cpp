@@ -14,14 +14,18 @@
 #include <USBMSC.h>
 #include <ESPmDNS.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 
 #include "esp_partition.h"
+#include "esp_flash.h"
+#include "esp_psram.h"
 #include "wear_levelling.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "esp_system.h"
 
 extern "C" {
 #include "class/msc/msc.h"
@@ -68,6 +72,168 @@ static void put16(uint8_t *p, uint16_t v);
 static void put32(uint8_t *p, uint32_t v);
 static esp_err_t raw_write_bytes(uint32_t off, const void *buf, size_t len);
 static esp_err_t raw_zero_bytes(uint32_t off, size_t len);
+
+// ---- RAM ring-buffer log (observable via GET /disk-log) ------------------
+// The T-Dongle S3 doesn't expose UART pads, so any Serial0.printf() from
+// the firmware is invisible. This ring buffer captures disk-side diagnostic
+// lines (MSC write failures, raw-FAT writer errors) in RAM where they
+// survive any number of DOS / host crashes -- only an actual dongle reset
+// loses them. Pull via the dosongle.sh disk-log subcommand or curl /disk-log.
+// Pattern mirrors dongle_kbd.cpp's kbd_logf.
+
+#define DISK_LOG_LINES    64
+#define DISK_LOG_LINE_LEN 128
+
+static portMUX_TYPE s_disk_log_mux = portMUX_INITIALIZER_UNLOCKED;
+static char s_disk_log[DISK_LOG_LINES][DISK_LOG_LINE_LEN];
+static uint32_t s_disk_log_seq = 0;
+
+// Sibling ring for USB device-state events (mount / unmount / suspend /
+// resume / re-enumeration). Same pattern as disk_logf but called from
+// main.cpp's loop poll. Exposed for C linkage so main.cpp can drive it
+// without dragging in the rest of dongle_disk.cpp.
+#define USB_LOG_LINES    32
+#define USB_LOG_LINE_LEN 96
+static portMUX_TYPE s_usb_log_mux = portMUX_INITIALIZER_UNLOCKED;
+static char s_usb_log[USB_LOG_LINES][USB_LOG_LINE_LEN];
+static uint32_t s_usb_log_seq = 0;
+
+extern "C" void usb_logf(const char *fmt, ...) {
+    char line[USB_LOG_LINE_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+
+    portENTER_CRITICAL(&s_usb_log_mux);
+    uint32_t seq = ++s_usb_log_seq;
+    snprintf(s_usb_log[seq % USB_LOG_LINES], USB_LOG_LINE_LEN,
+             "%lu %lu %s", (unsigned long)seq, (unsigned long)millis(), line);
+    portEXIT_CRITICAL(&s_usb_log_mux);
+}
+
+static void disk_logf(const char *fmt, ...) {
+    char line[DISK_LOG_LINE_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+
+    portENTER_CRITICAL(&s_disk_log_mux);
+    uint32_t seq = ++s_disk_log_seq;
+    snprintf(s_disk_log[seq % DISK_LOG_LINES], DISK_LOG_LINE_LEN,
+             "%lu %s", (unsigned long)seq, line);
+    portEXIT_CRITICAL(&s_disk_log_mux);
+    // No Serial0 mirror: UART0 TX (GPIO43) is not exposed on the T-Dongle
+    // S3, so printf'ing to it just burns cycles and risks blocking on
+    // FIFO drain under a flood of failure logs.
+}
+
+// ---- write-back coalescing cache ----------------------------------------
+// Why: DOS sends 8 consecutive SCSI WRITE(10)s of 512B each to fill a 4KB
+// host write. Without coalescing each one does a full WL-sector RMW (read
+// 4KB, modify 512B, erase 4KB, write 4KB). The back-to-back erase current
+// spikes were severe enough to brown-out / POWERON-reset the dongle under
+// sustained writes (DISKTEST WRITE+TIMING). With this single-sector
+// write-back cache, 8 same-sector writes merge in RAM and become 1 erase +
+// 1 write -- 8x fewer flash ops, 8x lower peak erase rate, 8x faster.
+//
+// Invariants (all updates inside msc_on_{read,write}, the idle timer, or
+// the ownership-swap path, all serialized via s_io_mux + the active-IO
+// counter):
+//   s_wb_have     -> s_wb_cache holds a current snapshot of the WL sector
+//                    starting at s_wb_sect_base. Reads within this sector
+//                    MUST consult the cache because it may carry dirty
+//                    data not yet flushed to flash.
+//   s_wb_dirty    -> cache differs from flash; flush owed at s_wb_sect_base.
+//
+// Loss model: dirty cache is RAM-only. A dongle reset between the host's
+// write and our flush loses the last <=4KB of writes. Mitigated by the
+// idle-flush timer firing ~WB_IDLE_MS after the last write, plus an
+// explicit flush at every ownership swap / eject / mediaPresent(false).
+
+#define WB_CACHE_BYTES 4096
+
+static uint8_t   s_wb_cache[WB_CACHE_BYTES];
+static uint32_t  s_wb_sect_base = 0;
+static bool      s_wb_have  = false;
+static bool      s_wb_dirty = false;
+static uint32_t  s_wb_merge_count = 0;   // writes that hit the cached sector
+static uint32_t  s_wb_evict_count = 0;   // flushes triggered by sector change
+
+// NB: an async eviction worker was attempted (Step 1 of the CHUSB-agent
+// dark-window plan) but produced a crash cascade under macOS mount load --
+// the host's burst of metadata writes (.Spotlight-V100, .fseventsd,
+// AppleDouble forks) interacted with the worker + write-back cache + cache
+// disable in some way that triggered a reboot loop. Each reboot lost the
+// dirty cache, corrupting the FAT incrementally until the volume failed
+// to mount entirely (at which point the loop stabilised). Rolled back
+// to synchronous evictions on the TinyUSB task; the dongle still goes
+// dark on the bus for ~70 ms per erase, which CHUSB doesn't tolerate,
+// but macOS does. The proper fix is Step 2 -- replace the arduino-esp32
+// USB init with ESP-IDF native tinyusb so we can IRAM-flag the OTG ISR
+// and let CONFIG_SPI_FLASH_AUTO_SUSPEND preempt the cache-off window.
+// Until that lands, we run synchronously.
+
+// Erase+write the cache back to flash if dirty. Caller must hold the
+// active-IO count (i.e. be inside an msc_*_begin/end window) or otherwise
+// guarantee no concurrent flash op. Returns ESP_OK if nothing to do.
+static esp_err_t wb_flush_to_flash(void) {
+    if (!s_wb_have || !s_wb_dirty) return ESP_OK;
+    if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
+    size_t sect = wl_sector_size(s_wl);
+    if (sect > WB_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
+    esp_err_t e = wl_erase_range(s_wl, s_wb_sect_base, sect);
+    if (e != ESP_OK) {
+        disk_logf("[wb] flush erase fail base=0x%x sect=%u err=%d (%s)\n",
+                  (unsigned)s_wb_sect_base, (unsigned)sect, e, esp_err_to_name(e));
+        return e;
+    }
+    e = wl_write(s_wl, s_wb_sect_base, s_wb_cache, sect);
+    if (e != ESP_OK) {
+        disk_logf("[wb] flush write fail base=0x%x sect=%u err=%d (%s)\n",
+                  (unsigned)s_wb_sect_base, (unsigned)sect, e, esp_err_to_name(e));
+        return e;
+    }
+    s_wb_dirty = false;
+    return ESP_OK;
+}
+
+static void wb_invalidate(void) {
+    s_wb_have      = false;
+    s_wb_dirty     = false;
+    s_wb_sect_base = 0;
+}
+
+// Load a fresh sector into the cache. Caller must have flushed any prior
+// dirty contents first; we do NOT silently overwrite dirty data.
+static esp_err_t wb_load_sector(uint32_t sect_base) {
+    if (s_wb_have && s_wb_dirty && s_wb_sect_base != sect_base) {
+        disk_logf("[wb] BUG: wb_load_sector(0x%x) while dirty at 0x%x\n",
+                  (unsigned)sect_base, (unsigned)s_wb_sect_base);
+        return ESP_ERR_INVALID_STATE;
+    }
+    size_t sect = wl_sector_size(s_wl);
+    if (sect > WB_CACHE_BYTES) return ESP_ERR_INVALID_SIZE;
+    esp_err_t e = wl_read(s_wl, sect_base, s_wb_cache, sect);
+    if (e != ESP_OK) {
+        disk_logf("[wb] load fail base=0x%x sect=%u err=%d (%s)\n",
+                  (unsigned)sect_base, (unsigned)sect, e, esp_err_to_name(e));
+        return e;
+    }
+    s_wb_have      = true;
+    s_wb_dirty     = false;
+    s_wb_sect_base = sect_base;
+    return ESP_OK;
+}
+
+// Flush + invalidate. Used at ownership swaps and eject -- the cache must
+// not survive into a context where the other side might write to flash.
+static esp_err_t wb_flush_and_invalidate(void) {
+    esp_err_t e = wb_flush_to_flash();
+    wb_invalidate();
+    return e;
+}
 
 // ---- low-level: raw flash via WL, 512-byte logical blocks ----
 
@@ -117,72 +283,113 @@ static void owner_set_device_side(bool owns) {
     portEXIT_CRITICAL(&s_io_mux);
 }
 
+// Read path. Cache hits return from RAM (carries dirty bytes that haven't
+// been flushed yet); misses go straight to wl_read.
 static int32_t msc_on_read(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
     if (!msc_read_begin()) return -1;
     size_t addr = (size_t)lba * s_block_size + offset;
     if ((uint64_t)addr + bufsize > (uint64_t)s_block_count * s_block_size) {
+        disk_logf("[msc] READ OOB lba=%u off=%u bsz=%u addr=0x%x limit=0x%x\n",
+            (unsigned)lba, (unsigned)offset, (unsigned)bufsize,
+            (unsigned)addr, (unsigned)((uint64_t)s_block_count * s_block_size));
         msc_io_end();
         return -1;
     }
-    if (wl_read(s_wl, addr, buffer, bufsize) != ESP_OK) {
-        msc_io_end();
-        return -1;
+    size_t sect = wl_sector_size(s_wl);
+    size_t remaining = bufsize;
+    uint8_t *dst = (uint8_t *)buffer;
+    while (remaining > 0) {
+        size_t sect_off  = addr & (sect - 1);
+        size_t sect_base = addr - sect_off;
+        size_t chunk     = sect - sect_off;
+        if (chunk > remaining) chunk = remaining;
+        if (s_wb_have && s_wb_sect_base == sect_base) {
+            memcpy(dst, s_wb_cache + sect_off, chunk);
+        } else {
+            esp_err_t e = wl_read(s_wl, addr, dst, chunk);
+            if (e != ESP_OK) {
+                disk_logf("[msc] read wl_read fail lba=%u addr=0x%x bsz=%u err=%d (%s)\n",
+                    (unsigned)lba, (unsigned)addr, (unsigned)chunk, e, esp_err_to_name(e));
+                msc_io_end();
+                return -1;
+            }
+        }
+        addr += chunk; dst += chunk; remaining -= chunk;
     }
     msc_io_end();
     return (int32_t)bufsize;
 }
 
-// Hosts see 512-byte logical sectors. Flash writes still happen in the
-// enclosing WL erase sector, so only a full aligned WL-sector write can skip
-// the read/modify/write path.
+// Write path: stages every byte into the write-back cache. A run of writes
+// to the same WL sector collapses into a single erase+write at eviction
+// (or idle-timer flush) -- the 8x current-draw and time saving that lets
+// sustained writes run without browning out the chip. All failure paths
+// log to disk_logf and survive into /disk-log.
 static int32_t msc_on_write(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
-    if (!msc_write_begin()) return -1;
+    if (!msc_write_begin()) {
+        disk_logf("[msc] WRITE REJECTED lba=%u off=%u bsz=%u  owns=%d http_rd=%d present=%d wl=%d\n",
+            (unsigned)lba, (unsigned)offset, (unsigned)bufsize,
+            (int)s_dongle_owns, (int)s_raw_http_read_active,
+            (int)s_msc_present, s_wl != WL_INVALID_HANDLE);
+        return -1;
+    }
     size_t sect = wl_sector_size(s_wl);
     size_t addr = (size_t)lba * s_block_size + offset;
     if ((uint64_t)addr + bufsize > (uint64_t)s_block_count * s_block_size) {
+        disk_logf("[msc] WRITE OOB lba=%u off=%u bsz=%u addr=0x%x limit=0x%x\n",
+            (unsigned)lba, (unsigned)offset, (unsigned)bufsize,
+            (unsigned)addr, (unsigned)((uint64_t)s_block_count * s_block_size));
+        msc_io_end();
+        return -1;
+    }
+    if (sect > WB_CACHE_BYTES) {
+        disk_logf("[msc] WB cache too small: sect=%u cache=%u (build defect)\n",
+            (unsigned)sect, (unsigned)WB_CACHE_BYTES);
         msc_io_end();
         return -1;
     }
 
-    if (offset == 0 && (addr & (sect - 1)) == 0 && bufsize == sect) {
-        if (wl_erase_range(s_wl, addr, sect) != ESP_OK) {
-            msc_io_end();
-            return -1;
-        }
-        if (wl_write(s_wl, addr, buffer, sect) != ESP_OK) {
-            msc_io_end();
-            return -1;
-        }
-        msc_io_end();
-        return (int32_t)bufsize;
-    }
-
-    // Partial-sector path: read whole sector, splice in, erase+write back.
-    static uint8_t sbuf[4096];
-    if (sect > sizeof sbuf) {
-        msc_io_end();
-        return -1;
-    }
     size_t remaining = bufsize;
     uint8_t *src = buffer;
     while (remaining > 0) {
-        size_t sect_off = addr & (sect - 1);
+        size_t sect_off  = addr & (sect - 1);
         size_t sect_base = addr - sect_off;
-        size_t chunk = sect - sect_off;
+        size_t chunk     = sect - sect_off;
         if (chunk > remaining) chunk = remaining;
-        if (wl_read(s_wl, sect_base, sbuf, sect) != ESP_OK) {
-            msc_io_end();
-            return -1;
+
+        if (s_wb_have && s_wb_sect_base == sect_base) {
+            // Same cached sector -- pure RAM merge, no flash op.
+            memcpy(s_wb_cache + sect_off, src, chunk);
+            s_wb_dirty = true;
+            s_wb_merge_count++;
+        } else {
+            // Different sector. Flush the existing one if dirty, then load
+            // the new one (skip the load on a full-sector overwrite).
+            if (s_wb_have && s_wb_dirty) {
+                esp_err_t e = wb_flush_to_flash();
+                if (e != ESP_OK) {
+                    msc_io_end();
+                    return -1;
+                }
+                s_wb_evict_count++;
+            }
+            if (sect_off == 0 && chunk == sect) {
+                memcpy(s_wb_cache, src, sect);
+                s_wb_have      = true;
+                s_wb_dirty     = true;
+                s_wb_sect_base = sect_base;
+            } else {
+                wb_invalidate();   // clean state for wb_load_sector's BUG check
+                esp_err_t e = wb_load_sector(sect_base);
+                if (e != ESP_OK) {
+                    msc_io_end();
+                    return -1;
+                }
+                memcpy(s_wb_cache + sect_off, src, chunk);
+                s_wb_dirty = true;
+            }
         }
-        memcpy(sbuf + sect_off, src, chunk);
-        if (wl_erase_range(s_wl, sect_base, sect) != ESP_OK) {
-            msc_io_end();
-            return -1;
-        }
-        if (wl_write(s_wl, sect_base, sbuf, sect) != ESP_OK) {
-            msc_io_end();
-            return -1;
-        }
+
         addr += chunk; src += chunk; remaining -= chunk;
     }
     msc_io_end();
@@ -193,6 +400,16 @@ static bool msc_on_start_stop(uint8_t power_condition, bool start, bool load_eje
     // Host SCSI 1Bh START_STOP_UNIT. We accept all; eject just flips our
     // mediaPresent flag so the host treats the volume as gone.
     if (load_eject && !start) {
+        // Flush any dirty write-back cache before the medium disappears --
+        // an eject with dirty cache and no subsequent eviction would lose
+        // the last <=4KB of host writes on dongle reset. We are on the
+        // TinyUSB task here, same as msc_on_write, so no race with cache
+        // state; safe to call wb_flush_and_invalidate inline.
+        esp_err_t e = wb_flush_and_invalidate();
+        if (e != ESP_OK) {
+            disk_logf("[wb] eject flush err=%d (%s) -- data may be lost\n",
+                      e, esp_err_to_name(e));
+        }
         s_msc.mediaPresent(false);
         s_msc_present = false;
         s_msc.isWritable(false);
@@ -237,7 +454,11 @@ static esp_err_t format_for_device_locked(void) {
     put16(sec + 22, spf);
     put16(sec + 24, 32);      // sectors/track, conventional geometry only
     put16(sec + 26, 64);      // heads
-    sec[36] = 0x80;
+    // drive number: 0x00 = first removable / "super-floppy" (no MBR
+    // partition table). With drive=0x80 macOS treats the 0x55AA signature
+    // at the BPB's end as an MBR marker, looks for a partition table in
+    // the BPB padding area, finds all zeros, and declares "uninitialized".
+    sec[36] = 0x00;
     sec[38] = 0x29;
     put32(sec + 39, 0x444F5301UL);
     memcpy(sec + 43, "DOSONGLE   ", 11);
@@ -295,6 +516,14 @@ static void msc_take_offline(bool writable_when_back) {
     set_msc_present(false);
     vTaskDelay(pdMS_TO_TICKS(150));
     wait_for_msc_idle();
+    // Cache must not survive into the device-side or post-eject context:
+    // the FAT might be modified by the other side, and we'd be holding a
+    // stale snapshot. Flush any dirty data back to flash and invalidate.
+    esp_err_t e = wb_flush_and_invalidate();
+    if (e != ESP_OK) {
+        disk_logf("[wb] take_offline flush err=%d (%s) -- data may be lost\n",
+                  e, esp_err_to_name(e));
+    }
     set_msc_writable(writable_when_back);
 }
 
@@ -385,6 +614,10 @@ static const char *INDEX_HTML =
     "tokens like <code>&lt;ENTER&gt;</code>, <code>&lt;F1&gt;</code>, "
     "<code>&lt;CTRL+C&gt;</code>, <code>&lt;DELAY=200&gt;</code>)</li>"
     "<li><a href=/type-log>/type-log</a> &mdash; recent parsed keyboard events</li>"
+    "<li><a href=/disk-log>/disk-log</a> &mdash; MSC + raw-FAT diagnostic ring buffer "
+    "(survives DOS crashes; lost only on dongle reset)</li>"
+    "<li><a href=/usb-log>/usb-log</a> &mdash; USB device-state events (mount, "
+    "unmount, suspend, resume, deferred-WiFi markers)</li>"
     "<li><code>POST /ota</code> &mdash; HTTP OTA upload of firmware.bin</li>"
     "<li><code>POST /reset</code> &mdash; reboot dongle</li>"
     "</ul>"
@@ -558,7 +791,15 @@ static bool uri_to_83_name(const char *uri, char out[11]) {
 static esp_err_t raw_read_bytes(uint32_t off, void *buf, size_t len) {
     if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
     if ((uint64_t)off + len > (uint64_t)s_block_count * s_block_size) return ESP_ERR_INVALID_SIZE;
-    uint8_t sector[4096];
+    // STATIC -- this function is called transitively from h_fs_put / h_list /
+    // h_fs_get_raw_host on the HTTPD task whose stack is only 8 KB. A 4 KB
+    // stack local plus the wl_* call chain (each layer adds another ~512 B)
+    // was a real stack-overflow / PANIC vector under sustained writes. The
+    // dongle's MSC IO is single-threaded at the wl_* layer (s_lock and
+    // s_io_mux serialize the callers that reach here), so a shared static
+    // buffer is safe. Matches the pattern used by raw_write_bytes /
+    // raw_zero_bytes already.
+    static uint8_t sector[4096];
     if (s_block_size > sizeof sector) return ESP_ERR_INVALID_SIZE;
     uint8_t *dst = (uint8_t *)buf;
     while (len > 0) {
@@ -658,9 +899,19 @@ static bool raw_fat_mount_info(raw_fat_info_t *fi, char *why, size_t whysz) {
     fi->root_start = (uint32_t)(reserved + fi->fats * fi->sectors_per_fat) * fi->bps;
     fi->root_bytes = (uint32_t)fi->root_entries * 32U;
     uint32_t root_sectors = (fi->root_bytes + fi->bps - 1) / fi->bps;
-    fi->data_start = (uint32_t)(reserved + fi->fats * fi->sectors_per_fat + root_sectors) * fi->bps;
-    uint32_t data_sectors = fi->total_sectors - (reserved + fi->fats * fi->sectors_per_fat + root_sectors);
-    uint32_t clusters = data_sectors / fi->spc;
+    // Defend against corrupt BPB: if total_sectors is smaller than the
+    // header overhead, data_sectors would underflow into a huge uint32_t
+    // and downstream FAT scans (e.g. raw_fat_find_free_clusters walking
+    // billions of entries) would hang the dongle. Bail early instead.
+    uint32_t overhead = (uint32_t)reserved + (uint32_t)fi->fats * fi->sectors_per_fat + root_sectors;
+    if (fi->total_sectors <= overhead) {
+        snprintf(why, whysz, "bad total_sectors=%u (overhead=%u)",
+                 (unsigned)fi->total_sectors, (unsigned)overhead);
+        return false;
+    }
+    fi->data_start = (uint32_t)overhead * fi->bps;
+    uint32_t data_sectors = fi->total_sectors - overhead;
+    uint32_t clusters = (fi->spc > 0) ? (data_sectors / fi->spc) : 0;
     fi->cluster_count = clusters;
     fi->fat12 = clusters < 4085;
 
@@ -988,6 +1239,18 @@ static esp_err_t h_fs_put(httpd_req_t *req) {
         return send_text(req, "507 Insufficient Storage", "text/plain", "root directory full\n");
     }
 
+    // Guard against absent / negative / wildly oversized Content-Length:
+    // (uint32_t)negative wraps to huge; uncapped sizes would walk billions
+    // of FAT entries in raw_fat_find_free_clusters and lock up the dongle.
+    if (req->content_len < 0) {
+        xSemaphoreGive(s_lock);
+        return send_text(req, "411 Length Required", "text/plain", "Content-Length required\n");
+    }
+    uint64_t partition_bytes = (uint64_t)s_block_count * s_block_size;
+    if ((uint64_t)req->content_len > partition_bytes) {
+        xSemaphoreGive(s_lock);
+        return send_text(req, "413 Payload Too Large", "text/plain", "exceeds partition size\n");
+    }
     uint32_t size = (uint32_t)req->content_len;
     uint32_t cluster_bytes = raw_fat_cluster_bytes(&fi);
     uint32_t nclusters = size ? ((size + cluster_bytes - 1U) / cluster_bytes) : 0;
@@ -1235,12 +1498,85 @@ static esp_err_t h_reset(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// GET /usb-log -- dump the USB device-state event ring (mount / unmount /
+// suspend / resume / re-enumeration markers + WiFi-deferral events).
+static esp_err_t h_usb_log(httpd_req_t *req) {
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Connection", "close");
+
+    portENTER_CRITICAL(&s_usb_log_mux);
+    uint32_t seq = s_usb_log_seq;
+    portEXIT_CRITICAL(&s_usb_log_mux);
+    uint32_t first = (seq > USB_LOG_LINES) ? (seq - USB_LOG_LINES + 1) : 1;
+
+    char line[USB_LOG_LINE_LEN + 2];
+    for (uint32_t cur = first; cur <= seq; ++cur) {
+        portENTER_CRITICAL(&s_usb_log_mux);
+        int w = snprintf(line, sizeof line, "%s\n", s_usb_log[cur % USB_LOG_LINES]);
+        portEXIT_CRITICAL(&s_usb_log_mux);
+        if (w <= 0) continue;
+        if (httpd_resp_send_chunk(req, line, (size_t)w) != ESP_OK) break;
+    }
+    httpd_resp_send_chunk(req, nullptr, 0);
+    return ESP_OK;
+}
+
+// GET /lba/<N> -- raw 512-byte sector dump (octet-stream). Diagnostic
+// endpoint for inspecting the on-flash FAT layout when a host (macOS,
+// CHUSB) won't mount it. Bypasses the cache so we see exactly what's
+// on flash, not what we have buffered.
+static esp_err_t h_lba(httpd_req_t *req) {
+    const char *uri = req->uri;
+    // Skip "/lba/"
+    const char *p = strrchr(uri, '/');
+    if (!p) return send_text(req, "400 Bad Request", "text/plain", "bad path\n");
+    p++;
+    uint32_t lba = (uint32_t)strtoul(p, nullptr, 0);
+    if (s_wl == WL_INVALID_HANDLE)
+        return send_text(req, "503 Service Unavailable", "text/plain", "wl not mounted\n");
+    if (lba >= s_block_count)
+        return send_text(req, "416 Range Not Satisfiable", "text/plain", "lba OOB\n");
+    uint8_t buf[MSC_BLOCK_SIZE];
+    if (wl_read(s_wl, (size_t)lba * MSC_BLOCK_SIZE, buf, MSC_BLOCK_SIZE) != ESP_OK)
+        return send_text(req, "500 Internal Server Error", "text/plain", "wl_read failed\n");
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_send(req, (const char *)buf, MSC_BLOCK_SIZE);
+}
+
+// GET /disk-log -- dump the disk-side ring buffer (MSC + raw-FAT diagnostics).
+// Streamed chunked so we don't need a big buffer; each line snapshot under
+// the spinlock to avoid tearing if disk_logf appends concurrently.
+static esp_err_t h_disk_log(httpd_req_t *req) {
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Connection", "close");
+
+    portENTER_CRITICAL(&s_disk_log_mux);
+    uint32_t seq = s_disk_log_seq;
+    portEXIT_CRITICAL(&s_disk_log_mux);
+    uint32_t first = (seq > DISK_LOG_LINES) ? (seq - DISK_LOG_LINES + 1) : 1;
+
+    char line[DISK_LOG_LINE_LEN + 2];
+    for (uint32_t cur = first; cur <= seq; ++cur) {
+        portENTER_CRITICAL(&s_disk_log_mux);
+        int w = snprintf(line, sizeof line, "%s\n", s_disk_log[cur % DISK_LOG_LINES]);
+        portEXIT_CRITICAL(&s_disk_log_mux);
+        if (w <= 0) continue;
+        if (httpd_resp_send_chunk(req, line, (size_t)w) != ESP_OK) break;
+    }
+    httpd_resp_send_chunk(req, nullptr, 0);
+    return ESP_OK;
+}
+
 static void httpd_start_once(void) {
     if (s_httpd) return;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192;
-    cfg.max_uri_handlers = 18;
+    cfg.max_uri_handlers = 20;
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 2;
     cfg.send_wait_timeout = 2;
@@ -1265,6 +1601,9 @@ static void httpd_start_once(void) {
         { "/present",   HTTP_POST,   h_owner_usb,    nullptr },
         { "/type",      HTTP_POST,   h_type,      nullptr },
         { "/type-log",  HTTP_GET,    h_type_log,  nullptr },
+        { "/disk-log",  HTTP_GET,    h_disk_log,  nullptr },
+        { "/lba/*",     HTTP_GET,    h_lba,       nullptr },
+        { "/usb-log",   HTTP_GET,    h_usb_log,   nullptr },
         { "/ota",       HTTP_POST,   h_ota,       nullptr },
         { "/reset",     HTTP_POST,   h_reset,     nullptr },
     };
@@ -1312,6 +1651,59 @@ void dongle_disk_init(void) {
     }
 
     s_block_count = (uint32_t)(wl_size(s_wl) / s_block_size);
+    // Capture WHY the dongle last reset. If a write test crashed the dongle,
+    // this is the field that tells us the cause: ESP_RST_BROWNOUT is a power
+    // dip during sustained flash erases; ESP_RST_TASK_WDT means msc_on_write
+    // starved the scheduler; ESP_RST_INT_WDT means IRQs were masked too long
+    // (likely flash bus); ESP_RST_PANIC is a code defect (stack overflow,
+    // assertion). ESP_RST_POWERON / ESP_RST_SW are benign.
+    const char *rr;
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  rr = "POWERON";  break;
+        case ESP_RST_EXT:      rr = "EXT";      break;
+        case ESP_RST_SW:       rr = "SW";       break;
+        case ESP_RST_PANIC:    rr = "PANIC";    break;
+        case ESP_RST_INT_WDT:  rr = "INT_WDT";  break;
+        case ESP_RST_TASK_WDT: rr = "TASK_WDT"; break;
+        case ESP_RST_WDT:      rr = "WDT";      break;
+        case ESP_RST_BROWNOUT: rr = "BROWNOUT"; break;
+        case ESP_RST_DEEPSLEEP:rr = "DEEPSLEEP";break;
+        case ESP_RST_SDIO:     rr = "SDIO";     break;
+        default:               rr = "UNKNOWN";  break;
+    }
+    // One-time capability dump for the CHUSB-tolerance decision: flash chip
+    // JEDEC ID (vendor byte tells us if SPI_FLASH_AUTO_SUSPEND is safe to
+    // enable -- GD/Winbond/ISSI ok, XMC-C explicitly de-qualified by
+    // Espressif) and PSRAM size (0 if absent or unconfigured -- if 0 we
+    // can't host a RAM-backed MSC volume).
+    {
+        uint32_t jedec = 0;
+        if (esp_flash_default_chip)
+            esp_flash_read_id(esp_flash_default_chip, &jedec);
+        const char *vendor;
+        switch ((jedec >> 16) & 0xFF) {
+            case 0xC8: vendor = "GD";      break;
+            case 0xEF: vendor = "Winbond"; break;
+            case 0x9D: vendor = "ISSI";    break;
+            case 0xC2: vendor = "MXIC";    break;
+            case 0x20: vendor = "XMC";     break;
+            case 0x68: vendor = "BOYA";    break;
+            case 0x85: vendor = "PUYA";    break;
+            case 0xCD: vendor = "TH";      break;
+            default:   vendor = "unknown"; break;
+        }
+        size_t psram = 0;
+#ifdef CONFIG_SPIRAM
+        psram = esp_psram_get_size();
+#endif
+        disk_logf("hw: flash_jedec=0x%06lx vendor=%s psram=%lu bytes\n",
+                  (unsigned long)jedec, vendor, (unsigned long)psram);
+    }
+    disk_logf("init: reset_reason=%s wl_sector=%u msc_block=%u count=%u total=%lu\n",
+              rr,
+              (unsigned)wl_sector_size(s_wl), (unsigned)s_block_size,
+              (unsigned)s_block_count,
+              (unsigned long)((uint64_t)s_block_count * s_block_size));
 
     s_msc.vendorID("DOSONGLE");      // <=8 chars
     s_msc.productID("DEV-DISK");     // <=16

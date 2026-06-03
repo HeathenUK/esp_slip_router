@@ -392,6 +392,47 @@ void modem_clear_slip_stats() {
     bytes_from_host = bytes_to_host = 0;
 }
 
+// ---- USB-state poll + deferred WiFi --------------------------------------
+// Called from loop(). Logs the device-side view of enumeration (mount /
+// bus reset / suspend / resume) into the /usb-log ring, and triggers
+// wifi_load_and_begin() exactly once -- either when the host has us
+// configured (tud_ready() goes true) or after a hard timeout, so a
+// host that can't enumerate us doesn't strand the dongle's WiFi-OTA
+// recovery path. WiFi tasks run at high priority and have been observed
+// to starve the TinyUSB device task during enumeration on hosts with
+// tight timing (CHUSB on the Pocket386); deferring WiFi.begin() until
+// after enumeration completes keeps the USB stack uncontended.
+static uint32_t g_setup_complete_ms = 0;
+static bool     g_wifi_started      = false;
+static bool     g_usb_was_ready     = false;
+static bool     g_usb_was_suspended = false;
+#define WIFI_DEFER_TIMEOUT_MS 30000
+
+extern "C" void usb_logf(const char *fmt, ...);   /* defined in dongle_disk.cpp */
+
+static void usb_state_poll(uint32_t now) {
+    bool ready = tud_ready();
+    bool suspended = tud_suspended();
+    if (ready != g_usb_was_ready) {
+        usb_logf("%s", ready ? "tud_ready: configured" : "tud_ready: lost (bus reset / unplug)");
+        g_usb_was_ready = ready;
+    }
+    if (suspended != g_usb_was_suspended) {
+        usb_logf("%s", suspended ? "tud_suspended" : "tud_resumed");
+        g_usb_was_suspended = suspended;
+    }
+    if (!g_wifi_started) {
+        bool timed_out = (now - g_setup_complete_ms) > WIFI_DEFER_TIMEOUT_MS;
+        if (ready || timed_out) {
+            g_wifi_started = true;
+            usb_logf("starting WiFi %s (delay %lu ms)",
+                     ready ? "(post tud_ready)" : "(timeout fallback)",
+                     (unsigned long)(now - g_setup_complete_ms));
+            wifi_load_and_begin();
+        }
+    }
+}
+
 static void poll_button() {
     static bool prev = false;
     static uint32_t t0 = 0;
@@ -434,7 +475,13 @@ void setup() {
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
     g_prefs.begin("slip-router", false);
-    wifi_load_and_begin();      // NVS creds (or config.h defaults) -> WiFi.begin
+    // NB: WiFi.begin() is DEFERRED until USB enumeration completes (or a
+    // timeout fires). Rationale: WiFi tasks run at high priority and have
+    // been observed to starve the TinyUSB device task during enumeration,
+    // causing SET_CONFIGURATION stalls on hosts with tight timing (CHUSB
+    // on the Pocket386). Polling tud_ready() in loop() picks up the host's
+    // configured-us signal; once true (or timeout) we start WiFi. See
+    // usb_state_poll() below.
 
     display_init();
     slip_start();
@@ -453,6 +500,16 @@ void setup() {
     // (and AT$TYPE) drive the host as if a human were typing.
     dongle_kbd_init();
 
+    // (Considered pinning the TinyUSB "usbd" task to core 1 with
+    // vTaskCoreAffinitySet, but that API is gated by
+    // CONFIG_FREERTOS_USE_CORE_AFFINITY which isn't enabled in this
+    // arduino-esp32 SDK. The deferred WiFi.begin() below already keeps
+    // core 0 idle through enumeration, so the unpinned usbd lands there
+    // naturally with no contention.)
+    usb_logf("loop() on core %d", xPortGetCoreID());
+
+    g_setup_complete_ms = millis();
+    usb_logf("setup complete; awaiting tud_ready / wifi-defer timeout");
     DBG("[boot] setup complete, mode=%s\n", g_mode == MODE_SLIP ? "SLIP" : "MODEM");
 }
 
@@ -463,6 +520,8 @@ void loop() {
     else                     modem_poll();
 
     uint32_t now = millis();
+
+    usb_state_poll(now);
 
     // Debounced auto-apply after a credential change.
     if (g_wifi_apply_at && (int32_t)(now - g_wifi_apply_at) >= 0) {
