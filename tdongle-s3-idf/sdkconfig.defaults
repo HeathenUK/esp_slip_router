@@ -158,6 +158,13 @@ CONFIG_LWIP_TCP_WND_DEFAULT=8192
 # moves with it (no separate Kconfig needed).
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+# Selective ACK on the receive path. On our lossy -70ish dBm link a dropped
+# segment without SACK piles everything after it into the out-of-order queue
+# (held as pbufs) until the retransmit fills the gap. SACK recovers the gap
+# selectively, so LESS is held at once -- validated 2026-06-03 to raise BOTH
+# throughput (seq +8%, concurrent +48%) AND min_free (its ~900 B static cost
+# is repaid by the smaller backlog). Net heap-positive during transfers.
+CONFIG_LWIP_TCP_SACK_OUT=y
 CONFIG_LWIP_IRAM_OPTIMIZATION=y
 CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION=y
 # CPU at full 240 MHz (was IDF-default 160). Zero SRAM cost -- it's a

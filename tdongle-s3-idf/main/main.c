@@ -465,6 +465,7 @@ static esp_err_t h_ota(httpd_req_t *req) {
     int got = 0;
     bool ok = true;
     int next_log = 32 * 1024;
+    int timeouts = 0;
     int64_t t_start = esp_timer_get_time();
     disk_logf("ota: begin, total=%d", total);
     while (got < total) {
@@ -472,9 +473,20 @@ static esp_err_t h_ota(httpd_req_t *req) {
         if (want > 2048) want = 2048;
         int r = httpd_req_recv(req, (char *)buf, want);
         if (r == HTTPD_SOCK_ERR_TIMEOUT) {
-            disk_logf("ota: recv TIMEOUT at got=%d (continuing)", got);
+            /* Bound the stall. A dropped link (common on weak WiFi) leaves a
+             * half-open connection where recv times out every recv_wait_timeout
+             * (~10 s) forever -- the old `continue` looped indefinitely, holding
+             * the esp_ota handle + blocking httpd, and drove min_free to ~900 B.
+             * After a few consecutive timeouts treat the upload as dead, abort,
+             * free, and let httpd recover. (never-starve directive) */
+            if (++timeouts >= 3) {
+                disk_logf("ota: recv stalled (%d timeouts) at got=%d -- aborting", timeouts, got);
+                ok = false; break;
+            }
+            disk_logf("ota: recv TIMEOUT #%d at got=%d (retry)", timeouts, got);
             continue;
         }
+        timeouts = 0;
         if (r <= 0) {
             disk_logf("ota: recv err r=%d at got=%d (fatal)", r, got);
             ok = false; break;
