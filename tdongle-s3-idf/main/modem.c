@@ -124,6 +124,19 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
  * derefs NULL handle). 8 KB absorbs ~80 ms of WiFi RX at 100 KB/s,
  * which empirically is enough. */
 #define DATA_STREAM_BYTES 4096   /* 8192 -> 4096 (SRAM: +8 KB heap, 2026-06-02) */
+
+/* Low-heap guard for the relay. If free heap falls below this DURING a
+ * session, the data task aborts gracefully (NO CARRIER -> command mode)
+ * instead of relaying until starvation WEDGES the device -- and a wedge
+ * kills BOTH OTA paths, stranding the dongle until a physical Download
+ * mode (see the never-starve directive). Tuned to fire only on a genuine
+ * anomaly: the measured worst-case under-load floor is ~7.5 KB, the death
+ * zone is ~900 B, so 5 KB sits below normal stress (no false aborts) yet
+ * well clear of the cliff. Crucially the abort CLOSES the socket, which
+ * releases up to a full TCP_WND of held RX pbufs (~8 KB) -- so tripping
+ * the guard actively RECOVERS heap rather than just bailing. */
+#define LOW_HEAP_GUARD_BYTES 5120
+
 static StreamBufferHandle_t s_to_cdc = NULL;
 /* Reverse pipeline: producer is on_cdc_rx (TinyUSB task, CPU1) pushing
  * raw bytes into s_to_tcp; consumer is modem_tcp_pump_task (CPU0)
@@ -496,6 +509,23 @@ static void modem_data_task(void *arg) {
     bool peer_closed = false;
 
     while (s_online && s_sock >= 0) {
+        /* Anti-wedge: bail before starvation can take out the OTA paths.
+         * Close the socket FIRST (frees the held RX pbuf backlog -> heap
+         * jumps back up) and deliberately SKIP the usual CDC-drain wait:
+         * a stalled CDC is the very thing this guards against, so we must
+         * not block on it. A few in-flight bytes are sacrificed -- the
+         * stream is being torn down anyway and NO CARRIER tells DOS so. */
+        uint32_t freeb = esp_get_free_heap_size();
+        if (freeb < LOW_HEAP_GUARD_BYTES) {
+            disk_logf("relay: LOW HEAP %u<%u -- abort session (anti-wedge)",
+                      (unsigned)freeb, (unsigned)LOW_HEAP_GUARD_BYTES);
+            s_online = false;
+            if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+            s_peer[0] = 0;
+            r_nocarrier();
+            break;
+        }
+
         int n = recv(s_sock, inbuf, sizeof inbuf, 0);
         if (n > 0) s_tp_rx += (uint32_t)n;
         if (n > 0 && !s_telnet) {
