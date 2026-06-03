@@ -276,13 +276,28 @@ static inline void cdc_byte(uint8_t b)      { cdc_write(&b, 1); }
  * reading can never wedge us here. Call only when no other task is writing
  * CDC (the relay pump must be idle/parked first). */
 static void drain_cdc_fifo(void) {
-    int spins = 0;
-    while (tud_cdc_n_connected(0) && spins++ < 1000) {   /* ~2 s cap */
+    /* Wait for the host to pull the whole TX FIFO. We do NOT trust a fixed
+     * "FIFO empty" constant (if it's wrong we'd time out every time and
+     * strand the tail). Instead: free space only grows as the host pulls;
+     * track the max seen (== true empty) and keep waiting while it's still
+     * climbing. Stop when it's been STABLE for 1.5 s (host either finished
+     * or stopped pulling) or an 8 s absolute cap. Log what was left so a
+     * truncation can be attributed exactly. */
+    int prev = -1, stall_ms = 0, waited = 0, maxseen = 0, avail = 0;
+    while (tud_cdc_n_connected(0) && waited < 8000) {
         tud_cdc_n_write_flush(0);
-        if (tud_cdc_n_write_available(0) >= CONFIG_TINYUSB_CDC_TX_BUFSIZE)
-            break;                                        /* FIFO empty -> host has it */
+        avail = (int)tud_cdc_n_write_available(0);
+        if (avail > maxseen) maxseen = avail;
+        if (avail != prev) { stall_ms = 0; prev = avail; }       /* progress */
+        else { stall_ms += 2; if (stall_ms >= 1500) break; }     /* stable -> done/gone */
         vTaskDelay(pdMS_TO_TICKS(2));
+        waited += 2;
     }
+    /* stuck = bytes the host never pulled (max free minus current free). */
+    int stuck = maxseen - avail;
+    if (stuck > 0 || waited >= 1500)
+        disk_logf("cdc drain: stuck=%d avail=%d/max=%d waited=%dms",
+                  stuck, avail, maxseen, waited);
 }
 
 /* ---- result codes ---- */
