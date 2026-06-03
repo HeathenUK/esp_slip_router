@@ -59,9 +59,10 @@ WiFi.
 | `slip-throughput.py` | UDP-over-SLIP throughput (host → dongle → WiFi → Mac UDP server). |
 | `slip-bench.py` | SLIP intake microbenchmark — bytes/sec the dongle accepts. |
 | `datapath-test.py` | Hayes (MODEM mode) online-mode integrity + throughput: host → CDC → TCP → Mac echo. |
-| `mtcpget-src/` | Clean-room mTCP-based DOS profiler (`PROFILE.EXE`) and downloader (`MTCPGET.EXE`). |
+| `mtcpget-src/` | Clean-room mTCP-based DOS profiler (`PROFILE.EXE`) and downloader (`MTCPGET.EXE`). Checkpoint dir; real builds happen in `/tmp/mTCP-src_2025-01-10/APPS/*/` (see `mtcpget-src/BUILD.md`). |
 | `mtcp-bin/` | Stock mTCP utilities shipped to the CF for ad-hoc DOS testing. |
 | `dos-throughput/` | DOS-side throughput tools (THROUGHPUT.EXE, HTTPGET.EXE, MAGICOUT.EXE, ATQ.EXE) and the CF deploy tree. |
+| `dosongle.sh` | FAT-over-HTTP toolkit (`ls`, `push`, `pull`, `cat`, `rm`, `swap`, `type`, `type-log`, `ota`, `format`, `reset`). Wraps the owner-swap + macOS-unmount + 8.3-validation + verify dance so you don't hand-roll the curl chain. Sourceable as a library. |
 
 ## The four planes
 
@@ -211,12 +212,37 @@ POST /host-write        USB MSC owns the block device; host may mount/write it
 POST /format            starts explicit FAT format; poll /status
 POST /eject             alias for /device-write
 POST /present           alias for /host-write
+POST /type              body is a typing-DSL string (see dongle_kbd.h);
+                        emitted as USB HID keystrokes to whatever host the
+                        dongle is plugged into -- this is NOT a CDC write
+                        and cannot escape a SLIP-stuck dongle (use /reset)
 GET  /type-log          recent parsed HID typing events
 POST /ota               HTTP OTA upload of firmware.bin; reboots on success
-POST /reset             esp_restart
+POST /reset             esp_restart -- also the recovery path for a dongle
+                        stuck in SLIP mode (NVS-default personality is MODEM
+                        so reboot drops CDC back into the AT engine)
 ```
 
-Examples:
+**Recommended:** use `./dosongle.sh` for these — it wraps the
+owner-swap + macOS-unmount + strict-8.3-validation + post-PUT verify
+dance into a small CLI (and is sourceable as a library if you want
+to script on top of it):
+
+```sh
+./dosongle.sh status                          # pretty-printed /status JSON
+./dosongle.sh ls                              # file listing
+./dosongle.sh pull PROFILE.LOG profile.log    # GET; no swap needed
+./dosongle.sh cat  PROFILE.LOG                # GET to stdout
+./dosongle.sh push ./SNAP.EXE                 # full owner-swap dance + verify
+./dosongle.sh rm STALE.TXT -y
+./dosongle.sh swap host                       # explicit owner-swap
+./dosongle.sh type 'PROFILE<ENTER>'           # HID keystrokes -> attached host
+./dosongle.sh type-log 20                     # what the HID parser last did
+./dosongle.sh reset                           # also fixes a SLIP-stuck dongle
+```
+
+The same operations as raw HTTP (what `dosongle.sh` is actually doing
+on the wire):
 
 ```sh
 curl http://dosongle.local/status
