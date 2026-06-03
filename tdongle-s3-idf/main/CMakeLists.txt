@@ -16,6 +16,7 @@ idf_component_register(
         "slip.c"
         "dns_forwarder.c"
         "kbd.c"
+        "display.c"
     INCLUDE_DIRS "."
     REQUIRES
         # Networking / WiFi
@@ -45,4 +46,9 @@ idf_component_register(
         mdns
         # GPIO for the BOOT-button mode toggle.
         esp_driver_gpio
+        # Status LCD (display.c): ST7735 over SPI via esp_lcd panel-io,
+        # SPI2 bus, and LEDC PWM for the backlight.
+        esp_lcd
+        esp_driver_spi
+        esp_driver_ledc
 )

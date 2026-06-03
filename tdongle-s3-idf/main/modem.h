@@ -13,6 +13,7 @@
  *   1c.4: AT$RESET, AT$OTASTART= (system commands)
  */
 #pragma once
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -22,6 +23,11 @@ extern "C" {
 /* Register the modem on TinyUSB CDC interface 0 + initialise its
  * NVS-backed settings. Call after tusb_cdc_acm_init(). */
 esp_err_t modem_init(void);
+
+/* Status-display accessor: true if a TCP call is up. When it returns true and
+ * peer_out is non-NULL, *peer_out points at the "host:port" string (valid
+ * while the call is up). */
+bool modem_online_peer(const char **peer_out);
 
 #ifdef __cplusplus
 }

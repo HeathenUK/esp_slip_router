@@ -34,6 +34,13 @@
 #define FAT_SECTOR_SIZE  512U
 #define WL_SECTOR_BYTES  4096U
 
+/* Shared 4 KB file-streaming buffer for fat_read()/fat_write(). A file is
+ * only ever being read OR written at a time (FATFS is single-threaded and
+ * each op takes disk ownership), so one buffer serves both -- saves 4 KB of
+ * .bss vs a buffer per function. NOT used by the diskio RMW path (rmw[],
+ * which IS live concurrently during a write). */
+static uint8_t s_fat_iobuf[WL_SECTOR_BYTES];
+
 static wl_handle_t s_wl_for_diskio = WL_INVALID_HANDLE;
 
 static DSTATUS d_init(unsigned char pdrv)   { (void)pdrv; return 0; }
@@ -229,7 +236,7 @@ esp_err_t fat_read(const char *name83, fat_out_cb_t out, void *ctx) {
 
     /* Stream in chunks. 4 KB matches our WL sector + cache slot so
      * each f_read in the steady state translates to one wl_read. */
-    static uint8_t buf[4096];
+    uint8_t *buf = s_fat_iobuf;
     while (1) {
         UINT br = 0;
         fr = f_read(&f, buf, sizeof buf, &br);
@@ -259,7 +266,7 @@ esp_err_t fat_write(const char *name83, fat_in_cb_t in, size_t total, void *ctx)
         fat_unmount(); disk_release_to_usb(); return ESP_FAIL;
     }
 
-    static uint8_t buf[4096];
+    uint8_t *buf = s_fat_iobuf;
     size_t remaining = total;
     while (remaining > 0) {
         size_t want = remaining < sizeof buf ? remaining : sizeof buf;

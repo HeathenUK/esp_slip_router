@@ -31,6 +31,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -112,7 +113,7 @@ static TaskHandle_t s_tcp_pump_task = NULL;
  * boot (panic at xStreamBufferCreate returning NULL -> pump task
  * derefs NULL handle). 8 KB absorbs ~80 ms of WiFi RX at 100 KB/s,
  * which empirically is enough. */
-#define DATA_STREAM_BYTES 8192
+#define DATA_STREAM_BYTES 4096   /* 8192 -> 4096 (SRAM: +8 KB heap, 2026-06-02) */
 static StreamBufferHandle_t s_to_cdc = NULL;
 /* Reverse pipeline: producer is on_cdc_rx (TinyUSB task, CPU1) pushing
  * raw bytes into s_to_tcp; consumer is modem_tcp_pump_task (CPU0)
@@ -425,7 +426,7 @@ static void modem_cdc_pump_task(void *arg) {
      * bytes. With TX_BUFSIZE=4096 the ring still has 2 KB headroom
      * for a USB IN transfer in flight while we stage the next
      * chunk -- continuous bulk-IN pipelining, no idle slots. */
-    static uint8_t buf[2048];
+    static uint8_t buf[1024];   /* SRAM trim 2026-06-02 (was 2048) */
     for (;;) {
         /* Park until cmd_dial signals a new session. */
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -462,8 +463,8 @@ static void modem_data_task(void *arg) {
     /* Sized to the CDC TX FIFO (2 KB) so one recv() worth of bytes fits
      * in a single FIFO drain without spinning on backpressure. outbuf
      * only used on the telnet path; binary path pushes inbuf directly. */
-    static uint8_t inbuf[2048];
-    static uint8_t outbuf[2048];
+    static uint8_t inbuf[1024];   /* SRAM trim 2026-06-02 (was 2048) */
+    static uint8_t outbuf[1024];  /* telnet path flushes incrementally as it fills */
 
     for (;;) {
     /* Park until cmd_dial signals a new session (persistent task --
@@ -723,18 +724,18 @@ static void modem_tcp_pump_task(void *arg) {
 
 /* ---- AT$ command handlers ---- */
 
-static esp_err_t save_wifi_creds(const char *ssid, const char *pass) {
-    disk_logf("nvs/cmd_wifi_set-save: ssid=\"%s\" pass-len=%zu",
-              ssid, strlen(pass));
-    nvs_handle_t h;
-    esp_err_t e = nvs_open("slip-router", NVS_READWRITE, &h);
-    if (e != ESP_OK) return e;
-    nvs_set_str(h, "ssid", ssid);
-    nvs_set_str(h, "pass", pass);
-    nvs_commit(h);
-    nvs_close(h);
-    return ESP_OK;
-}
+/* Defined in main.c. Applies creds to the running radio and connects, but
+ * persists to NVS only after a verified GOT_IP -- so a bad/stray command (or
+ * CDC-line garbage parsed as AT) can never overwrite the working network.
+ * This is why none of the handlers below write NVS directly any more. */
+extern void wifi_provision(const char *ssid, const char *pass);
+
+/* Staged single-field creds from AT$SSID=/AT$PASS=. Held here (never in NVS)
+ * until the next bare AT$WIFI applies them via wifi_provision. */
+static char s_stage_ssid[33];
+static bool s_have_stage_ssid = false;
+static char s_stage_pass[65];
+static bool s_have_stage_pass = false;
 
 static void cmd_wifi_set(const char *arg) {
     /* AT$WIFI=ssid,password -- comma is the separator; ssids with
@@ -748,18 +749,8 @@ static void cmd_wifi_set(const char *arg) {
     memcpy(ssid, arg, sl);
     strncpy(pass, comma + 1, sizeof pass - 1);
 
-    if (save_wifi_creds(ssid, pass) != ESP_OK) { r_error(); return; }
-
-    wifi_config_t wc = {0};
-    size_t n = strnlen(ssid, sizeof wc.sta.ssid);
-    memcpy(wc.sta.ssid, ssid, n);
-    n = strnlen(pass, sizeof wc.sta.password);
-    memcpy(wc.sta.password, pass, n);
-    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    esp_wifi_disconnect();
-    esp_wifi_set_config(WIFI_IF_STA, &wc);
     cdc_print("\r\nconnecting...\r\n");
-    esp_wifi_connect();
+    wifi_provision(ssid, pass);   /* applies + connects; NVS write deferred to GOT_IP */
     r_ok();
 }
 
@@ -1129,13 +1120,10 @@ static void handle_dollar(char *s) {
         if (val && eq)        cmd_wifi_set(val);
         else if (val && qm)   { cmd_wifi_query(); r_ok(); }
         else {
-            /* Bare AT$WIFI -- reconnect with stored creds. */
-            /* Reload SSID + PASS from NVS and push into the running WiFi
-             * config. esp_wifi_set_config is normally only called at
-             * boot in wifi_start(); without this, AT$SSID= / AT$PASS=
-             * writes to NVS that never reach the radio until a reset,
-             * which surprised the user (and the old arduino-esp32 build
-             * applied them immediately via WiFi.begin()). */
+            /* Bare AT$WIFI -- (re)connect using staged AT$SSID=/AT$PASS=
+             * values where given, otherwise the current NVS creds. NVS is
+             * NOT written here; wifi_provision persists only after a verified
+             * GOT_IP, so this can never clobber the working network. */
             char ssid[33] = {0}, pass[65] = {0};
             size_t ns = sizeof ssid, np = sizeof pass;
             nvs_handle_t hr;
@@ -1144,45 +1132,46 @@ static void handle_dollar(char *s) {
                 nvs_get_str(hr, "pass", pass, &np);
                 nvs_close(hr);
             }
-            wifi_config_t wc = {0};
-            size_t n = strnlen(ssid, sizeof wc.sta.ssid);
-            memcpy(wc.sta.ssid, ssid, n);
-            n = strnlen(pass, sizeof wc.sta.password);
-            memcpy(wc.sta.password, pass, n);
-            wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
+            if (s_have_stage_ssid) {
+                strncpy(ssid, s_stage_ssid, sizeof ssid - 1); ssid[sizeof ssid - 1] = 0;
+            }
+            if (s_have_stage_pass) {
+                strncpy(pass, s_stage_pass, sizeof pass - 1); pass[sizeof pass - 1] = 0;
+            }
+            s_have_stage_ssid = s_have_stage_pass = false;
             cdc_print("\r\nreconnecting...\r\n");
-            esp_wifi_disconnect();
-            esp_wifi_set_config(WIFI_IF_STA, &wc);
-            esp_wifi_connect();
+            wifi_provision(ssid, pass);
             r_ok();
         }
     } else if (!strcmp(key, "SSID")) {
-        nvs_handle_t h;
         if (val && eq) {
-            disk_logf("nvs/AT$SSID=: writing \"%s\"", val);
-            if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) { r_error(); return; }
-            nvs_set_str(h, "ssid", val);
-            nvs_commit(h); nvs_close(h);
-            /* Old build debounced SSID+PASS pair, but with separate
-             * commands we just reconnect on next AT$WIFI (or AT$WIFI=). */
+            /* Stage only -- never written to NVS here. Applied + connected
+             * (and only then eligible for NVS) on the next bare AT$WIFI. */
+            strncpy(s_stage_ssid, val, sizeof s_stage_ssid - 1);
+            s_stage_ssid[sizeof s_stage_ssid - 1] = 0;
+            s_have_stage_ssid = true;
+            disk_logf("AT$SSID=: staged \"%s\" (apply via AT$WIFI)", val);
             r_ok();
         } else {
             char ssid[33] = {0};
             size_t n = sizeof ssid;
+            nvs_handle_t h;
             if (nvs_open("slip-router", NVS_READONLY, &h) == ESP_OK) {
                 nvs_get_str(h, "ssid", ssid, &n);
                 nvs_close(h);
             }
-            cdc_print("\r\n"); cdc_print(ssid); cdc_print("\r\n");
+            /* Show the staged value if one is pending, else what's in NVS. */
+            cdc_print("\r\n"); cdc_print(s_have_stage_ssid ? s_stage_ssid : ssid); cdc_print("\r\n");
             r_ok();
         }
     } else if (!strcmp(key, "PASS")) {
         nvs_handle_t h;
         if (val && eq) {
-            disk_logf("nvs/AT$PASS=: writing len=%zu", strlen(val));
-            if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) { r_error(); return; }
-            nvs_set_str(h, "pass", val);
-            nvs_commit(h); nvs_close(h);
+            /* Stage only -- never written to NVS here. */
+            strncpy(s_stage_pass, val, sizeof s_stage_pass - 1);
+            s_stage_pass[sizeof s_stage_pass - 1] = 0;
+            s_have_stage_pass = true;
+            disk_logf("AT$PASS=: staged len=%zu (apply via AT$WIFI)", strlen(val));
             r_ok();
         } else {
             char pass[65] = {0};
@@ -1296,7 +1285,7 @@ static void handle_dollar(char *s) {
         cdc_print("\r\nOTA READY\r\n");
         long got = 0;
         int64_t last_rx_us = esp_timer_get_time();
-        static uint8_t buf[2048];
+        static uint8_t buf[1024];   /* SRAM trim 2026-06-02 (was 2048) */
         while (got < sz) {
             size_t want = (size_t)(sz - got);
             if (want > sizeof buf) want = sizeof buf;
@@ -1428,7 +1417,16 @@ static void exec(char *line) {
         case 'E': s_echo    = (p[1] != '0'); r_ok(); return;
         case 'V': s_verbose = (p[1] != '0'); r_ok(); return;
         case 'Q': s_quiet   = (p[1] == '1'); r_ok(); return;
-        case 'I': cdc_print("\r\nDOSongle Modem (Phase 1c)\r\n"); r_ok(); return;
+        case 'I': {
+            char b[96];
+            snprintf(b, sizeof b,
+                     "\r\nDOSongle Modem (Phase 1c)\r\nheap free=%u min=%u largest=%u\r\n",
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)esp_get_minimum_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            cdc_print(b);
+            r_ok(); return;
+        }
         case 'N': {
             /* AT N<n> / AT NET<n> -- telnet IAC + CR-to-CRLF processing.
              * Old build accepts both "ATN0" and "ATNET0"; HTTPGET.EXE
@@ -1576,6 +1574,11 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
 }
 
 /* ---- public entry ---- */
+
+bool modem_online_peer(const char **peer_out) {
+    if (peer_out) *peer_out = s_peer;
+    return s_online;
+}
 
 esp_err_t modem_init(void) {
     modem_load_evn();      /* restore E/V/N from NVS (AT&W saved) */

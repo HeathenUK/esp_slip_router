@@ -52,6 +52,7 @@
 #include "slip.h"
 #include "dns_forwarder.h"
 #include "kbd.h"
+#include "display.h"
 
 /* First-flash bootstrap WiFi credentials. The file `wifi_creds.h` is
  * gitignored and locally created. NVS-stored creds always take
@@ -107,8 +108,8 @@ static const char *reset_reason_name(esp_reset_reason_t rr) {
  * before the new init line. Magic+seq are then cleared so a clean
  * subsequent reboot doesn't double-print. */
 
-#define DISK_LOG_LINES        48       /* was 64 -- SRAM trim 2026-06-01 */
-#define DISK_LOG_LINE_LEN     128      /* was 160 -- prefix + 96-byte msg */
+#define DISK_LOG_LINES        24       /* 64 -> 48 -> 32 -> 24 (SRAM trim 2026-06-02) */
+#define DISK_LOG_LINE_LEN     128      /* prefix + 96-byte msg (kept 128: 96 trips format-truncation) */
 #define DISK_LOG_MSG_LEN      96
 #define RTC_LOG_LINES         32       /* smaller -- RTC SLOW is precious */
 #define RTC_LOG_LINE_LEN      128      /* was 144 -- match DISK_LOG_LINE_LEN */
@@ -816,6 +817,13 @@ static void copy_z(char *dst, size_t dstmax, const char *src) {
 static bool s_creds_from_nvs = false;   /* true if load_wifi_creds got
                                          * them from NVS (no need to
                                          * re-save on connect). */
+static bool s_persist_on_connect = false; /* true when runtime-provisioned
+                                         * creds (AT$WIFI=/AT$SSID=) are
+                                         * applied but NOT yet written to
+                                         * NVS -- we persist them only once
+                                         * GOT_IP proves they actually work,
+                                         * so a bad/stray command can never
+                                         * clobber the working network. */
 
 static void load_wifi_creds(char ssid[33], char pass[65]) {
     nvs_handle_t h;
@@ -844,19 +852,27 @@ static void load_wifi_creds(char ssid[33], char pass[65]) {
  * the arduino-esp32 behaviour (Preferences-backed). Only writes if
  * the creds didn't already come from NVS (avoids needless flash
  * wear). */
-static void save_wifi_creds_if_new(const char *ssid, const char *pass) {
-    disk_logf("nvs/bootstrap-save: from_nvs=%d ssid[0]=%d \"%s\"",
-              s_creds_from_nvs ? 1 : 0, (int)ssid[0], ssid);
-    if (s_creds_from_nvs) return;
-    if (!ssid[0]) return;
+/* Unconditional NVS cred write. Only ever called once the creds are PROVEN
+ * to connect (GOT_IP). Before this change AT$WIFI=/AT$SSID= wrote NVS
+ * immediately, so a bad or stray command (or CDC-line garbage parsed as AT)
+ * permanently clobbered the working network -- e.g. NVS ending up holding
+ * ssid="ssid". Persisting only on a verified connect makes that impossible. */
+static esp_err_t nvs_write_creds(const char *ssid, const char *pass) {
+    if (!ssid || !ssid[0]) return ESP_ERR_INVALID_ARG;
     nvs_handle_t h;
-    if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) return ESP_FAIL;
     nvs_set_str(h, "ssid", ssid);
-    nvs_set_str(h, "pass", pass);
+    nvs_set_str(h, "pass", pass ? pass : "");
     nvs_commit(h);
     nvs_close(h);
-    s_creds_from_nvs = true;
-    disk_logf("nvs/bootstrap-save: WROTE ssid=\"%s\"", ssid);
+    disk_logf("nvs/creds: WROTE ssid=\"%s\" (verified-connected)", ssid);
+    return ESP_OK;
+}
+
+static void save_wifi_creds_if_new(const char *ssid, const char *pass) {
+    if (s_creds_from_nvs) return;
+    if (!ssid[0]) return;
+    if (nvs_write_creds(ssid, pass) == ESP_OK) s_creds_from_nvs = true;
 }
 
 /* The current creds, kept in static storage so the GOT_IP handler can
@@ -881,7 +897,17 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
         disk_logf("wifi got IP " IPSTR, IP2STR(&ev->ip_info.ip));
-        save_wifi_creds_if_new(s_ssid, s_pass);
+        if (s_persist_on_connect) {
+            /* Runtime-provisioned creds (AT$WIFI=/AT$SSID=) just proved they
+             * work -- NOW it is safe to persist them, overwriting whatever
+             * was there. Until this point NVS was untouched, so a command
+             * that never connected left the working creds intact. */
+            nvs_write_creds(s_ssid, s_pass);
+            s_persist_on_connect = false;
+            s_creds_from_nvs = true;
+        } else {
+            save_wifi_creds_if_new(s_ssid, s_pass);
+        }
         httpd_start_once();
         mdns_start_once();
     }
@@ -935,6 +961,30 @@ static void wifi_start(void) {
      * stub PCB antenna, sits far from APs. +19.5 dBm is the chip max. */
     esp_wifi_set_max_tx_power(78);   /* 78 * 0.25 dBm = 19.5 dBm */
     disk_logf("wifi: STA started, ssid=\"%s\"", s_ssid);
+}
+
+/* Runtime (re)provision of WiFi creds from the modem (AT$WIFI=/AT$SSID=).
+ * Applies the creds to the running radio and connects, but does NOT write
+ * NVS -- persistence is deferred to the GOT_IP handler, so creds that never
+ * associate cannot overwrite the working network. Called from modem.c. */
+void wifi_provision(const char *ssid, const char *pass) {
+    if (!ssid) ssid = "";
+    if (!pass) pass = "";
+    copy_z(s_ssid, sizeof s_ssid, ssid);
+    copy_z(s_pass, sizeof s_pass, pass);
+    s_persist_on_connect = true;     /* persist iff this actually connects */
+    s_creds_from_nvs = false;
+
+    wifi_config_t wc = {0};
+    size_t n = strnlen(s_ssid, sizeof wc.sta.ssid);
+    memcpy(wc.sta.ssid, s_ssid, n);
+    n = strnlen(s_pass, sizeof wc.sta.password);
+    memcpy(wc.sta.password, s_pass, n);
+    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    disk_logf("wifi: provision ssid=\"%s\" (apply+connect, NVS deferred)", s_ssid);
+    esp_wifi_disconnect();
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    esp_wifi_connect();
 }
 
 /* ===== app_main ====================================================== */
@@ -1006,6 +1056,12 @@ void app_main(void) {
         if (e != ESP_OK)
             disk_logf("usb_start at boot failed: %s", esp_err_to_name(e));
     }
+
+    /* Status LCD (0.96" ST7735). Brought up last so the state accessors
+     * it polls (wifi/IP, slip stats, modem online/peer, CDC) all exist.
+     * Self-contained: spawns its own task and degrades gracefully if the
+     * panel fails to init. */
+    display_init();
 
     /* Idle forever. WiFi event handler will start HTTP + mDNS once
      * STA is connected. Subsequent phases will start additional tasks
