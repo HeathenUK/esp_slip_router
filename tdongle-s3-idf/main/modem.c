@@ -907,6 +907,21 @@ static void cmd_netif(void) {
  * Reads the dial argument from s_dial_arg (populated by cmd_dial under
  * the s_at_busy guard, so no concurrent writer). */
 static void cmd_dial_impl(const char *arg) {
+    /* Hang up any lingering connection before dialing (standard modem
+     * behaviour). Without this, a +++ escape leaves s_sock OPEN (for ATO)
+     * with no task draining it -- the peer keeps sending, lwIP buffers a
+     * full TCP window of pbufs nobody consumes, and a re-dial then LEAKS
+     * that socket (unclosable until reboot, still holding ~8 KB of pbufs).
+     * Repeated across a session this bleeds heap to starvation -> wedge.
+     * (2026-06-03 leak fix; see never-starve directive.) */
+    if (s_sock >= 0) {
+        s_online = false;
+        vTaskDelay(pdMS_TO_TICKS(20));   /* let the pump/data tasks park */
+        close(s_sock);
+        s_sock = -1;
+        s_peer[0] = 0;
+    }
+
     char host[80];
     uint16_t port = 23;     /* Hayes default = telnet */
     const char *colon = strrchr(arg, ':');

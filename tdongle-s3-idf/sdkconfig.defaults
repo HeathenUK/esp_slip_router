@@ -186,3 +186,6 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 # CONFIG_LWIP_TCPIP_TASK_AFFINITY_NO_AFFINITY is not set
 # (CDC TX FIFO stays at 2048 -- bumping to 16384 made best case worse,
 # the FIFO isn't where the throughput is being lost.)
+# Stack high-water monitoring via uxTaskGetSystemState (/tasks endpoint).
+# ~160 B for the full task table; kept as a permanent diagnostic.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y

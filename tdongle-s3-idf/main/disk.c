@@ -23,6 +23,7 @@
 #include "disk.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
 
@@ -418,47 +419,56 @@ static inline void put32(uint8_t *p, uint32_t v) {
     p[3] = (uint8_t)(v >> 24);
 }
 
+/* sbuf/zero were static .bss (8 KB) but are only touched during format
+ * (first-boot mkfs or POST /format) -- on-demand heap reclaims that 8 KB.
+ * Format runs with no host mounted and heap high, so the malloc is safe;
+ * on OOM we fail the format cleanly rather than carry the static cost. */
 static esp_err_t raw_write_bytes(uint32_t off, const void *buf, size_t len) {
     if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
     size_t sect = wl_sector_size(s_wl);
-    static uint8_t sbuf[4096];
-    if (sect > sizeof sbuf || (sect & (sect - 1)) != 0) return ESP_ERR_INVALID_SIZE;
+    if (sect > 4096 || (sect & (sect - 1)) != 0) return ESP_ERR_INVALID_SIZE;
+    uint8_t *sbuf = malloc(sect);
+    if (!sbuf) return ESP_ERR_NO_MEM;
 
+    esp_err_t rc = ESP_OK;
     const uint8_t *src = (const uint8_t *)buf;
     while (len > 0) {
         size_t sect_off  = off & (sect - 1);
         size_t sect_base = off - sect_off;
         size_t chunk     = sect - sect_off;
         if (chunk > len) chunk = len;
-        if (wl_read(s_wl, sect_base, sbuf, sect) != ESP_OK) return ESP_FAIL;
+        if (wl_read(s_wl, sect_base, sbuf, sect) != ESP_OK) { rc = ESP_FAIL; break; }
         memcpy(sbuf + sect_off, src, chunk);
-        if (wl_erase_range(s_wl, sect_base, sect) != ESP_OK) return ESP_FAIL;
-        if (wl_write(s_wl, sect_base, sbuf, sect) != ESP_OK) return ESP_FAIL;
+        if (wl_erase_range(s_wl, sect_base, sect) != ESP_OK) { rc = ESP_FAIL; break; }
+        if (wl_write(s_wl, sect_base, sbuf, sect) != ESP_OK) { rc = ESP_FAIL; break; }
         off += chunk; src += chunk; len -= chunk;
     }
-    return ESP_OK;
+    free(sbuf);
+    return rc;
 }
 
 static esp_err_t raw_zero_bytes(uint32_t off, size_t len) {
-    static uint8_t zero[4096];
     size_t sect = wl_sector_size(s_wl);
-    if (sect > sizeof zero || (sect & (sect - 1)) != 0) return ESP_ERR_INVALID_SIZE;
-    memset(zero, 0, sect);
+    if (sect > 4096 || (sect & (sect - 1)) != 0) return ESP_ERR_INVALID_SIZE;
+    uint8_t *zero = calloc(1, sect);
+    if (!zero) return ESP_ERR_NO_MEM;
 
+    esp_err_t rc = ESP_OK;
     while (len > 0) {
         if ((off & (sect - 1)) == 0 && len >= sect) {
-            if (wl_erase_range(s_wl, off, sect) != ESP_OK) return ESP_FAIL;
-            if (wl_write(s_wl, off, zero, sect) != ESP_OK) return ESP_FAIL;
+            if (wl_erase_range(s_wl, off, sect) != ESP_OK) { rc = ESP_FAIL; break; }
+            if (wl_write(s_wl, off, zero, sect) != ESP_OK) { rc = ESP_FAIL; break; }
             off += sect; len -= sect;
             continue;
         }
         size_t align = sect - (off & (sect - 1));
         size_t n = len < align ? len : align;
-        esp_err_t err = raw_write_bytes(off, zero, n);
-        if (err != ESP_OK) return err;
+        esp_err_t err = raw_write_bytes(off, zero, n);   /* mallocs its own sbuf */
+        if (err != ESP_OK) { rc = err; break; }
         off += n; len -= n;
     }
-    return ESP_OK;
+    free(zero);
+    return rc;
 }
 
 /* Hand-build a FAT12 superfloppy at the start of the partition.

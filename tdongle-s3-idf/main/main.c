@@ -744,6 +744,31 @@ static esp_err_t h_usb_stats(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* /tasks: per-task stack high-water (bytes still free at the worst point
+ * since boot) so we can trim over-provisioned stacks with DATA, not guesses.
+ * stack_free near 0 = do NOT trim; large = reclaimable. Needs
+ * CONFIG_FREERTOS_USE_TRACE_FACILITY (enabled). */
+static esp_err_t h_tasks(httpd_req_t *req) {
+    UBaseType_t n = uxTaskGetNumberOfTasks();
+    TaskStatus_t *st = malloc(n * sizeof(TaskStatus_t));
+    if (!st) return send_text(req, "500 Internal Server Error", "text/plain", "oom\n");
+    n = uxTaskGetSystemState(st, n, NULL);
+    httpd_resp_set_type(req, "text/plain");
+    char line[80];
+    for (UBaseType_t i = 0; i < n; ++i) {
+        /* usStackHighWaterMark is the min free stack ever. On ESP-IDF
+         * StackType_t is a byte, so this is already in BYTES (not words). */
+        snprintf(line, sizeof line, "%-16s pri=%-2u stack_free=%u B\n",
+                 st[i].pcTaskName,
+                 (unsigned)st[i].uxCurrentPriority,
+                 (unsigned)st[i].usStackHighWaterMark);
+        httpd_resp_sendstr_chunk(req, line);
+    }
+    httpd_resp_sendstr_chunk(req, NULL);
+    free(st);
+    return ESP_OK;
+}
+
 static httpd_handle_t s_httpd = NULL;
 
 static void httpd_start_once(void) {
@@ -782,6 +807,7 @@ static void httpd_start_once(void) {
         { .uri = "/usb-reconnect", .method = HTTP_POST, .handler = h_usb_reconnect, .user_ctx = NULL },
         { .uri = "/usb-start", .method = HTTP_POST, .handler = h_usb_start, .user_ctx = NULL },
         { .uri = "/usb-stats", .method = HTTP_GET,  .handler = h_usb_stats, .user_ctx = NULL },
+        { .uri = "/tasks",     .method = HTTP_GET,  .handler = h_tasks,     .user_ctx = NULL },
         { .uri = "/list",      .method = HTTP_GET,  .handler = h_list,      .user_ctx = NULL },
         { .uri = "/fs/*",      .method = HTTP_GET,    .handler = h_fs_get,    .user_ctx = NULL },
         { .uri = "/fs/*",      .method = HTTP_PUT,    .handler = h_fs_put,    .user_ctx = NULL },
