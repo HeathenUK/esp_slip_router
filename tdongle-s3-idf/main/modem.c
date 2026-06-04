@@ -163,7 +163,7 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
 #define WINCTL_START   16384
 #define WINCTL_MAX     16384
 #define WINCTL_STEP    4096
-#define WINCTL_HEAP_LOW  10240   /* shrink hard below this (clamp; well above the 5K guard) */
+#define WINCTL_HEAP_LOW  12288   /* clamp below this; ~2.4K overshoot drain => floor lands ~10K, 5K over the guard */
 #define WINCTL_HEAP_HIGH 24576   /* re-grow only above this (full-fill of MAX must clear the guard) */
 #define WINCTL_TICK_US   (500*1000)
 #define WINCTL_SAT_US    100000   /* cdc_write blocked >100ms in a 500ms tick => consumer-bound */
@@ -636,9 +636,16 @@ static void modem_data_task(void *arg) {
          * crosses the clamp line; the tick below re-grows once heap recovers
          * above WINCTL_HEAP_HIGH. Different heap regimes => no oscillation. */
         if (freeb < WINCTL_HEAP_LOW && win > WINCTL_MIN) {
-            win = WINCTL_MIN;
-            setsockopt(s_sock, SOL_SOCKET, SO_RCVBUF, &win, sizeof win);
-            disk_logf("winctl FAST-clamp ->%d heap=%u", win, (unsigned)freeb);
+            /* Gentle step (-2*STEP), same law as the tick's clamp branch but
+             * per-iteration: re-fires next chunk if still low, so it converges
+             * progressively rather than slamming to MIN and lurching throughput.
+             * Already-buffered data still has to drain, so the floor overshoots
+             * this trigger by a few KB -- WINCTL_HEAP_LOW carries the margin. */
+            int newin = win - 2*WINCTL_STEP;
+            if (newin < WINCTL_MIN) newin = WINCTL_MIN;
+            setsockopt(s_sock, SOL_SOCKET, SO_RCVBUF, &newin, sizeof newin);
+            disk_logf("winctl FAST-clamp %d->%d heap=%u", win, newin, (unsigned)freeb);
+            win = newin;
             ctl_blk = s_tp_blk_us;   /* don't fold this into the next tick's blk_delta */
         }
 
