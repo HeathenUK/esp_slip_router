@@ -527,23 +527,22 @@ static void modem_cdc_pump_task(void *arg) {
     }
 }
 
-/* Auto-detect a telnet server: a real telnet host (towel, BBSes) announces
- * itself with IAC negotiation (IAC WILL/WONT/DO/DONT) in its opening bytes.
- * We scan for that so a port-23 dial left in binary mode (e.g. ATNET0 stuck
- * from a prior WGET) still gets its IAC processed instead of dumped raw into
- * the terminal. Only WILL/WONT/DO/DONT match -- NOT IAC IAC (0xFF 0xFF, an
- * escaped data byte) -- which binary data almost never carries. Caller gates
- * this to port 23, so an HTTP download (port 80) is never inspected and can
- * never be misclassified. */
-static bool sniff_telnet_iac(const uint8_t *b, int n) {
-    for (int i = 0; i + 1 < n; ++i) {
-        if (b[i] == TN_IAC) {
-            uint8_t c = b[i + 1];
-            if (c == TN_WILL || c == TN_WONT || c == TN_DO || c == TN_DONT)
-                return true;
-        }
-    }
-    return false;
+/* Auto-detect telnet by the connection OPENING with IAC negotiation -- works
+ * on ANY port, no port gate. A telnet/BBS server leads with IAC WILL/WONT/DO/
+ * DONT (or SB) as the very first bytes. An HTTP response ALWAYS opens with
+ * "HTTP/" (byte 0 = 'H', 0x48), never 0xFF, regardless of header length or
+ * port -- so a download can never false-trigger (its body's stray 0xFF only
+ * ever appears AFTER the headers, never at offset 0). Checking just the
+ * opening byte is what makes this both port-independent AND HTTP-safe.
+ * Returns 1=telnet, 0=not telnet (commit binary), -1=need another byte
+ * (a lone leading IAC split across recv chunks). */
+static int telnet_opens_with_iac(const uint8_t *b, int n) {
+    if (n < 1)            return -1;
+    if (b[0] != TN_IAC)   return 0;     /* HTTP 'H', ANSI ESC, plain text -> binary */
+    if (n < 2)            return -1;    /* lone IAC so far -- wait for the command byte */
+    uint8_t c = b[1];
+    return (c == TN_WILL || c == TN_WONT || c == TN_DO ||
+            c == TN_DONT || c == TN_SB) ? 1 : 0;
 }
 
 static void modem_data_task(void *arg) {
@@ -566,12 +565,11 @@ static void modem_data_task(void *arg) {
     struct timeval rcv_tv = { .tv_sec = 0, .tv_usec = 100 * 1000 };
     setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof rcv_tv);
 
-    /* Auto-telnet: if we dialed a telnet port (23) but telnet handling is off
-     * (e.g. ATNET0 left over from a WGET), sniff the opening bytes for IAC
-     * negotiation and switch on telnet handling if the server announces it.
-     * Port-23-gated so an HTTP download can never be inspected/misclassified. */
-    bool     autosniff   = (!s_telnet && s_peer_port == 23);
-    uint32_t sniff_bytes = 0;
+    /* Auto-telnet: if telnet handling is off (e.g. ATNET0 left over from a
+     * WGET) and the peer OPENS the connection with IAC negotiation, switch
+     * telnet handling on. Port-independent (works for BBSes on any port) and
+     * HTTP-safe (HTTP opens with "HTTP/", never IAC -- see telnet_opens_with_iac). */
+    bool autosniff = !s_telnet;
 
     bool peer_closed = false;
 
@@ -596,17 +594,19 @@ static void modem_data_task(void *arg) {
         int n = recv(s_sock, inbuf, sizeof inbuf, 0);
         if (n > 0) s_tp_rx += (uint32_t)n;
         if (n > 0 && autosniff) {
-            /* Sniff the opening for telnet negotiation; flip BEFORE the
-             * dispatch below so this very chunk routes through the IAC
-             * machine (the negotiation bytes get processed, not relayed raw). */
-            if (sniff_telnet_iac(inbuf, n)) {
+            /* Decide from the connection OPENING; flip BEFORE the dispatch
+             * below so this chunk routes through the IAC machine (negotiation
+             * processed, not relayed raw). */
+            int r = telnet_opens_with_iac(inbuf, n);
+            if (r > 0) {
                 s_telnet  = true;
                 autosniff = false;
                 tn_start();   /* proper entry: T_DATA reset + send our option offers */
-                disk_logf("modem: auto-detected telnet (IAC) on port 23 -> telnet mode");
-            } else if ((sniff_bytes += (uint32_t)n) > 512U) {
-                autosniff = false;   /* opening passed with no IAC -- commit to binary */
+                disk_logf("modem: auto-detected telnet (opens with IAC) -> telnet mode");
+            } else if (r == 0) {
+                autosniff = false;   /* opens with non-IAC (HTTP 'H', ANSI, text) -- binary */
             }
+            /* r < 0: lone leading IAC split across recv chunks -- keep sniffing */
         }
         if (n > 0 && !s_telnet) {
             /* Binary fast path: skip the per-byte IAC state machine when
