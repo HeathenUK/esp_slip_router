@@ -66,8 +66,11 @@ The guard prevented a wedge, but 816 B is not "rock solid."
 
 Two conclusions: (1) the grow reacts too slowly to a fast flood; (2) growing
 gives **no throughput benefit** for this dongle's consumers anyway -- they're
-consumer-bound (Mac CDC ~100 KB/s, DOS CHUSB ~17 KB/s), and 4K already saturates
-them (4096 / internet-RTT > 100 KB/s). So growing is all-risk-no-reward here.
+consumer-bound ... [BOTH WRONG -- see the CORRECTION at the bottom of this file.
+The real limiter was the receive WINDOW, not the consumer. And the "DOS CHUSB
+~17 KB/s" figure cited here was a STALE/unverified number repeated as fact: DOS
+downloads have been observed at 70+ KB/s, so the consumer is NOT the bottleneck
+at these speeds. Do not cite 17 KB/s.]
 
 Fix: WINCTL_MAX = WINCTL_START = 4096 (the proven-safe value; internet floor was
 14-16K). The controller now only SHRINKS (4K -> 2K, consumer-driven) + clamps on
