@@ -147,7 +147,7 @@ CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
 # "Rock solid" was lost to peak speed. 4 KB halves the held backlog (heap
 # floor back to ~14-16 K) for ~80 KB/s. The per-socket SO_RCVBUF (below +
 # modem.c) then tightens it per use case: 2 KB telnet / 4 KB binary. */
-CONFIG_LWIP_TCP_WND_DEFAULT=4096
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
 # Per-socket receive-window capping. Lets modem.c size the window to the
 # session type (telnet 2 KB smooth-pacing vs binary 4 KB bulk) -- the
 # reliability lever that hard-bounds pbufs held by one connection. Setting

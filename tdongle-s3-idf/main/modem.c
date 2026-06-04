@@ -144,20 +144,27 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
  * bleed) or heap tightens. Consumer-driven, supersedes the static telnet/binary
  * split.
  *
- * CEILING CAPPED AT 4K (2026-06-04): growing to 8K was validated UNSAFE against
- * a fast (low-RTT/LAN) server -- it floods the window faster than the 500ms tick
- * can shrink, bleeding heap to ~816 B and tripping the 5K guard (transfer then
- * failed). AND it gives NO throughput benefit for this dongle's consumers, which
- * are consumer-bound (Mac CDC ~100KB/s, DOS CHUSB ~17KB/s): 4K already saturates
- * them. So MAX==START==4K -- the controller shrinks but does not grow past the
- * proven-safe value. (Raise WINCTL_MAX only if a fast WINDOW-bound consumer is
- * ever validated, AND the fast-flood reaction is hardened first.) */
-#define WINCTL_MIN     2048
-#define WINCTL_START   4096
-#define WINCTL_MAX     4096
-#define WINCTL_STEP    2048
+ * CEILING 16K (2026-06-04, corrected): a download's throughput ceiling is the
+ * advertised RECEIVE window: tput <= RWND / RTT. On a weak link RTT inflates
+ * under load (802.11 retransmits), so the old 4K cap window-limited downloads to
+ * ~7 KB/s in the same spot that did 70 KB/s with a 64K window. The earlier "4K
+ * is safe, bigger bleeds" finding was a FALSE ALARM -- that test (fast LAN server
+ * -> dongle) was confounded by the same weak-2.4GHz RF path, not a heap bug.
+ *
+ * Why a big window is safe HERE: a download with a keep-up consumer (Mac CDC
+ * ~100KB/s > the ~70KB/s WiFi fill) keeps the lwIP buffer DRAINED -> a 16K window
+ * costs almost no resident heap. Heap only piles up with a SLOW consumer -- and
+ * that is exactly when the controller shrinks on cdc_block saturation. So: start
+ * at the ceiling for immediate throughput, shrink reactively when the consumer
+ * can't keep up or heap tightens. 16K is the largest that survives even a sudden
+ * total stall on the 26K-baseline heap (26K - 16K > the 5K guard). Going bigger
+ * needs heap recovery or a per-iteration (not 500ms-tick) heap-shrink first. */
+#define WINCTL_MIN     4096
+#define WINCTL_START   16384
+#define WINCTL_MAX     16384
+#define WINCTL_STEP    4096
 #define WINCTL_HEAP_LOW  10240   /* shrink hard below this (clamp; well above the 5K guard) */
-#define WINCTL_HEAP_HIGH 18432   /* grow only above this (moot while MAX==START) */
+#define WINCTL_HEAP_HIGH 24576   /* re-grow only above this (full-fill of MAX must clear the guard) */
 #define WINCTL_TICK_US   (500*1000)
 #define WINCTL_SAT_US    100000   /* cdc_write blocked >100ms in a 500ms tick => consumer-bound */
 
@@ -620,6 +627,19 @@ static void modem_data_task(void *arg) {
             s_peer[0] = 0;
             r_nocarrier();
             break;
+        }
+
+        /* --- fast heap clamp (per-iteration, NOT tick-gated) --- */
+        /* A 16K window can pile into heap faster than the 500ms tick reacts: in
+         * testing the floor dipped to 7.7K (below WINCTL_HEAP_LOW) before the
+         * tick shrank it. So shrink to the floor IMMEDIATELY the moment heap
+         * crosses the clamp line; the tick below re-grows once heap recovers
+         * above WINCTL_HEAP_HIGH. Different heap regimes => no oscillation. */
+        if (freeb < WINCTL_HEAP_LOW && win > WINCTL_MIN) {
+            win = WINCTL_MIN;
+            setsockopt(s_sock, SOL_SOCKET, SO_RCVBUF, &win, sizeof win);
+            disk_logf("winctl FAST-clamp ->%d heap=%u", win, (unsigned)freeb);
+            ctl_blk = s_tp_blk_us;   /* don't fold this into the next tick's blk_delta */
         }
 
         /* --- adaptive window controller tick (time-gated, ~500ms) --- */
