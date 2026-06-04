@@ -172,12 +172,17 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
  * cdc_block saturation for that case; the heap clamp is the abnormal-pressure
  * backstop (set BELOW the natural floor so it doesn't fire every cycle). */
 #define WINCTL_MIN     4096
-#define WINCTL_START   4096      /* START SMALL, grow into fast consumers. A slow consumer (e.g. DOS
-                                  * CHUSB ~50 KB/s) would pile a big START window into heap in the
-                                  * first ~500ms before the clamp reacts -- that dropped the DOS floor
-                                  * to 6.5K. Starting at the floor means slow consumers never pile up
-                                  * (saturation-shrink holds them here); fast consumers ramp 4K->14K in
-                                  * ~1.5s via the grow branch. Zero cost to DOS tput (CHUSB-bound). */
+#define WINCTL_START   10240     /* REVERTED 4096->10240 (2026-06-04): START=4096 regressed tele2 --
+                                  * the version with START=10240 (commit 4e76747) COMPLETED a tele2
+                                  * download (the 50 KB/s run); dropping START to 4096 made the same
+                                  * download FREEZE (LOW HEAP abort). Same controller, only START
+                                  * differs -- so this restores the known-tele2-working behaviour.
+                                  * Starting at 10K lets a fast WiFi feed + slow consumer saturate
+                                  * immediately -> the controller clamps DOWN to a small safe window,
+                                  * rather than (at START=4096) the window looking unsaturated and
+                                  * GROWING into a heap crater. WHY exactly start size flips this is
+                                  * the open question we are still investigating -- this is a revert to
+                                  * a measured-good state, not a claimed root-cause fix. */
 #define WINCTL_MAX     14336     /* GROWTH: the ~2K freed from UPLOAD_STREAM_BYTES funds a higher
                                   * ceiling at the same floor. Grows toward 14K only when blk is low
                                   * (consumer keeps up) AND free > WINCTL_HEAP_HIGH; shrinks otherwise. */
