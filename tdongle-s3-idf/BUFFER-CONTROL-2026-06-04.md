@@ -83,3 +83,31 @@ heap-shrink, not just the 500ms tick).
    expect the window to **stay small / shrink** (saturated), heap floor stays
    well clear of the cliff — i.e. NO bleed. winctl log shows it holding low.
 3. Confirm the 5 KB guard never fires in either.
+
+## CORRECTION 2026-06-04 (later) — the 4K cap was the bug, not the fix
+
+The "fast LAN flood bled heap at 8K" finding above was a FALSE ALARM: that test
+(Mac local server -> dongle) was confounded, and the real limiter throughout was
+the RECEIVE WINDOW, not heap. Capping at 4K window-limited downloads to ~7 KB/s
+on a weak link (the same spot did 70 KB/s at TCP_WND=65535) — tput <= RWND/RTT,
+and weak-link RTT inflates under load.
+
+Key correction: `SO_RCVBUF` (what this controller sets) can never raise the
+advertised window above `CONFIG_LWIP_TCP_WND_DEFAULT`. With TCP_WND_DEFAULT=4096
+the controller's growth was a no-op. Fix: TCP_WND_DEFAULT 4096 -> 16384, and:
+
+| param | value | why |
+|---|---|---|
+| WINCTL_MIN | 4096 | telnet / slow-consumer floor |
+| WINCTL_START/MAX | 10240 | sized for a SAFE heap floor, not peak speed (below) |
+| WINCTL_STEP | 4096 | |
+| HEAP_LOW | 8192 | abnormal-pressure clamp, below the ~8-9K natural floor |
+| HEAP_HIGH | 24576 | re-grow gate |
+
+**The window/floor law:** a fast recv() buffers up to a full window before the
+loop re-checks heap, so floor ~= baseline - window - ~5K, and no clamp beats it —
+the ceiling is the only lever. On 26K baseline: 16K -> 200 KB/s but 6K floor (~1K
+over guard, too tight); 10K -> ~190 KB/s, ~8K floor. Chose 10K: still ~2.7x the
+prior 70 KB/s baseline, with the guard comfortably clear. A per-iteration fast
+clamp + saturation-shrink remain as backstops for the slow-consumer case.
+Measured at RSSI -68: ~190 KB/s, byte-perfect x20+, guard never fired, no leak.
