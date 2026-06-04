@@ -98,6 +98,7 @@ static void modem_save_evn(void) {
 static int       s_sock = -1;
 static volatile bool s_online = false;
 static char      s_peer[96] = {0};       /* "host:port" string for AT$STATUS */
+static volatile uint16_t s_peer_port = 0; /* numeric port of the active dial (auto-telnet gate) */
 static TaskHandle_t s_data_task = NULL;
 static TaskHandle_t s_cdc_pump_task = NULL;
 static TaskHandle_t s_tcp_pump_task = NULL;
@@ -526,6 +527,25 @@ static void modem_cdc_pump_task(void *arg) {
     }
 }
 
+/* Auto-detect a telnet server: a real telnet host (towel, BBSes) announces
+ * itself with IAC negotiation (IAC WILL/WONT/DO/DONT) in its opening bytes.
+ * We scan for that so a port-23 dial left in binary mode (e.g. ATNET0 stuck
+ * from a prior WGET) still gets its IAC processed instead of dumped raw into
+ * the terminal. Only WILL/WONT/DO/DONT match -- NOT IAC IAC (0xFF 0xFF, an
+ * escaped data byte) -- which binary data almost never carries. Caller gates
+ * this to port 23, so an HTTP download (port 80) is never inspected and can
+ * never be misclassified. */
+static bool sniff_telnet_iac(const uint8_t *b, int n) {
+    for (int i = 0; i + 1 < n; ++i) {
+        if (b[i] == TN_IAC) {
+            uint8_t c = b[i + 1];
+            if (c == TN_WILL || c == TN_WONT || c == TN_DO || c == TN_DONT)
+                return true;
+        }
+    }
+    return false;
+}
+
 static void modem_data_task(void *arg) {
     (void)arg;
     /* Sized to the CDC TX FIFO (2 KB) so one recv() worth of bytes fits
@@ -545,6 +565,13 @@ static void modem_data_task(void *arg) {
      * is silent. */
     struct timeval rcv_tv = { .tv_sec = 0, .tv_usec = 100 * 1000 };
     setsockopt(s_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof rcv_tv);
+
+    /* Auto-telnet: if we dialed a telnet port (23) but telnet handling is off
+     * (e.g. ATNET0 left over from a WGET), sniff the opening bytes for IAC
+     * negotiation and switch on telnet handling if the server announces it.
+     * Port-23-gated so an HTTP download can never be inspected/misclassified. */
+    bool     autosniff   = (!s_telnet && s_peer_port == 23);
+    uint32_t sniff_bytes = 0;
 
     bool peer_closed = false;
 
@@ -568,6 +595,19 @@ static void modem_data_task(void *arg) {
 
         int n = recv(s_sock, inbuf, sizeof inbuf, 0);
         if (n > 0) s_tp_rx += (uint32_t)n;
+        if (n > 0 && autosniff) {
+            /* Sniff the opening for telnet negotiation; flip BEFORE the
+             * dispatch below so this very chunk routes through the IAC
+             * machine (the negotiation bytes get processed, not relayed raw). */
+            if (sniff_telnet_iac(inbuf, n)) {
+                s_telnet  = true;
+                autosniff = false;
+                tn_start();   /* proper entry: T_DATA reset + send our option offers */
+                disk_logf("modem: auto-detected telnet (IAC) on port 23 -> telnet mode");
+            } else if ((sniff_bytes += (uint32_t)n) > 512U) {
+                autosniff = false;   /* opening passed with no IAC -- commit to binary */
+            }
+        }
         if (n > 0 && !s_telnet) {
             /* Binary fast path: skip the per-byte IAC state machine when
              * telnet is off -- push inbuf straight into the CDC pipeline.
@@ -1099,6 +1139,7 @@ static void cmd_dial_impl(const char *arg) {
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
 
     s_sock = sock;
+    s_peer_port = port;
     snprintf(s_peer, sizeof s_peer, "%s:%u", host, (unsigned)port);
     s_plus_count = 0;
     s_last_data_us = esp_timer_get_time();
