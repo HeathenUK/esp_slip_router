@@ -151,20 +151,26 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
  * is safe, bigger bleeds" finding was a FALSE ALARM -- that test (fast LAN server
  * -> dongle) was confounded by the same weak-2.4GHz RF path, not a heap bug.
  *
- * Why a big window is safe HERE: a download with a keep-up consumer (Mac CDC
- * ~100KB/s > the ~70KB/s WiFi fill) keeps the lwIP buffer DRAINED -> a 16K window
- * costs almost no resident heap. Heap only piles up with a SLOW consumer -- and
- * that is exactly when the controller shrinks on cdc_block saturation. So: start
- * at the ceiling for immediate throughput, shrink reactively when the consumer
- * can't keep up or heap tightens. 16K is the largest that survives even a sudden
- * total stall on the 26K-baseline heap (26K - 16K > the 5K guard). Going bigger
- * needs heap recovery or a per-iteration (not 500ms-tick) heap-shrink first. */
+ * CEILING SIZED FOR THE HEAP FLOOR, not for peak speed. A fast download buffers
+ * up to a full window inside a single recv() before the loop can re-check heap,
+ * so the floor is set by the window itself: floor ~= baseline - window - ~5K
+ * overhead. Measured: a 16K window -> 200 KB/s but floor 6.2K (only ~1K over the
+ * 5K guard -- NOT rock solid). The fast clamp can't help: the buffering happens
+ * inside recv(), faster than any per-iteration check. The ONLY lever is the
+ * ceiling. So size the window for a SAFE floor and accept the (still large)
+ * throughput: 10K -> floor ~12K (7K over the guard), ~150+ KB/s -- 2x the prior
+ * 70 KB/s baseline in this spot, with margin to spare. (Raise only after
+ * recovering baseline heap; do not trade the floor for speed we don't need.)
+ *
+ * Heap still only piles up with a SLOW consumer -- the controller shrinks on
+ * cdc_block saturation for that case; the heap clamp is the abnormal-pressure
+ * backstop (set BELOW the natural floor so it doesn't fire every cycle). */
 #define WINCTL_MIN     4096
-#define WINCTL_START   16384
-#define WINCTL_MAX     16384
+#define WINCTL_START   10240
+#define WINCTL_MAX     10240
 #define WINCTL_STEP    4096
-#define WINCTL_HEAP_LOW  12288   /* clamp below this; ~2.4K overshoot drain => floor lands ~10K, 5K over the guard */
-#define WINCTL_HEAP_HIGH 24576   /* re-grow only above this (full-fill of MAX must clear the guard) */
+#define WINCTL_HEAP_LOW  8192    /* abnormal-pressure clamp: below the ~12K natural floor, above the 5K guard */
+#define WINCTL_HEAP_HIGH 24576   /* re-grow gate (moot while MAX==START; kept for the shrink/recover path) */
 #define WINCTL_TICK_US   (500*1000)
 #define WINCTL_SAT_US    100000   /* cdc_write blocked >100ms in a 500ms tick => consumer-bound */
 
