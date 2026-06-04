@@ -138,6 +138,20 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
  * the guard actively RECOVERS heap rather than just bailing. */
 #define LOW_HEAP_GUARD_BYTES 5120
 
+/* Adaptive RX-window controller (see BUFFER-CONTROL-2026-06-04.md). Sizes the
+ * relay's receive window to the largest the consumer can drain without risking
+ * heap: grows when heap is ample AND the consumer keeps up; shrinks when the
+ * consumer saturates (a bigger window only piles up backlog for a slow consumer
+ * -- the bleed) or heap tightens. Subsumes the static telnet/binary split. */
+#define WINCTL_MIN     2048
+#define WINCTL_START   4096
+#define WINCTL_MAX     8192
+#define WINCTL_STEP    2048
+#define WINCTL_HEAP_LOW  10240   /* shrink hard below this (clamp; well above the 5K guard) */
+#define WINCTL_HEAP_HIGH 18432   /* grow only above this (real headroom) */
+#define WINCTL_TICK_US   (500*1000)
+#define WINCTL_SAT_US    100000   /* cdc_write blocked >100ms in a 500ms tick => consumer-bound */
+
 static StreamBufferHandle_t s_to_cdc = NULL;
 /* Reverse pipeline: producer is on_cdc_rx (TinyUSB task, CPU1) pushing
  * raw bytes into s_to_tcp; consumer is modem_tcp_pump_task (CPU0)
@@ -571,6 +585,14 @@ static void modem_data_task(void *arg) {
      * HTTP-safe (HTTP opens with "HTTP/", never IAC -- see telnet_opens_with_iac). */
     bool autosniff = !s_telnet;
 
+    /* Adaptive RX-window controller (BUFFER-CONTROL-2026-06-04.md). Owns the
+     * receive window for this session from here: starts moderate, then sizes to
+     * consumer keep-up + heap headroom each tick. */
+    int      win      = WINCTL_START;
+    setsockopt(s_sock, SOL_SOCKET, SO_RCVBUF, &win, sizeof win);
+    int64_t  ctl_last = esp_timer_get_time();
+    uint64_t ctl_blk  = s_tp_blk_us;
+
     bool peer_closed = false;
 
     while (s_online && s_sock >= 0) {
@@ -589,6 +611,25 @@ static void modem_data_task(void *arg) {
             s_peer[0] = 0;
             r_nocarrier();
             break;
+        }
+
+        /* --- adaptive window controller tick (time-gated, ~500ms) --- */
+        int64_t nowus = esp_timer_get_time();
+        if (nowus - ctl_last >= WINCTL_TICK_US) {
+            uint64_t blk = s_tp_blk_us, blk_delta = blk - ctl_blk;
+            int newin = win;
+            if      (freeb < WINCTL_HEAP_LOW)  newin = win - 2*WINCTL_STEP; /* clamp: heap tight */
+            else if (blk_delta > WINCTL_SAT_US) newin = win - WINCTL_STEP;  /* consumer-bound */
+            else if (freeb > WINCTL_HEAP_HIGH)  newin = win + WINCTL_STEP;  /* headroom: grow */
+            if (newin < WINCTL_MIN) newin = WINCTL_MIN;
+            if (newin > WINCTL_MAX) newin = WINCTL_MAX;
+            if (newin != win) {
+                setsockopt(s_sock, SOL_SOCKET, SO_RCVBUF, &newin, sizeof newin);
+                disk_logf("winctl %d->%d heap=%u blk=%ums", win, newin,
+                          (unsigned)freeb, (unsigned)(blk_delta/1000));
+                win = newin;
+            }
+            ctl_last = nowus; ctl_blk = blk;
         }
 
         int n = recv(s_sock, inbuf, sizeof inbuf, 0);
