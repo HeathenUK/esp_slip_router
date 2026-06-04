@@ -56,6 +56,25 @@ HEAP_LOW/HIGH gap + the coarse step.
 - Subsumes the static telnet/binary split: a slow telnet consumer stays at
   WIN_MIN (saturated → never grows); a fast download climbs. No port/command.
 
+## UPDATE 2026-06-04 — grow ceiling capped to 4K after a fast-flood failure
+
+Fresh testing against a *fast LAN* server (not RTT-paced internet) exposed a
+flaw: the controller grew to 8K (heap looked ample, blk=0), then the server
+flooded the window faster than the 500ms tick could shrink -- heap bled to
+**816 B** and the 5K guard aborted the session (transfer failed at 2.9 KB/s).
+The guard prevented a wedge, but 816 B is not "rock solid."
+
+Two conclusions: (1) the grow reacts too slowly to a fast flood; (2) growing
+gives **no throughput benefit** for this dongle's consumers anyway -- they're
+consumer-bound (Mac CDC ~100 KB/s, DOS CHUSB ~17 KB/s), and 4K already saturates
+them (4096 / internet-RTT > 100 KB/s). So growing is all-risk-no-reward here.
+
+Fix: WINCTL_MAX = WINCTL_START = 4096 (the proven-safe value; internet floor was
+14-16K). The controller now only SHRINKS (4K -> 2K, consumer-driven) + clamps on
+heap; it does not grow past 4K. Raise the ceiling only if a fast WINDOW-bound
+consumer is validated AND the fast-flood reaction is hardened (e.g. per-iteration
+heap-shrink, not just the 500ms tick).
+
 ## Test plan (from the Mac, both directions of the loop)
 1. **Fast consumer** (`hayes-throughput.py`, reads flat-out): expect the window
    to **grow** 4 K→8 K, byte-perfect md5, heap floor healthy. winctl log shows

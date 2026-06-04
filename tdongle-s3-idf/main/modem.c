@@ -139,16 +139,25 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
 #define LOW_HEAP_GUARD_BYTES 5120
 
 /* Adaptive RX-window controller (see BUFFER-CONTROL-2026-06-04.md). Sizes the
- * relay's receive window to the largest the consumer can drain without risking
- * heap: grows when heap is ample AND the consumer keeps up; shrinks when the
- * consumer saturates (a bigger window only piles up backlog for a slow consumer
- * -- the bleed) or heap tightens. Subsumes the static telnet/binary split. */
+ * relay's receive window to the consumer: shrinks to 2K when the consumer
+ * saturates (a bigger window only piles up backlog for a slow consumer -- the
+ * bleed) or heap tightens. Consumer-driven, supersedes the static telnet/binary
+ * split.
+ *
+ * CEILING CAPPED AT 4K (2026-06-04): growing to 8K was validated UNSAFE against
+ * a fast (low-RTT/LAN) server -- it floods the window faster than the 500ms tick
+ * can shrink, bleeding heap to ~816 B and tripping the 5K guard (transfer then
+ * failed). AND it gives NO throughput benefit for this dongle's consumers, which
+ * are consumer-bound (Mac CDC ~100KB/s, DOS CHUSB ~17KB/s): 4K already saturates
+ * them. So MAX==START==4K -- the controller shrinks but does not grow past the
+ * proven-safe value. (Raise WINCTL_MAX only if a fast WINDOW-bound consumer is
+ * ever validated, AND the fast-flood reaction is hardened first.) */
 #define WINCTL_MIN     2048
 #define WINCTL_START   4096
-#define WINCTL_MAX     8192
+#define WINCTL_MAX     4096
 #define WINCTL_STEP    2048
 #define WINCTL_HEAP_LOW  10240   /* shrink hard below this (clamp; well above the 5K guard) */
-#define WINCTL_HEAP_HIGH 18432   /* grow only above this (real headroom) */
+#define WINCTL_HEAP_HIGH 18432   /* grow only above this (moot while MAX==START) */
 #define WINCTL_TICK_US   (500*1000)
 #define WINCTL_SAT_US    100000   /* cdc_write blocked >100ms in a 500ms tick => consumer-bound */
 
