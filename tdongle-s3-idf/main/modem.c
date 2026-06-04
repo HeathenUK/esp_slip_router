@@ -124,7 +124,13 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
  * boot (panic at xStreamBufferCreate returning NULL -> pump task
  * derefs NULL handle). 8 KB absorbs ~80 ms of WiFi RX at 100 KB/s,
  * which empirically is enough. */
-#define DATA_STREAM_BYTES 4096   /* 8192 -> 4096 (SRAM: +8 KB heap, 2026-06-02) */
+#define DATA_STREAM_BYTES 4096   /* DOWNLOAD path (TCP->CDC): absorbs WiFi RX bursts. 8192 -> 4096 (SRAM: +8 KB heap, 2026-06-02) */
+/* UPLOAD path (CDC->TCP) is only DOS->net command/keystroke traffic (AT lines,
+ * GET request lines, telnet input) -- never bulk. 4 KB was wildly oversized;
+ * 2 KB is far more than any realistic burst and frees ~2 KB baseline heap, which
+ * funds a larger RX-window ceiling at the same floor. (1 KB also works if more
+ * heap is ever needed -- uploads just back-pressure the USB OUT EP a touch more.) */
+#define UPLOAD_STREAM_BYTES 2048
 
 /* Low-heap guard for the relay. If free heap falls below this DURING a
  * session, the data task aborts gracefully (NO CARRIER -> command mode)
@@ -166,11 +172,13 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
  * cdc_block saturation for that case; the heap clamp is the abnormal-pressure
  * backstop (set BELOW the natural floor so it doesn't fire every cycle). */
 #define WINCTL_MIN     4096
-#define WINCTL_START   10240
-#define WINCTL_MAX     10240
+#define WINCTL_START   10240     /* safe immediate throughput; grows from here when heap allows */
+#define WINCTL_MAX     14336     /* GROWTH RE-ENABLED: the ~2K freed from UPLOAD_STREAM_BYTES funds
+                                  * a higher ceiling at the same floor. Grows 10K->14K only when
+                                  * free > WINCTL_HEAP_HIGH (drained moments); shrinks under pressure. */
 #define WINCTL_STEP    4096
-#define WINCTL_HEAP_LOW  8192    /* abnormal-pressure clamp: below the ~12K natural floor, above the 5K guard */
-#define WINCTL_HEAP_HIGH 24576   /* re-grow gate (moot while MAX==START; kept for the shrink/recover path) */
+#define WINCTL_HEAP_LOW  8192    /* abnormal-pressure clamp: below the natural floor, above the 5K guard */
+#define WINCTL_HEAP_HIGH 24576   /* grow gate: only size up with real headroom (full-fill of MAX must clear the guard) */
 #define WINCTL_TICK_US   (500*1000)
 #define WINCTL_SAT_US    100000   /* cdc_write blocked >100ms in a 500ms tick => consumer-bound */
 
@@ -1861,7 +1869,7 @@ esp_err_t modem_init(void) {
      * rings exist by the time ATDT fires. The rings are session-
      * resident (reset on each dial), never freed. */
     if (!s_to_cdc) s_to_cdc = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
-    if (!s_to_tcp) s_to_tcp = xStreamBufferCreate(DATA_STREAM_BYTES, 1);
+    if (!s_to_tcp) s_to_tcp = xStreamBufferCreate(UPLOAD_STREAM_BYTES, 1);
     if (!s_to_cdc || !s_to_tcp) {
         ESP_LOGE(TAG, "modem stream alloc fail to_cdc=%p to_tcp=%p free=%u",
                  (void *)s_to_cdc, (void *)s_to_tcp,
@@ -1889,8 +1897,8 @@ esp_err_t modem_init(void) {
         return ESP_ERR_NO_MEM;
     }
 
-    disk_logf("modem: AT engine ready on CDC0 (E%d V%d N%d) streams=%uB pumps=up",
+    disk_logf("modem: AT engine ready on CDC0 (E%d V%d N%d) dl=%uB ul=%uB pumps=up",
               s_echo?1:0, s_verbose?1:0, s_telnet?1:0,
-              (unsigned)DATA_STREAM_BYTES);
+              (unsigned)DATA_STREAM_BYTES, (unsigned)UPLOAD_STREAM_BYTES);
     return ESP_OK;
 }
