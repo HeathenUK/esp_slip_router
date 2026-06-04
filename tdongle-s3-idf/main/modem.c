@@ -172,10 +172,15 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
  * cdc_block saturation for that case; the heap clamp is the abnormal-pressure
  * backstop (set BELOW the natural floor so it doesn't fire every cycle). */
 #define WINCTL_MIN     4096
-#define WINCTL_START   10240     /* safe immediate throughput; grows from here when heap allows */
-#define WINCTL_MAX     14336     /* GROWTH RE-ENABLED: the ~2K freed from UPLOAD_STREAM_BYTES funds
-                                  * a higher ceiling at the same floor. Grows 10K->14K only when
-                                  * free > WINCTL_HEAP_HIGH (drained moments); shrinks under pressure. */
+#define WINCTL_START   4096      /* START SMALL, grow into fast consumers. A slow consumer (e.g. DOS
+                                  * CHUSB ~50 KB/s) would pile a big START window into heap in the
+                                  * first ~500ms before the clamp reacts -- that dropped the DOS floor
+                                  * to 6.5K. Starting at the floor means slow consumers never pile up
+                                  * (saturation-shrink holds them here); fast consumers ramp 4K->14K in
+                                  * ~1.5s via the grow branch. Zero cost to DOS tput (CHUSB-bound). */
+#define WINCTL_MAX     14336     /* GROWTH: the ~2K freed from UPLOAD_STREAM_BYTES funds a higher
+                                  * ceiling at the same floor. Grows toward 14K only when blk is low
+                                  * (consumer keeps up) AND free > WINCTL_HEAP_HIGH; shrinks otherwise. */
 #define WINCTL_STEP    4096
 #define WINCTL_HEAP_LOW  8192    /* abnormal-pressure clamp: below the natural floor, above the 5K guard */
 #define WINCTL_HEAP_HIGH 24576   /* grow gate: only size up with real headroom (full-fill of MAX must clear the guard) */
