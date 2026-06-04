@@ -154,14 +154,19 @@ CONFIG_LWIP_TCP_WND_DEFAULT=4096
 # it BELOW TCP_WND shrinks the advertised window (what we want); the old
 # trap was setting it ABOVE, which grew the accept queue.
 CONFIG_LWIP_SO_RCVBUF=y
-# Send buffer (per-pcb queue lwIP will accept from the app before
-# blocking send()). Default IDF v5.5 is 5760 (4*MSS) which caps the
-# upload BDP at ~5.6 KB in-flight -- enough for 56 Kbps but throttles
-# anything faster. 65535 lets the dongle pipeline a full window of
-# upload data before lwIP back-pressures the modem_tcp_pump_task.
-# SND_QUEUELEN scales from SND_BUF/MSS so the pbuf-count ceiling
-# moves with it (no separate Kconfig needed).
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
+# Send buffer (per-pcb queue lwIP accepts from the app before blocking send()).
+# RELIABILITY RESET 2026-06-04: 65535 -> 4096. 65535 let the /fs HTTP serve (and
+# any large outgoing transfer) queue pbufs until HEAP EXHAUSTION -- a 109 KB /fs
+# GET wedged the device (heap to 504 B; see FS-TRANSFER-HEAP-2026-06-03.md). This
+# IDF's lwIP has NO per-socket SO_SNDBUF (unknown Kconfig symbol -- verified
+# 2026-06-04), so a dynamic per-connection cap isn't possible; this global value
+# is the only lever. Measured /fs-GET heap floor by SND_BUF: 65535 -> 504 B,
+# 8192 -> 3.6 K, 4096 -> 15.4 K -- so 4 KB hard-bounds the held TX backlog to a
+# rock-solid floor (and it's file-size-independent: a 109 KB GET floors the same).
+# Downloads are unaffected (RX side, governed by the adaptive SO_RCVBUF window
+# controller); uploads/serve are rare/admin and 4 KB is ample for their RTT/BDP.
+# SND_QUEUELEN scales from SND_BUF/MSS automatically.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=4096
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 # Selective ACK on the receive path. On our lossy -70ish dBm link a dropped
 # segment without SACK piles everything after it into the out-of-order queue
