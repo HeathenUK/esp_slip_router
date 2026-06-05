@@ -192,6 +192,14 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
 #define WINCTL_TICK_US   (500*1000)
 #define WINCTL_SAT_US    100000   /* cdc_write blocked >100ms in a 500ms tick => consumer-bound */
 
+/* Relay teardown grace for a WiFi drop: shorter blips are left to TCP retransmit
+ * (transparent carry-on); a drop longer than this tears the relay down cleanly so
+ * WGET can resume via Range. See the grace check in modem_data_task + wifi_down_us()
+ * in main.c. */
+#define RELAY_WIFI_GRACE_US (3*1000*1000)
+/* Defined in main.c: us the WiFi link has been down (0 if up / never connected). */
+extern int64_t wifi_down_us(void);
+
 static StreamBufferHandle_t s_to_cdc = NULL;
 /* Reverse pipeline: producer is on_cdc_rx (TinyUSB task, CPU1) pushing
  * raw bytes into s_to_tcp; consumer is modem_tcp_pump_task (CPU0)
@@ -646,6 +654,24 @@ static void modem_data_task(void *arg) {
         if (freeb < LOW_HEAP_GUARD_BYTES) {
             disk_logf("relay: LOW HEAP %u<%u -- abort session (anti-wedge)",
                       (unsigned)freeb, (unsigned)LOW_HEAP_GUARD_BYTES);
+            s_online = false;
+            if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+            s_peer[0] = 0;
+            r_nocarrier();
+            break;
+        }
+
+        /* --- WiFi-drop grace teardown --- */
+        /* Brief blips (< RELAY_WIFI_GRACE_US) are left to TCP retransmit so the
+         * download carries on transparently on the same socket. A longer outage
+         * means the link is almost certainly dead (or will re-associate with a
+         * new IP, orphaning this socket) -- tear down cleanly NOW so NO CARRIER
+         * reaches DOS and WGET resumes via Range, instead of waiting out the
+         * ~12 s keepalive. Race-free: this task is the SOLE closer of s_sock;
+         * main.c only timestamps the WiFi up<->down edges (wifi_down_us()). */
+        if (wifi_down_us() > RELAY_WIFI_GRACE_US) {
+            disk_logf("relay: WiFi down >%ums -- abort session (resume-friendly)",
+                      (unsigned)(RELAY_WIFI_GRACE_US / 1000));
             s_online = false;
             if (s_sock >= 0) { close(s_sock); s_sock = -1; }
             s_peer[0] = 0;
@@ -1238,6 +1264,22 @@ static void cmd_dial_impl(const char *arg) {
      * went intermittently dark. Bounding the window fixes that by design. */
     int rcvbuf = s_telnet ? 2048 : 4096;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+
+    /* TCP keepalive: bound dead-link detection (flaky WiFi) so a silent-but-dead
+     * socket (link dropped, no FIN) can't hang the relay forever. Keepalive only
+     * probes when the connection is IDLE -- an active download never goes idle so
+     * this never interferes with a healthy transfer, and a 1-2 s blip is recovered
+     * by TCP retransmit before the 4 s idle gate is even reached. Only a genuinely
+     * dead link burns the budget: idle 4 s + 4 probes x 2 s = ~12 s, after which
+     * the pcb aborts and the next recv() errors -> the existing peer_closed/NO
+     * CARRIER teardown fires (no new teardown code). LWIP_TCP_KEEPALIVE is always
+     * compiled in IDF, so no sdkconfig change is needed. Backstops the WiFi-grace
+     * teardown for the "reconnected but socket dead" / silent-RF-degradation cases
+     * where no STA_DISCONNECTED event fires. */
+    int ka = 1;       setsockopt(sock, SOL_SOCKET,  SO_KEEPALIVE,  &ka,       sizeof ka);
+    int ka_idle = 4;  setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE,  &ka_idle,  sizeof ka_idle);
+    int ka_intvl = 2; setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &ka_intvl, sizeof ka_intvl);
+    int ka_cnt = 4;   setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT,   &ka_cnt,   sizeof ka_cnt);
 
     s_sock = sock;
     s_peer_port = port;

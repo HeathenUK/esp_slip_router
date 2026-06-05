@@ -941,10 +941,28 @@ static void save_wifi_creds_if_new(const char *ssid, const char *pass) {
 static char s_ssid[33];
 static char s_pass[65];
 
+/* WiFi link state for the relay's grace-period teardown (modem.c polls
+ * wifi_down_us()). Updated only on the up<->down edges in on_wifi_event. */
+static volatile bool    s_wifi_up = false;
+static volatile int64_t s_wifi_down_us = 0;
+
+/* Microseconds the WiFi link has been continuously down, or 0 if it is up
+ * (or has never connected). The relay uses this for a grace-period teardown:
+ * short blips are ridden out by TCP, longer drops trigger a clean NO CARRIER. */
+int64_t wifi_down_us(void) {
+    if (s_wifi_up || s_wifi_down_us == 0) return 0;
+    return esp_timer_get_time() - s_wifi_down_us;
+}
+
 static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        /* Timestamp the up->down edge ONCE (a reconnect storm re-fires this
+         * event; we must not keep resetting the clock or the grace never
+         * expires). The relay's grace teardown reads wifi_down_us(). */
+        if (s_wifi_up) s_wifi_down_us = esp_timer_get_time();
+        s_wifi_up = false;
         /* Throttle the "retrying" log to once every ~30s so the disk-log
          * ring buffer isn't eaten by a tight reconnect loop. */
         static int64_t s_last_retry_log_us = 0;
@@ -956,6 +974,7 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        s_wifi_up = true;   /* link back up -> relay grace clock clears */
         disk_logf("wifi got IP " IPSTR, IP2STR(&ev->ip_info.ip));
         if (s_persist_on_connect) {
             /* Runtime-provisioned creds (AT$WIFI=/AT$SSID=) just proved they
