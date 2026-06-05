@@ -640,6 +640,7 @@ static void modem_data_task(void *arg) {
     setsockopt(s_sock, SOL_SOCKET, SO_RCVBUF, &win, sizeof win);
     int64_t  ctl_last = esp_timer_get_time();
     uint64_t ctl_blk  = s_tp_blk_us;
+    uint32_t ctl_rx   = s_tp_rx, ctl_cdc = s_tp_cdc;  /* prev-tick counters for the diagnostic sample */
 
     bool peer_closed = false;
 
@@ -714,6 +715,22 @@ static void modem_data_task(void *arg) {
                 disk_logf("winctl %d->%d heap=%u blk=%ums", win, newin,
                           (unsigned)freeb, (unsigned)(blk_delta/1000));
                 win = newin;
+            }
+            /* --- diagnostic sample (every ~500ms tick) ------------------------
+             * Where does the heap go during a tele2 stall? Compare bytes the relay
+             * PULLED from TCP (rx+) vs DRAINED to CDC (cdc+) against the free-heap
+             * trend. If heap falls while win is small and rx+ ~= cdc+, the relay's
+             * own buffers aren't the sink -- the WiFi RX pbuf pool is. lfb = largest
+             * free internal block (fragmentation vs raw free). */
+            {
+                uint32_t rxn = s_tp_rx, cdcn = s_tp_cdc;
+                size_t lfb = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+                int rssi = 0; (void)esp_wifi_sta_get_rssi(&rssi);
+                disk_logf("smp heap=%u lfb=%u win=%d blk=%ums rx+%u cdc+%u rssi=%d",
+                          (unsigned)freeb, (unsigned)lfb, win,
+                          (unsigned)(blk_delta / 1000),
+                          (unsigned)(rxn - ctl_rx), (unsigned)(cdcn - ctl_cdc), rssi);
+                ctl_rx = rxn; ctl_cdc = cdcn;
             }
             ctl_last = nowus; ctl_blk = blk;
         }
