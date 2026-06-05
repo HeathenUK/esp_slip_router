@@ -638,7 +638,8 @@ static void modem_data_task(void *arg) {
     setsockopt(s_sock, SOL_SOCKET, SO_RCVBUF, &win, sizeof win);
     int64_t  ctl_last = esp_timer_get_time();
     uint64_t ctl_blk  = s_tp_blk_us;
-    uint32_t ctl_rx   = s_tp_rx, ctl_cdc = s_tp_cdc;  /* prev-tick counters for the diagnostic sample */
+    uint32_t ctl_rx   = s_tp_rx;   /* prev-tick rx counter (for the active-flow grow gate) */
+    int      ctl_lowblk = 0;       /* consecutive ticks of active flow + consumer keep-up */
 
     bool peer_closed = false;
 
@@ -704,13 +705,17 @@ static void modem_data_task(void *arg) {
             uint64_t blk = s_tp_blk_us, blk_delta = blk - ctl_blk;
             uint32_t rxd = s_tp_rx - ctl_rx;   /* bytes pulled from TCP this tick */
             int newin = win;
+            /* Sustained keep-up: a tick "counts" only if data actually moved AND the
+             * consumer kept up. A single-tick lull on a fundamentally slow consumer
+             * resets this, so a transient gap can't inflate the window. */
+            if (rxd > 0 && blk_delta <= WINCTL_SAT_US) ctl_lowblk++; else ctl_lowblk = 0;
             if      (freeb < WINCTL_HEAP_LOW)   newin = win - 2*WINCTL_STEP; /* clamp: heap tight */
             else if (blk_delta > WINCTL_SAT_US) newin = win - WINCTL_STEP;   /* consumer-bound: shrink */
-            /* GROW ONLY ON ACTIVE FLOW: rxd>0 means data really moved this tick and
-             * the consumer kept up (blk low) -- not an idle gap. Growing during an
-             * idle HTTP-setup/zero-window gap (blk=0 but rxd=0) was the root cause of
-             * the burst-then-heap-plunge LOW HEAP aborts on both servers. */
-            else if (rxd > 0 && freeb > WINCTL_HEAP_HIGH) newin = win + WINCTL_STEP;
+            /* GROW only on SUSTAINED keep-up (>=2 ticks of active flow) with real heap
+             * headroom. rxd>0 alone stopped idle-gap inflation; requiring it sustained
+             * also stops a brief lull on a slow consumer from growing the window into a
+             * burst-then-heap-dip. A genuinely fast consumer (Mac) sustains it and grows. */
+            else if (ctl_lowblk >= 2 && freeb > WINCTL_HEAP_HIGH) newin = win + WINCTL_STEP;
             if (newin < WINCTL_MIN) newin = WINCTL_MIN;
             if (newin > WINCTL_MAX) newin = WINCTL_MAX;
             if (newin != win) {
@@ -719,23 +724,7 @@ static void modem_data_task(void *arg) {
                           (unsigned)freeb, (unsigned)(blk_delta/1000));
                 win = newin;
             }
-            /* --- diagnostic sample (every ~500ms tick) ------------------------
-             * Where does the heap go during a tele2 stall? Compare bytes the relay
-             * PULLED from TCP (rx+) vs DRAINED to CDC (cdc+) against the free-heap
-             * trend. If heap falls while win is small and rx+ ~= cdc+, the relay's
-             * own buffers aren't the sink -- the WiFi RX pbuf pool is. lfb = largest
-             * free internal block (fragmentation vs raw free). */
-            {
-                uint32_t rxn = s_tp_rx, cdcn = s_tp_cdc;
-                size_t lfb = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-                int rssi = 0; (void)esp_wifi_sta_get_rssi(&rssi);
-                disk_logf("smp heap=%u lfb=%u win=%d blk=%ums rx+%u cdc+%u rssi=%d",
-                          (unsigned)freeb, (unsigned)lfb, win,
-                          (unsigned)(blk_delta / 1000),
-                          (unsigned)(rxn - ctl_rx), (unsigned)(cdcn - ctl_cdc), rssi);
-                ctl_rx = rxn; ctl_cdc = cdcn;
-            }
-            ctl_last = nowus; ctl_blk = blk;
+            ctl_last = nowus; ctl_blk = blk; ctl_rx = s_tp_rx;
         }
 
         int n = recv(s_sock, inbuf, sizeof inbuf, 0);
