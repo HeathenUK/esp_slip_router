@@ -243,13 +243,179 @@ static void derive_filename(const char *pth, char *out, unsigned cap)
     if (n == 0 || out[0] == '.') strcpy(out, "WGET.DAT");
 }
 
+/* Outcome of one dial+GET+stream attempt. */
+enum { ATT_OK = 0, ATT_INCOMPLETE, ATT_DIAL_FAIL, ATT_HTTP_FATAL, ATT_IGNORED_RANGE };
+
+/* Return to command mode and drop any active call, so the next ATDT dials clean.
+ * +++ (with the Hayes 1s guards) escapes online-data mode; ATH hangs up. Safe to
+ * call whether the dongle is online or already NO CARRIER'd. */
+static void hangup_call(unsigned port)
+{
+    wait_ms(1200);
+    fossil_send_str(port, "+++"); wait_ms(1500);
+    drain_rx(port, 200);
+    fossil_send_str(port, "ATH\r"); wait_ms(300);
+    drain_rx(port, 100);
+}
+
+/* One download attempt: dial -> GET (with Range if resume_from>0) -> parse
+ * status/headers -> stream body into f (positioned at resume_from). Sets total
+ * and have_total when the response reveals the full size; sets written to the
+ * absolute on-disk byte count. Returns an ATT_* code. */
+static int do_attempt(unsigned port, const char *h, unsigned pnum, const char *pth,
+                      FILE *f, unsigned long resume_from,
+                      unsigned long *total, int *have_total, unsigned long *written)
+{
+    int n, status = 0;
+    unsigned long clen = 0UL;     int have_clen = 0;
+    unsigned long cr_start = 0UL, cr_total = 0UL; int have_cr = 0;
+    unsigned long last_byte_ticks, last_progress_ticks, t0, max_ticks, silence_ticks;
+    unsigned char hold[16]; unsigned held = 0;
+
+    /* --- dial --- */
+    drain_rx(port, 100);
+    fossil_send_str(port, "ATH\r");    wait_ms(400); drain_rx(port, 100);
+    fossil_send_str(port, "ATNET0\r"); wait_ms(300); drain_rx(port, 100);
+    {
+        char dial[200];
+        snprintf(dial, sizeof(dial), "ATDT%s:%u\r", h, pnum);
+        fossil_send_str(port, dial);
+    }
+    switch (wait_dial_result(port, 20000)) {
+        case 1: break;   /* CONNECT */
+        /* All dial failures are RETRYABLE: on a resume, the very drop we're
+         * recovering from may still have WiFi down at re-dial time (getaddrinfo
+         * fails -> NO DIALTONE). The no-progress guard (3 attempts) bounds a
+         * genuinely bad host. */
+        case -1: fprintf(stderr, "WGET: host not resolved (%s) -- retrying.\n", h); return ATT_DIAL_FAIL;
+        default: fprintf(stderr, "WGET: dial failed -- retrying.\n");             return ATT_DIAL_FAIL;
+    }
+    { int c; unsigned long t = bios_ticks() + 18UL;   /* eat CR/LF after CONNECT */
+      while (bios_ticks() < t) { c = fossil_recv_nowait(port);
+          if (c < 0) { dos_yield(); continue; } if (c == '\n') break; } }
+
+    /* --- GET (+ Range header on resume) --- */
+    {
+        static char req[600];
+        int reqlen;
+        if (resume_from > 0UL)
+            reqlen = snprintf(req, sizeof(req),
+                "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: tdongle-wget/1\r\n"
+                "Range: bytes=%lu-\r\nConnection: close\r\n\r\n", pth, h, resume_from);
+        else
+            reqlen = snprintf(req, sizeof(req),
+                "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: tdongle-wget/1\r\n"
+                "Connection: close\r\n\r\n", pth, h);
+        fossil_send_block(port, (const unsigned char __far *)req, (unsigned)reqlen);
+    }
+
+    /* --- status line (parse numeric code: accept 200 full / 206 partial) --- */
+    n = read_line(port, line, sizeof(line), 15000);
+    if (n < 0) { fprintf(stderr, "WGET: status timeout.\n"); return ATT_INCOMPLETE; }
+    printf("         %s\n", line);
+    if (strncmp(line, "HTTP/", 5) != 0) { fprintf(stderr, "WGET: bad status line.\n"); return ATT_HTTP_FATAL; }
+    {
+        const char *p = line + 5;
+        while (*p && *p != ' ') ++p;        /* skip version */
+        while (*p == ' ') ++p;
+        while (*p >= '0' && *p <= '9') { status = status*10 + (int)(*p - '0'); ++p; }
+    }
+
+    /* --- headers: Content-Length and (for 206) Content-Range --- */
+    for (;;) {
+        n = read_line(port, line, sizeof(line), 15000);
+        if (n < 0) { fprintf(stderr, "WGET: header timeout.\n"); return ATT_INCOMPLETE; }
+        if (n == 0) break;
+        if (!strncmp(line,"Content-Length:",15) || !strncmp(line,"content-length:",15)) {
+            const char *p = line + 15; unsigned long v = 0UL;
+            while (*p==' '||*p=='\t') ++p;
+            while (*p>='0'&&*p<='9') { v = v*10UL + (unsigned long)(*p-'0'); ++p; }
+            clen = v; have_clen = 1;
+        } else if (!strncmp(line,"Content-Range:",14) || !strncmp(line,"content-range:",14)) {
+            /* Content-Range: bytes START-END/TOTAL */
+            const char *p = line + 14;
+            while (*p && (*p<'0'||*p>'9')) ++p;                       /* skip " bytes " */
+            while (*p>='0'&&*p<='9') { cr_start = cr_start*10UL + (unsigned long)(*p-'0'); ++p; }
+            while (*p && *p != '/') ++p;                              /* skip -END */
+            if (*p == '/') ++p;
+            while (*p>='0'&&*p<='9') { cr_total = cr_total*10UL + (unsigned long)(*p-'0'); ++p; }
+            have_cr = 1;
+        }
+    }
+
+    /* --- reconcile status vs the Range we asked for --- */
+    if (status == 200) {
+        if (resume_from > 0UL) return ATT_IGNORED_RANGE;   /* server ignored Range -> restart fresh */
+        *total = clen; *have_total = have_clen;
+    } else if (status == 206) {
+        if (!have_cr || cr_start != resume_from) return ATT_IGNORED_RANGE; /* not the range we hold */
+        *total = cr_total; *have_total = 1;
+    } else {
+        fprintf(stderr, "WGET: HTTP status %d (not 200/206).\n", status);
+        return ATT_HTTP_FATAL;
+    }
+    if (*have_total) printf("         total %lu, have %lu\n", *total, resume_from);
+    else             printf("         (no size -- single attempt, no resume)\n");
+
+    /* --- stream body into f at the resume offset --- */
+    fseek(f, (long)resume_from, SEEK_SET);
+    *written = resume_from;
+    silence_ticks = *have_total ? 273UL : 90UL;   /* 15s sized / 5s unsized */
+    max_ticks = 5460UL;                            /* ~300s */
+    t0 = bios_ticks(); last_byte_ticks = t0; last_progress_ticks = t0;
+    for (;;) {
+        unsigned r = fossil_recv_block(port, (unsigned char __far *)buf, sizeof(buf));
+        if (r) {
+            last_byte_ticks = bios_ticks();
+            if (*have_total) {
+                unsigned tow = r;
+                if (*written + (unsigned long)tow > *total)
+                    tow = (unsigned)(*total - *written);
+                if (tow) {
+                    unsigned w = (unsigned)fwrite(buf, 1, tow, f);
+                    *written += (unsigned long)w;
+                    if (w < tow) { fprintf(stderr, "\nWGET: disk write failed (full?).\n"); return ATT_HTTP_FATAL; }
+                }
+                if (*written >= *total) break;     /* done; ignore trailing NO CARRIER */
+            } else {
+                /* unsized: hold back 16 B so the trailing "\r\nNO CARRIER" is stripped */
+                unsigned ri = 0;
+                while (ri < r) {
+                    if (held == sizeof(hold)) { fputc(hold[0], f); (*written)++;
+                        memmove(hold, hold+1, sizeof(hold)-1); held--; }
+                    hold[held++] = buf[ri++];
+                }
+            }
+        } else {
+            if ((bios_ticks() - last_byte_ticks) > silence_ticks) break;
+            dos_yield();
+        }
+        if ((bios_ticks() - last_progress_ticks) > 36UL) {
+            last_progress_ticks = bios_ticks();
+            printf("         ... %lu bytes\r", *written);
+        }
+        if ((bios_ticks() - t0) > max_ticks) { printf("\n         (5 min cap)\n"); break; }
+    }
+    if (!*have_total) {
+        unsigned cut = held, i;
+        for (i = 0; i + 1 < held; ++i)
+            if (hold[i]=='\r' && hold[i+1]=='\n' && i+12 <= held && memcmp(hold+i,"\r\nNO CARRIER",12)==0) { cut=i; break; }
+        if (cut) { fwrite(hold, 1, cut, f); *written += cut; }
+    }
+    fflush(f);
+    printf("\n");
+    if (!*have_total)              return ATT_OK;          /* unsized best-effort done */
+    if (*written >= *total)        return ATT_OK;
+    return ATT_INCOMPLETE;
+}
+
 int main(int argc, char **argv)
 {
     int port_index = -1;
     unsigned port_num = 80;
     const char *url = NULL, *ofarg = NULL;
     int argi;
-    unsigned long t_body_start, t_done;
+    unsigned long t_start;
     FILE *f;
 
     setbuf(stdout, NULL);
@@ -286,147 +452,81 @@ int main(int argc, char **argv)
         fprintf(stderr, "WGET: dongle not responding to AT (SLIP escape failed?).\n");
         return 2;
     }
-    drain_rx((unsigned)port_index, 100);
-    fossil_send_str((unsigned)port_index, "ATH\r"); wait_ms(400);
-    drain_rx((unsigned)port_index, 100);
-    fossil_send_str((unsigned)port_index, "ATNET0\r"); wait_ms(300);
-    drain_rx((unsigned)port_index, 100);
+    /* Open the output ONCE, truncating. Resume is INTRA-invocation (across the
+     * retry loop below); we deliberately do NOT resume a stale on-disk file from
+     * a previous run (that would Range-request past a complete/changed file).
+     * "wb+" so retries can fseek to the end and append. */
+    f = fopen(outfile, "wb+");
+    if (!f) { fprintf(stderr, "WGET: cannot create %s\n", outfile); return 7; }
 
+    t_start = bios_ticks();
     {
-        char dial[200];
-        snprintf(dial, sizeof(dial), "ATDT%s:%u\r", host, port_num);
-        fossil_send_str((unsigned)port_index, dial);
-    }
-    switch (wait_dial_result((unsigned)port_index, 20000)) {
-        case 1: break;   /* CONNECT */
-        case -1: fprintf(stderr, "WGET: host not resolved (%s).\n", host); return 3;
-        case -2: fprintf(stderr, "WGET: connection failed/refused (%s:%u).\n", host, port_num); return 3;
-        case -3: fprintf(stderr, "WGET: line busy.\n"); return 3;
-        case -4: fprintf(stderr, "WGET: dial error.\n"); return 3;
-        default: fprintf(stderr, "WGET: no response from dongle (20s timeout).\n"); return 3;
-    }
-    { int c; unsigned long t = bios_ticks() + 18UL;        /* eat CR/LF after CONNECT */
-      while (bios_ticks() < t) { c = fossil_recv_nowait((unsigned)port_index);
-          if (c < 0) { dos_yield(); continue; } if (c == '\n') break; } }
-    {
-        static char req[512];
-        int reqlen = snprintf(req, sizeof(req),
-            "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: tdongle-wget/1\r\nConnection: close\r\n\r\n",
-            path, host);
-        fossil_send_block((unsigned)port_index, (const unsigned char __far *)req, (unsigned)reqlen);
-    }
+        int attempts = 0, consec_no_progress = 0, res = 0;
+        unsigned long total = 0UL, written = 0UL, n_before;
+        int have_total = 0;
+        const int MAX_ATTEMPTS = 6;
 
-    /* Status + headers. */
-    {
-        int n; unsigned long content_length = 0UL; int have_clen = 0;
-        n = read_line((unsigned)port_index, line, sizeof(line), 15000);
-        if (n < 0) { fprintf(stderr, "WGET: status timeout.\n"); return 4; }
-        printf("         %s\n", line);
-        if (strncmp(line, "HTTP/", 5) != 0 || strstr(line, " 200") == NULL) {
-            fprintf(stderr, "WGET: non-200 status.\n"); return 5;
-        }
         for (;;) {
-            n = read_line((unsigned)port_index, line, sizeof(line), 15000);
-            if (n < 0) { fprintf(stderr, "WGET: header timeout.\n"); return 6; }
-            if (n == 0) break;
-            if (!strncmp(line,"Content-Length:",15) || !strncmp(line,"content-length:",15)) {
-                const char *p = line + 15; unsigned long v = 0UL;
-                while (*p==' '||*p=='\t') ++p;
-                while (*p>='0'&&*p<='9') { v = v*10UL + (unsigned long)(*p-'0'); ++p; }
-                content_length = v; have_clen = 1;
+            fseek(f, 0L, SEEK_END);
+            n_before = (unsigned long)ftell(f);   /* authoritative resume offset */
+            if (attempts > 0) {
+                unsigned shift = (attempts <= 3) ? (unsigned)(attempts - 1) : 2U;
+                printf("         retry %d -- resume from %lu\n", attempts, n_before);
+                wait_ms((unsigned)(1000UL << shift));   /* 1s / 2s / 4s backoff */
             }
+            written = n_before;
+            res = do_attempt((unsigned)port_index, host, port_num, path,
+                             f, n_before, &total, &have_total, &written);
+
+            if (res == ATT_OK || res == ATT_HTTP_FATAL) break;
+
+            if (res == ATT_IGNORED_RANGE) {
+                /* Server won't serve our Range (sent 200, or 206 from the wrong
+                 * offset, or the size changed) -> the partial is unusable. Start
+                 * over from byte 0 with a fresh truncate. */
+                printf("         (range not honored -- restarting from 0)\n");
+                fclose(f); f = fopen(outfile, "wb+");
+                if (!f) { fprintf(stderr, "WGET: reopen failed.\n"); return 7; }
+                total = 0UL; have_total = 0; consec_no_progress = 0;
+                if (++attempts >= MAX_ATTEMPTS) break;
+                hangup_call((unsigned)port_index);
+                continue;
+            }
+
+            /* ATT_INCOMPLETE / ATT_DIAL_FAIL -> retry and resume from n_before. */
+            if (written > n_before) consec_no_progress = 0;
+            else if (++consec_no_progress >= 3) {
+                fprintf(stderr, "WGET: no progress in 3 attempts -- giving up.\n");
+                break;
+            }
+            if (++attempts >= MAX_ATTEMPTS) {
+                fprintf(stderr, "WGET: gave up after %d attempts.\n", MAX_ATTEMPTS);
+                break;
+            }
+            hangup_call((unsigned)port_index);
         }
-        if (have_clen) printf("         Content-Length: %lu\n", content_length);
-        else printf("         (no Content-Length -- saving to EOF)\n");
 
-        f = fopen(outfile, "wb");
-        if (!f) { fprintf(stderr, "WGET: cannot create %s\n", outfile); return 7; }
+        fflush(f); fclose(f);
 
-        /* BODY -> file. */
+        /* Final report + the INCOMPLETE guard (never let a partial look like success). */
         {
-            unsigned long written = 0UL;
-            unsigned long last_byte_ticks, last_progress_ticks;
-            /* Silence (no-byte) timeout. With Content-Length we KNOW more is
-             * coming until written==len, so be patient (~15s) -- a slow
-             * consumer (DOS disk write) or a retransmit can open a multi-second
-             * gap near the tail, and bailing at 5s truncated the file. Without
-             * Content-Length the silence IS how we detect EOF, so keep it short. */
-            const unsigned long silence_ticks = have_clen ? 273UL : 90UL; /* 15s / 5s */
-            const unsigned long max_ticks = 5460UL;     /* ~300s */
-            unsigned char hold[16]; unsigned held = 0;  /* no-clen: defer tail */
-            t_body_start = bios_ticks();
-            last_byte_ticks = t_body_start; last_progress_ticks = t_body_start;
-            for (;;) {
-                unsigned r = fossil_recv_block((unsigned)port_index,
-                                               (unsigned char __far *)buf, sizeof(buf));
-                if (r) {
-                    last_byte_ticks = bios_ticks();
-                    if (have_clen) {
-                        unsigned tow = r;
-                        if (written + (unsigned long)tow > content_length)
-                            tow = (unsigned)(content_length - written);
-                        if (tow) { fwrite(buf, 1, tow, f); written += tow; }
-                        if (written >= content_length) break;   /* ignore trailing NO CARRIER */
-                    } else {
-                        /* Hold back the last 16 bytes so the trailing
-                         * "\r\nNO CARRIER" (14 B) is never written; strip at EOF. */
-                        unsigned ri = 0;
-                        while (ri < r) {
-                            if (held == sizeof(hold)) { fputc(hold[0], f); written++;
-                                memmove(hold, hold+1, sizeof(hold)-1); held--; }
-                            hold[held++] = buf[ri++];
-                        }
-                    }
-                } else {
-                    if ((bios_ticks() - last_byte_ticks) > silence_ticks) break;
-                    dos_yield();
-                }
-                if ((bios_ticks() - last_progress_ticks) > 36UL) {
-                    last_progress_ticks = bios_ticks();
-                    printf("         ... %lu bytes\r", written);
-                }
-                if ((bios_ticks() - t_body_start) > max_ticks) {
-                    printf("\n         (5 min cap)\n"); break;
-                }
-            }
-            if (!have_clen) {
-                /* hold[] is the final tail. Strip a trailing "\r\nNO CARRIER..." */
-                unsigned cut = held, i;
-                for (i = 0; i + 1 < held; ++i)
-                    if (hold[i]=='\r' && hold[i+1]=='\n') {
-                        /* candidate; check it's the NO CARRIER tail */
-                        if (i+12 <= held && memcmp(hold+i, "\r\nNO CARRIER", 12)==0) { cut = i; break; }
-                    }
-                if (cut) { fwrite(hold, 1, cut, f); written += cut; }
-            }
-            fclose(f);
-            printf("\n");
-            t_done = bios_ticks();
-            {
-                unsigned long body_ticks = t_done - t_body_start;
-                unsigned long centi, tenths_kbps, kb, frac;
-                int incomplete = (have_clen && written < content_length);
-                if (body_ticks == 0UL) body_ticks = 1UL;
-                centi = (body_ticks * 10000UL + 910UL) / 1820UL;
-                tenths_kbps = (written * 1820UL / body_ticks * 10UL) / 102400UL;
-                kb = tenths_kbps / 10UL; frac = tenths_kbps % 10UL;
-                printf("         saved %lu bytes to %s in %lu.%02lus = %lu.%lu KB/s\n",
-                       written, outfile, centi/100UL, centi%100UL, kb, frac);
-                if (incomplete) {
-                    /* Never let a partial masquerade as success. The file on
-                     * disk is the bytes we got, but the transfer FAILED. */
-                    fprintf(stderr,
-                        "WGET: INCOMPLETE -- got %lu of %lu bytes (%lu short). File is PARTIAL.\n",
-                        written, content_length, content_length - written);
-                    return 8;
-                }
+            unsigned long el = bios_ticks() - t_start;
+            unsigned long centi, kb10;
+            if (el == 0UL) el = 1UL;
+            centi = (el * 10000UL + 910UL) / 1820UL;
+            kb10  = (written * 1820UL / el * 10UL) / 102400UL;
+            printf("         saved %lu bytes to %s in %lu.%02lus = %lu.%lu KB/s\n",
+                   written, outfile, centi/100UL, centi%100UL, kb10/10UL, kb10%10UL);
+            if (have_total && written < total) {
+                fprintf(stderr,
+                    "WGET: INCOMPLETE -- got %lu of %lu bytes (%lu short). File is PARTIAL.\n",
+                    written, total, total - written);
+                hangup_call((unsigned)port_index);
+                return 8;
             }
         }
     }
 
-    wait_ms(1200);
-    fossil_send_str((unsigned)port_index, "+++"); wait_ms(1500);
-    drain_rx((unsigned)port_index, 200);
-    fossil_send_str((unsigned)port_index, "ATH\r"); wait_ms(300);
+    hangup_call((unsigned)port_index);
     return 0;
 }
