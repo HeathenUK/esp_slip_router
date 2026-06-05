@@ -172,20 +172,18 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
  * cdc_block saturation for that case; the heap clamp is the abnormal-pressure
  * backstop (set BELOW the natural floor so it doesn't fire every cycle). */
 #define WINCTL_MIN     4096
-#define WINCTL_START   10240     /* REVERTED 4096->10240 (2026-06-04): START=4096 regressed tele2 --
-                                  * the version with START=10240 (commit 4e76747) COMPLETED a tele2
-                                  * download (the 50 KB/s run); dropping START to 4096 made the same
-                                  * download FREEZE (LOW HEAP abort). Same controller, only START
-                                  * differs -- so this restores the known-tele2-working behaviour.
-                                  * Starting at 10K lets a fast WiFi feed + slow consumer saturate
-                                  * immediately -> the controller clamps DOWN to a small safe window,
-                                  * rather than (at START=4096) the window looking unsaturated and
-                                  * GROWING into a heap crater. WHY exactly start size flips this is
-                                  * the open question we are still investigating -- this is a revert to
-                                  * a measured-good state, not a claimed root-cause fix. */
-#define WINCTL_MAX     14336     /* GROWTH: the ~2K freed from UPLOAD_STREAM_BYTES funds a higher
-                                  * ceiling at the same floor. Grows toward 14K only when blk is low
-                                  * (consumer keeps up) AND free > WINCTL_HEAP_HIGH; shrinks otherwise. */
+#define WINCTL_START   4096      /* START SMALL (root-cause fix, 2026-06-05, trace-confirmed on BOTH
+                                  * tele2 AND thinkbroadband). The earlier START=4096 regression was
+                                  * NOT the start value -- it was the controller GROWING the window to
+                                  * 14K during the idle HTTP-setup gap (blk=0), so the response body
+                                  * then arrived as one ~25-41 KB burst that flooded the WiFi RX pbuf
+                                  * pool faster than the shrink could react -> heap plunged below the
+                                  * guard at marginal RSSI. With idle-grow now gated on active data flow
+                                  * (see the tick below), START=4096 is correct: a slow consumer keeps
+                                  * blk high -> window stays ~4K -> small bursts -> heap floor ~20K+. */
+#define WINCTL_MAX     14336     /* Ceiling for a FAST consumer that genuinely keeps up (e.g. Mac CDC):
+                                  * grows toward 14K ONLY while data is actively flowing AND blk is low
+                                  * AND free > WINCTL_HEAP_HIGH. Never grows during an idle gap. */
 #define WINCTL_STEP    4096
 #define WINCTL_HEAP_LOW  8192    /* abnormal-pressure clamp: below the natural floor, above the 5K guard */
 #define WINCTL_HEAP_HIGH 24576   /* grow gate: only size up with real headroom (full-fill of MAX must clear the guard) */
@@ -704,10 +702,15 @@ static void modem_data_task(void *arg) {
         int64_t nowus = esp_timer_get_time();
         if (nowus - ctl_last >= WINCTL_TICK_US) {
             uint64_t blk = s_tp_blk_us, blk_delta = blk - ctl_blk;
+            uint32_t rxd = s_tp_rx - ctl_rx;   /* bytes pulled from TCP this tick */
             int newin = win;
-            if      (freeb < WINCTL_HEAP_LOW)  newin = win - 2*WINCTL_STEP; /* clamp: heap tight */
-            else if (blk_delta > WINCTL_SAT_US) newin = win - WINCTL_STEP;  /* consumer-bound */
-            else if (freeb > WINCTL_HEAP_HIGH)  newin = win + WINCTL_STEP;  /* headroom: grow */
+            if      (freeb < WINCTL_HEAP_LOW)   newin = win - 2*WINCTL_STEP; /* clamp: heap tight */
+            else if (blk_delta > WINCTL_SAT_US) newin = win - WINCTL_STEP;   /* consumer-bound: shrink */
+            /* GROW ONLY ON ACTIVE FLOW: rxd>0 means data really moved this tick and
+             * the consumer kept up (blk low) -- not an idle gap. Growing during an
+             * idle HTTP-setup/zero-window gap (blk=0 but rxd=0) was the root cause of
+             * the burst-then-heap-plunge LOW HEAP aborts on both servers. */
+            else if (rxd > 0 && freeb > WINCTL_HEAP_HIGH) newin = win + WINCTL_STEP;
             if (newin < WINCTL_MIN) newin = WINCTL_MIN;
             if (newin > WINCTL_MAX) newin = WINCTL_MAX;
             if (newin != win) {
