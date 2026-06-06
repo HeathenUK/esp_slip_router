@@ -1142,6 +1142,51 @@ static void tcp_send_all(const uint8_t *buf, size_t n) {
     }
 }
 
+/* Trailing-partial-escape detector for the keystroke coalescer.
+ *
+ * An arrow/F-key is ESC [ ... <final> (or ESC O x). s_to_tcp has trigger
+ * level 1, so a lone ESC byte that lands a beat ahead of its continuation gets
+ * shipped in its own TCP segment -- and a bare ESC reaching an app looks like
+ * the Escape key. That is what cancelled Claude's "Trust this folder?" menu
+ * when a single arrow keypress arrived split (ESC ... gap ... [B): the menu
+ * binds "Esc to cancel", so the orphaned ESC exited Claude (confirmed in an
+ * -l/-k capture by the leftover "[B" echoed after teardown). Fix: never ship a
+ * trailing INCOMPLETE escape sequence on its own; hold it for the next drain so
+ * ESC[B travels as one unit. A genuine lone ESC (Escape key) is held only until
+ * the grace timeout, then flushed unchanged -- so Escape still works.
+ *
+ * Scans buf[0..len) with a tiny ESC/CSI/SS3 state machine; returns the index
+ * where a trailing incomplete sequence begins, or len if the buffer ends clean.
+ * Recognizes only the forms a keyboard emits (lone ESC, ESC[..CSI, ESC O x SS3);
+ * everything before the trailing partial is complete and sendable now. */
+static size_t trailing_partial_esc(const uint8_t *buf, size_t len)
+{
+    enum { S_GND, S_ESC, S_CSI, S_SS3 } st = S_GND;
+    size_t seq_start = len;
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t c = buf[i];
+        switch (st) {
+        case S_GND:
+            if (c == 0x1B) { st = S_ESC; seq_start = i; }
+            break;
+        case S_ESC:
+            if      (c == 0x1B) { st = S_ESC; seq_start = i; }   /* prev ESC was lone; restart */
+            else if (c == '[')  { st = S_CSI; }
+            else if (c == 'O')  { st = S_SS3; }
+            else                { st = S_GND; seq_start = len; } /* ESC+x = complete 2-byte (Alt/Meta) */
+            break;
+        case S_CSI:
+            if (c >= 0x40 && c <= 0x7E) { st = S_GND; seq_start = len; }  /* final byte ends CSI */
+            /* else 0x20-0x3F params/intermediates: stay in CSI */
+            break;
+        case S_SS3:
+            st = S_GND; seq_start = len;   /* the single char after ESC O completes it */
+            break;
+        }
+    }
+    return (st == S_GND) ? len : seq_start;
+}
+
 /* ---- CDC -> TCP pump (consumer side) ----
  *
  * Runs on CPU0 with lwIP, so send() doesn't bounce across cores. Does
@@ -1152,17 +1197,38 @@ static void modem_tcp_pump_task(void *arg) {
     (void)arg;
     static uint8_t inbuf[1024];
     static uint8_t txbuf[2048];  /* 2x for worst-case IAC + CRLF expansion */
+    static uint8_t esc_carry[8]; /* held trailing partial escape sequence */
 
     for (;;) {
     /* Park until cmd_dial signals a new session (persistent task). */
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    size_t   esc_carry_len = 0;                /* bytes held from a split escape seq */
+    uint32_t esc_held = 0, esc_flushed = 0;    /* per-session diag */
     while (s_online || (s_to_tcp && xStreamBufferBytesAvailable(s_to_tcp) > 0)) {
+        /* Shorter poll while a partial escape is held, so a genuine lone ESC
+         * (Escape key) flushes promptly; normal 50ms cadence otherwise. */
         size_t got = xStreamBufferReceive(s_to_tcp, inbuf, sizeof inbuf,
-                                          pdMS_TO_TICKS(50));
-        if (got == 0 || s_sock < 0) continue;
+                                          esc_carry_len ? pdMS_TO_TICKS(25)
+                                                        : pdMS_TO_TICKS(50));
+        if (got == 0) {
+            /* Grace expired with nothing following: the held bytes were a real
+             * lone ESC (or a stuck truncated seq) -> flush so Escape reaches the
+             * app exactly as typed. */
+            if (esc_carry_len && s_sock >= 0) {
+                tcp_send_all(esc_carry, esc_carry_len);
+                esc_carry_len = 0; esc_flushed++;
+            }
+            continue;
+        }
+        if (s_sock < 0) { esc_carry_len = 0; continue; }
 
         size_t txlen = 0;
         int64_t now = esp_timer_get_time();
+        /* Lead with any carried partial escape from the previous drain (already
+         * telnet/CRLF-processed; ESC/CSI bytes are untouched by that anyway). */
+        for (size_t c = 0; c < esc_carry_len; ++c) txbuf[txlen++] = esc_carry[c];
+        esc_carry_len = 0;
+
         for (size_t i = 0; i < got; ++i) {
             uint8_t ch = inbuf[i];
             if (ch == '+' && s_plus_count < 3 &&
@@ -1191,8 +1257,26 @@ static void modem_tcp_pump_task(void *arg) {
                 tcp_send_all(txbuf, txlen); txlen = 0;
             }
         }
-        if (txlen) tcp_send_all(txbuf, txlen);
+
+        /* Hold back a trailing INCOMPLETE escape sequence so it ships intact
+         * with its continuation on the next drain (the split-arrow fix). A
+         * partial longer than the carry (never happens for a keyboard) is just
+         * sent as-is rather than dropped. */
+        if (txlen > 0) {
+            size_t cut = trailing_partial_esc(txbuf, txlen);
+            if (cut < txlen && (txlen - cut) <= sizeof esc_carry) {
+                esc_carry_len = txlen - cut;
+                memcpy(esc_carry, txbuf + cut, esc_carry_len);
+                txlen = cut;
+                esc_held++;
+            }
+            if (txlen) tcp_send_all(txbuf, txlen);
+        }
     }
+    /* Session ended: flush any residual held partial, then report diag. */
+    if (esc_carry_len && s_sock >= 0) tcp_send_all(esc_carry, esc_carry_len);
+    if (esc_held || esc_flushed)
+        disk_logf("esc-coalesce: held=%u flushed=%u", (unsigned)esc_held, (unsigned)esc_flushed);
     /* Loop back to park for the next dial. */
     }
 }
