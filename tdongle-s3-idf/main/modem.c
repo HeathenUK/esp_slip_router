@@ -36,6 +36,7 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"   /* esp_app_get_description()->version for ATI */
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "soc/rtc_cntl_reg.h"
@@ -199,6 +200,8 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
 extern int64_t wifi_down_us(void);
 /* Phase-0 SSH feasibility spike (ssh_spike.c). Throwaway. */
 extern void ssh_spike_start(const char *user, const char *pass, const char *host, uint16_t port);
+/* Dump the disk-log over CDC (AT$LOG) -- WiFi-independent diagnostics (main.c). */
+extern void disk_log_foreach(void (*cb)(const char *line, void *ctx), void *ctx);
 
 static StreamBufferHandle_t s_to_cdc = NULL;
 /* Reverse pipeline: producer is on_cdc_rx (TinyUSB task, CPU1) pushing
@@ -1430,6 +1433,11 @@ static char *strip_at(char *line) {
     return rest;
 }
 
+/* AT$LOG: emit each disk-log line over CDC (callback for disk_log_foreach). */
+static void log_cdc_emit(const char *line, void *ctx) {
+    (void)ctx; cdc_print(line); cdc_print("\r\n");
+}
+
 static void handle_dollar(char *s) {
     /* AT$<KEY>[=<value>|?] */
     char *eq  = strchr(s, '=');
@@ -1698,6 +1706,11 @@ static void handle_dollar(char *s) {
             cdc_print("\r\n"); cdc_print(s_term_type); cdc_print("\r\n");
             r_ok();
         }
+    } else if (!strcmp(key, "LOG")) {
+        /* Dump the disk-log over CDC -- WiFi-independent diagnostics. */
+        cdc_print("\r\n");
+        disk_log_foreach(log_cdc_emit, NULL);
+        r_ok();
     } else if (!strcmp(key, "SSHTEST") && val && eq) {
         /* Phase-0 spike: AT$SSHTEST=user:pass@host[:port] -- opens one libssh2
          * session and logs peak heap to /disk-log (GATE for SSH feasibility).
@@ -1760,11 +1773,13 @@ static void exec(char *line) {
         case 'V': s_verbose = (p[1] != '0'); r_ok(); return;
         case 'Q': s_quiet   = (p[1] == '1'); r_ok(); return;
         case 'I': {
-            char b[160];
+            char b[200];
+            const esp_app_desc_t *ad = esp_app_get_description();
             int64_t dur = s_tp_start ? (esp_timer_get_time() - s_tp_start) : 0;
             snprintf(b, sizeof b,
-                     "\r\nDOSongle Modem (Phase 1c)\r\nheap free=%u min=%u largest=%u\r\n"
+                     "\r\nDOSongle Modem (Phase 1c) ver=%s\r\nheap free=%u min=%u largest=%u\r\n"
                      "tput rx=%u cdc=%u blkus=%llu durus=%lld\r\n",
+                     ad ? ad->version : "?",
                      (unsigned)esp_get_free_heap_size(),
                      (unsigned)esp_get_minimum_free_heap_size(),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),

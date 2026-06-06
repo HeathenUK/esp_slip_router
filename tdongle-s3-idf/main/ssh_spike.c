@@ -20,6 +20,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "libssh2_idf.h"   /* sets ESP32 for the gated libssh2 headers, then includes libssh2.h */
 #include "disk.h"
@@ -59,9 +60,21 @@ static void ssh_spike_run(const char *user, const char *pass, const char *host, 
     if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) { disk_logf("sshspike: connect fail"); goto restore; }
     sample("connected");
 
-    if (libssh2_init(0) != 0) { disk_logf("sshspike: libssh2_init fail"); goto restore; }
+    extern size_t libssh2_session_struct_size(void);
+    disk_logf("sshspike: sizeof(LIBSSH2_SESSION)=%u", (unsigned)libssh2_session_struct_size());
+    int ir = libssh2_init(0);
+    disk_logf("sshspike: libssh2_init=%d free=%u lfb=%u", ir,
+              (unsigned)esp_get_free_heap_size(),
+              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (ir != 0) { disk_logf("sshspike: libssh2_init fail"); goto restore; }
     session = libssh2_session_init();
-    if (!session) { disk_logf("sshspike: session_init fail"); goto exit_lib; }
+    if (!session) {
+        disk_logf("sshspike: session_init NULL free=%u lfb=%u (stack hw=%u)",
+                  (unsigned)esp_get_free_heap_size(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                  (unsigned)uxTaskGetStackHighWaterMark(NULL));
+        goto exit_lib;
+    }
     libssh2_session_set_blocking(session, 1);
     sample("session");
 
@@ -98,8 +111,9 @@ exit_lib:
 restore:
     if (sock >= 0) close(sock);
     if (res) freeaddrinfo(res);
-    disk_logf("sshspike: VERDICT min-free during session = %u  (base %u, peak used ~%u, guard 5120)",
-              (unsigned)s_lo, (unsigned)base, (unsigned)(base - s_lo));
+    disk_logf("sshspike: VERDICT min-free heap = %u (base %u, heap-peak ~%u); task stack used = %u/20480",
+              (unsigned)s_lo, (unsigned)base, (unsigned)(base - s_lo),
+              (unsigned)(20480 - uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
     app_secure_quiesce(false);
     disk_logf("sshspike: httpd restored, done");
 }
@@ -124,8 +138,10 @@ void ssh_spike_start(const char *user, const char *pass, const char *host, uint1
     strncpy(a->pass, pass, sizeof a->pass - 1);
     strncpy(a->host, host, sizeof a->host - 1);
     a->port = port;
-    /* 8 KB stack: libssh2's key exchange does bignum math on the stack. CPU0. */
-    if (xTaskCreatePinnedToCore(spike_task, "sshspike", 8192, a, 5, NULL, 0) != pdPASS) {
+    /* 20 KB stack: libssh2 + mbedTLS key exchange does heavy bignum/SHA math on
+     * the stack (8 KB overflowed). The stack is also RAM -- the spike's verdict
+     * reports the stack high-water so we count stack + heap together. CPU0. */
+    if (xTaskCreatePinnedToCore(spike_task, "sshspike", 16384, a, 5, NULL, 0) != pdPASS) {
         disk_logf("sshspike: task spawn fail");
         free(a);
     }

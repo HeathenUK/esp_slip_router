@@ -416,6 +416,23 @@ static esp_err_t h_disk_log(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* Iterate the in-RAM disk-log ring oldest->newest, invoking cb(line, ctx) per
+ * line. Lets the modem expose the log over the CDC link (AT$LOG) so diagnostics
+ * don't depend on WiFi/HTTP being up. Same ring + lock as h_disk_log. */
+void disk_log_foreach(void (*cb)(const char *line, void *ctx), void *ctx) {
+    portENTER_CRITICAL(&s_disk_log_mux);
+    uint32_t seq = s_disk_log_seq;
+    portEXIT_CRITICAL(&s_disk_log_mux);
+    uint32_t first = (seq > DISK_LOG_LINES) ? (seq - DISK_LOG_LINES + 1) : 1;
+    char line[DISK_LOG_LINE_LEN + 1];
+    for (uint32_t cur = first; cur <= seq; ++cur) {
+        portENTER_CRITICAL(&s_disk_log_mux);
+        snprintf(line, sizeof line, "%s", s_disk_log[cur % DISK_LOG_LINES]);
+        portEXIT_CRITICAL(&s_disk_log_mux);
+        cb(line, ctx);
+    }
+}
+
 /* /ota: POST raw firmware.bin as the body. We write it into the
  * inactive OTA slot, mark that slot bootable, reply, then esp_restart.
  * Matches the protocol the arduino-esp32 build exposed, so dosongle.sh

@@ -175,7 +175,13 @@ struct iovec {
  * total packet size of 35000 bytes or less (including length,
  * padding length, payload, padding, and MAC.)."
  */
-#define MAX_SSH_PACKET_LEN 35000
+/* EMBEDDED TUNING (T-Dongle S3, no PSRAM): upstream 35000. outbuf[MAX_SSH_PACKET_LEN]
+ * is embedded in struct transportpacket, embedded in LIBSSH2_SESSION -- at 35000 the
+ * session struct is 54 KB, bigger than the whole heap. An interactive shell's packets
+ * are ~1-1.5 KB (KEXINIT + ECDH/host-key reply; channel data is capped to what we
+ * advertise). 4096 holds those with margin and shrinks the session to fit. Bulk
+ * SCP/SFTP of large files is NOT a goal here. See components/libssh2/CREDITS.md. */
+#define MAX_SSH_PACKET_LEN 4096
 #define MAX_SHA_DIGEST_LEN SHA512_DIGEST_LENGTH
 
 #define LIBSSH2_ALLOC(session, count) \
@@ -519,7 +525,10 @@ typedef struct _libssh2_endpoint_data
     char *lang_prefs;
 } libssh2_endpoint_data;
 
-#define PACKETBUFSIZE (1024*16)
+/* EMBEDDED TUNING: upstream (1024*16)=16 KB inbound reassembly buffer (buf[],
+ * embedded in the session). Interactive KEX/channel packets fit ~1.5-4 KB; 4096
+ * matches MAX_SSH_PACKET_LEN above and shrinks the session to fit the no-PSRAM heap. */
+#define PACKETBUFSIZE 4096
 
 struct transportpacket
 {
