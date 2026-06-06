@@ -2038,18 +2038,41 @@ static void handle_dollar(char *s) {
          * for seconds (kex), so the work runs on a worker task and CONNECT / NO
          * CARRIER is emitted from there. Password is parsed, never logged; turn
          * AT echo off (ATE0) before this so it isn't echoed back to the host. */
-        if (s_at_busy || s_dial_task) { r_error(); return; }
+        if (s_at_busy || s_dial_task) { disk_logf("ssh: BUSY (s_at_busy/s_dial_task)"); r_error(); return; }
         char tmp[200];
         strncpy(tmp, val, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
+        char *user, *pass = (char *)"", *host; uint16_t sport = 22;
         char *at = strchr(tmp, '@');
-        if (!at) { r_error(); return; }
-        *at = 0;
-        char *user = tmp, *pass = (char *)"";
-        char *c1 = strchr(tmp, ':');
-        if (c1) { *c1 = 0; pass = c1 + 1; }
-        char *host = at + 1; uint16_t sport = 22;
-        char *c2 = strrchr(host, ':');
-        if (c2) { *c2 = 0; int pn = atoi(c2 + 1); if (pn > 0 && pn < 65536) sport = (uint16_t)pn; }
+        if (at) {
+            *at = 0;
+            user = tmp;
+            char *c1 = strchr(tmp, ':');
+            if (c1) { *c1 = 0; pass = c1 + 1; }
+            host = at + 1;
+            char *c2 = strrchr(host, ':');
+            if (c2) { *c2 = 0; int pn = atoi(c2 + 1); if (pn > 0 && pn < 65536) sport = (uint16_t)pn; }
+        } else if (strchr(tmp, ',')) {
+            /* '@'-free alternate for keyboards/terminals that can't transmit '@'
+             * (common on non-US DOS layouts): AT$SSH=user,pass,host[,port]. */
+            user = strtok(tmp, ",");
+            pass = strtok(NULL, ",");
+            host = strtok(NULL, ",");
+            char *ps = strtok(NULL, ",");
+            if (!user) user = (char *)"";
+            if (!pass) pass = (char *)"";
+            if (!host) { r_error(); return; }
+            if (ps) { int pn = atoi(ps); if (pn > 0 && pn < 65536) sport = (uint16_t)pn; }
+        } else {
+            /* No '@' AND no ',' -- the separator didn't arrive. Log the received
+             * bytes (hex) so we can SEE exactly what came in (e.g. is there a 0x40
+             * where '@' should be?). Only logs on this already-malformed path, so
+             * a valid password is never dumped. */
+            char hx[120]; int k = 0;
+            for (const char *q = val; *q && k < (int)sizeof hx - 4; ++q)
+                k += snprintf(hx + k, sizeof hx - k, "%02x ", (unsigned char)*q);
+            disk_logf("ssh: no '@'/',' sep -- rx len=%d hex=%s", (int)strlen(val), hx);
+            r_error(); return;
+        }
         if (!*host || !*user) { r_error(); return; }
         strncpy(s_ssh_user, user, sizeof s_ssh_user - 1); s_ssh_user[sizeof s_ssh_user - 1] = 0;
         strncpy(s_ssh_pass, pass, sizeof s_ssh_pass - 1); s_ssh_pass[sizeof s_ssh_pass - 1] = 0;
@@ -2075,6 +2098,7 @@ static void handle_dollar(char *s) {
             "ATZ     reset settings     ATD<host>[:port]  dial out (ATDS=TLS)\r\n"
             "ATO     return online      ATH     hang up\r\n"
             "AT$SSH=user[:pass]@host[:port]   open an SSH session\r\n"
+            "AT$SSH=user,pass,host[,port]     (same, comma form -- no '@' key)\r\n"
             "+++     escape to cmd      (1 s guard, 3 +'s, 1 s guard)\r\n"
             "AT$WIFI=ssid,pw    set wifi creds + reconnect\r\n"
             "AT$WIFI?           show wifi status\r\n"
