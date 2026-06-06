@@ -40,7 +40,8 @@ static int s_rx_seen = 0;   /* logged the first relayed channel byte yet? */
  * connected socket fd (caller adopts it as the relay's s_sock) on success, or
  * -1 on any failure (all libssh2 state freed, socket closed). The session is
  * left NON-BLOCKING. Never logs `pass`. */
-int ssh_connect(const char *user, const char *pass, const char *host, uint16_t port)
+int ssh_connect(const char *user, const char *pass, const char *host, uint16_t port,
+                const char *term, int cols, int rows)
 {
     struct addrinfo hints, *res = NULL;
     char ps[8];
@@ -97,7 +98,17 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
     s_channel = libssh2_channel_open_session(s_session);
     if (!s_channel) { disk_logf("ssh: channel-open fail"); goto fail; }
     SSH_STEP("channel");
-    libssh2_channel_request_pty(s_channel, "vt100");
+    /* Advertise the caller's TERM + real cell size so the remote shell/apps
+     * pick the right capability set (colour, alt-screen) and render to the
+     * correct rows/cols. Default is a capable xterm-class TERM (the relay is
+     * byte-transparent and usbterm is xterm-ish); other/limited DOS terminals
+     * can downgrade via AT$TERM=. request_pty_ex carries the dimensions
+     * (plain request_pty hardcodes 80x24). */
+    if (!term || !*term) term = "vt100";
+    if (cols <= 0) cols = 80;
+    if (rows <= 0) rows = 25;
+    libssh2_channel_request_pty_ex(s_channel, term, (unsigned int)strlen(term),
+                                   NULL, 0, cols, rows, 0, 0);
     SSH_STEP("pty");
     if (libssh2_channel_shell(s_channel)) { disk_logf("ssh: shell fail"); goto fail; }
     SSH_STEP("shell");

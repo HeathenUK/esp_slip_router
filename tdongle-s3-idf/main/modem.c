@@ -125,7 +125,8 @@ extern void app_secure_quiesce(bool on);
 /* SSH transport (ssh.c). libssh2 types stay in ssh.c; modem.c drives this
  * plain-C API through the xport vtable. ssh_connect returns the socket fd or
  * -1; ssh_read/ssh_write follow the recv()/send() errno=EAGAIN contract. */
-extern int  ssh_connect(const char *user, const char *pass, const char *host, uint16_t port);
+extern int  ssh_connect(const char *user, const char *pass, const char *host, uint16_t port,
+                        const char *term, int cols, int rows);
 extern int  ssh_read(void *buf, size_t len);
 extern int  ssh_write(const void *buf, size_t len);
 extern void ssh_close(void);
@@ -409,6 +410,11 @@ static char          s_ssh_user[48];
 static char          s_ssh_pass[96];
 static char          s_ssh_host[96];
 static uint16_t      s_ssh_port = 22;
+/* TERM advertised to the remote over the SSH PTY. Default capable (the relay is
+ * byte-transparent and usbterm is xterm-class after its VT extensions) so apps
+ * emit colour + alt-screen. AT$TERM= lets a limited DOS terminal downgrade
+ * (e.g. "ansi"/"vt100") so it isn't fed sequences it can't render. */
+static char          s_ssh_term[32] = "xterm-256color";
 /* Interactive SSH password entry: when AT$SSH is given no password, the modem
  * prompts and on_cdc_rx captures the typed line (echo suppressed) into
  * s_ssh_pass, then spawns the worker. */
@@ -1665,7 +1671,13 @@ static void cmd_ssh_impl(void) {
         if (do_quiesce) app_secure_quiesce(true);
     }
 
-    int fd = ssh_connect(s_ssh_user, s_ssh_pass, s_ssh_host, s_ssh_port);
+    /* PTY size: cols/rows from AT$NAWS if set, else 80x25 (the DOS text-mode
+     * size -- the modem default is the telnet NVT 80x24, so map that to 25 for
+     * the SSH PTY; an explicit AT$NAWS value other than 24 is honored as-is). */
+    int ssh_cols = (int)s_term_cols;
+    int ssh_rows = (s_term_rows == 24) ? 25 : (int)s_term_rows;
+    int fd = ssh_connect(s_ssh_user, s_ssh_pass, s_ssh_host, s_ssh_port,
+                         s_ssh_term, ssh_cols, ssh_rows);
     if (fd < 0) { app_secure_quiesce(false); r_nocarrier(); return; }
 
     /* Adopt the fd into the relay. Interactive -> small window; keepalive +
@@ -2038,6 +2050,20 @@ static void handle_dollar(char *s) {
             cdc_print("\r\n"); cdc_print(s_term_type); cdc_print("\r\n");
             r_ok();
         }
+    } else if (!strcmp(key, "TERM")) {
+        /* AT$TERM=name -- TERM advertised to the remote over the SSH PTY.
+         * Default "xterm-256color" (capable: colour + alt-screen for usbterm).
+         * Set "ansi"/"vt100"/"dumb" for a limited DOS terminal. Bare query. */
+        if (val && eq) {
+            size_t vn = strnlen(val, sizeof s_ssh_term - 1);
+            if (vn == 0) { r_error(); return; }
+            memcpy(s_ssh_term, val, vn);
+            s_ssh_term[vn] = 0;
+            r_ok();
+        } else {
+            cdc_print("\r\n"); cdc_print(s_ssh_term); cdc_print("\r\n");
+            r_ok();
+        }
     } else if (!strcmp(key, "LOG")) {
         /* Dump the disk-log over CDC -- WiFi-independent diagnostics. */
         cdc_print("\r\n");
@@ -2114,6 +2140,7 @@ static void handle_dollar(char *s) {
             "AT$SSH=user[:pass]@host[:port]   open an SSH session\r\n"
             "AT$SSH=user,pass,host[,port]     (same, comma form -- no '@' key)\r\n"
             "   omit the password (user@host or user,host) to be prompted\r\n"
+            "AT$TERM=name       TERM for the SSH PTY (default xterm-256color)\r\n"
             "+++     escape to cmd      (1 s guard, 3 +'s, 1 s guard)\r\n"
             "AT$WIFI=ssid,pw    set wifi creds + reconnect\r\n"
             "AT$WIFI?           show wifi status\r\n"
