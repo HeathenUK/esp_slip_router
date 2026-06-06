@@ -25,6 +25,10 @@ idf_component_register(
         esp_event
         nvs_flash
         lwip
+        # TLS termination (HTTPS / secure relay) -- esp-tls wraps IDF's mbedTLS.
+        esp-tls
+        # SSH termination -- vendored libssh2 (see components/libssh2, BSD-3).
+        libssh2
         # HTTP server (already used in the arduino-esp32 build via
         # esp_http_server -- same component here).
         esp_http_server
