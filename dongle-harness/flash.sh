@@ -60,15 +60,22 @@ time.sleep(0.3)
 p.reset_input_buffer()
 
 def read_for(secs):
+    # Returns (buf, disconnected). A successful OTA reboots the dongle the
+    # instant the last byte lands, so the port vanishes mid-read -- that is
+    # EXPECTED, not an error. Treat the disconnect as "rebooting" and let the
+    # post-reboot version check be the authority.
     end = time.time() + secs; buf = b""
     while time.time() < end:
-        b = p.read(p.in_waiting or 1)
+        try:
+            b = p.read(p.in_waiting or 1)
+        except (OSError, serial.SerialException):
+            return buf, True
         if b: buf += b
-    return buf
+    return buf, False
 
 # Capture the running version so the post-reboot check can confirm it changed.
 p.write(b"ATI\r"); p.flush()
-m = re.search(rb"ver=([0-9a-fA-F]+)", read_for(1.5))
+m = re.search(rb"ver=([0-9a-fA-F]+)", read_for(1.5)[0])
 prev = m.group(1).decode() if m else ""
 open(prevf, "w").write(prev)
 print(f"flash: pre-flash version: {prev or '(unknown)'}")
@@ -111,22 +118,30 @@ with open(fw_path, "rb") as f:
             pct = sent * 100 // sz
             rate = sent / max(time.time() - t0, 0.001) / 1024
             print(f"  {sent:>8}/{sz} ({pct:3}%) @ {rate:.0f} KB/s", flush=True)
-p.flush()
+try:
+    p.flush()
+except (OSError, serial.SerialException):
+    pass   # device may have already rebooted on the final chunk
 dt = time.time() - t0
 print(f"flash: sent {sent} bytes in {dt:.1f}s ({sent/dt/1024:.0f} KB/s)")
 
 # Fast-fail ONLY on an explicit device error code (OTA WRITE-FAIL / TIMEOUT /
 # END-FAIL / SETBOOT-FAIL). We do NOT trust an in-band "OTA OK" -- success is
-# proven by the version flip below. On a real failure the firmware now arms a
-# parser drain and stays up on the OLD version (creds safe), so the version
-# simply won't change.
-txt = read_for(6.0)
-for code in (b"WRITE-FAIL", b"TIMEOUT", b"END-FAIL", b"SETBOOT-FAIL", b"BADSIZE", b"NOPART", b"BEGIN-FAIL"):
-    if b"OTA " + code in txt:
-        print(f"flash: device reported OTA {code.decode()} — flash aborted on-device (still on old fw).", file=sys.stderr)
-        p.close(); sys.exit(3)
-p.close()
-print("flash: stream sent; verifying by version change (authoritative)...")
+# proven by the version flip below. On a real failure the firmware arms a
+# parser drain and stays up on the OLD version (creds safe). On SUCCESS the
+# dongle reboots the instant the last byte lands, so the port drops mid-read --
+# that disconnect is the expected success signal, handed to the version check.
+txt, disconnected = read_for(6.0)
+try: p.close()
+except Exception: pass
+if not disconnected:
+    for code in (b"WRITE-FAIL", b"TIMEOUT", b"END-FAIL", b"SETBOOT-FAIL", b"BADSIZE", b"NOPART", b"BEGIN-FAIL"):
+        if b"OTA " + code in txt:
+            print(f"flash: device reported OTA {code.decode()} — flash aborted on-device (still on old fw).", file=sys.stderr)
+            sys.exit(3)
+    print("flash: stream sent (device still up); verifying by version change (authoritative)...")
+else:
+    print("flash: device rebooted at end of stream; verifying by version change (authoritative)...")
 PY
 RC=$?
 [ "$RC" -ne 0 ] && { rm -f "$PREVF"; exit "$RC"; }
