@@ -393,6 +393,61 @@ static void r_nocarrier(void)  { if (!s_quiet) cdc_print(s_verbose ? "\r\nNO CAR
  * to dial" semantic to "the name doesn't resolve". */
 static void r_nodialtone(void) { if (!s_quiet) cdc_print(s_verbose ? "\r\nNO DIALTONE\r\n" : "6\r\n"); }
 
+/* ---- CDC OTA receive state ----
+ * The firmware stream is consumed callback-by-callback in on_cdc_rx, NOT in a
+ * blocking loop. A blocking loop inside on_cdc_rx (which runs on the TinyUSB
+ * task) starves itself: while it spins, the TinyUSB task can't service new USB
+ * transfers, so tud_cdc_rx_cb never refills the driver RX ringbuffer and
+ * tinyusb_cdcacm_read returns 0 forever (measured: got=0, TIMEOUT -- CDC OTA
+ * never actually worked). Driving it as a state keeps the task responsive
+ * between chunks, exactly like the SLIP/online/command modes alongside it. */
+static volatile bool         s_ota_active  = false;
+static esp_ota_handle_t       s_ota_h       = 0;
+static const esp_partition_t *s_ota_part    = NULL;
+static long                   s_ota_sz      = 0;
+static long                   s_ota_got     = 0;
+static long                   s_ota_mark    = 0;   /* next 256 KB progress mark */
+static int64_t                s_ota_last_us = 0;   /* last byte time (stall timeout) */
+
+/* Abort an in-progress CDC OTA and arm the drain so the rest of the stream
+ * cannot reach the parser (else a misparse clobbers the live config). Pass
+ * abort_handle=false when esp_ota_end already consumed the handle. */
+static void ota_fail(const char *code, bool abort_handle) {
+    if (abort_handle && s_ota_h) esp_ota_abort(s_ota_h);
+    s_ota_h = 0;
+    s_ota_active = false;
+    disk_logf("ota: FAIL %s got=%ld/%ld -- arming parser drain", code, s_ota_got, s_ota_sz);
+    ota_arm_drain();
+    char m[40];
+    snprintf(m, sizeof m, "\r\nOTA %s\r\n", code);
+    cdc_print(m);
+}
+
+/* Feed one CDC chunk into the active OTA. Called from on_cdc_rx for every
+ * buffer while s_ota_active. Returns having either consumed the chunk, failed
+ * (drain armed), or completed (commit + reboot, never returns). */
+static void ota_feed(const uint8_t *buf, size_t n) {
+    int64_t now = esp_timer_get_time();
+    if (now - s_ota_last_us > 8 * 1000 * 1000LL) { ota_fail("TIMEOUT", true); return; }
+    if (esp_ota_write(s_ota_h, buf, n) != ESP_OK) { ota_fail("WRITE-FAIL", true); return; }
+    s_ota_got += (long)n;
+    s_ota_last_us = now;
+    if (s_ota_got >= s_ota_mark) {
+        disk_logf("ota: %ld/%ld KB free=%u", s_ota_got >> 10, s_ota_sz >> 10,
+                  (unsigned)esp_get_free_heap_size());
+        s_ota_mark += 256L * 1024;
+    }
+    if (s_ota_got >= s_ota_sz) {
+        if (esp_ota_end(s_ota_h) != ESP_OK)                  { ota_fail("END-FAIL", false); return; }
+        if (esp_ota_set_boot_partition(s_ota_part) != ESP_OK) { ota_fail("SETBOOT-FAIL", false); return; }
+        s_ota_h = 0; s_ota_active = false;
+        disk_logf("ota: OK got=%ld/%ld -- rebooting", s_ota_got, s_ota_sz);
+        cdc_print("\r\nOTA OK\r\n");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    }
+}
+
 /* ---- telnet helpers ---- */
 
 static void tn_send3(uint8_t cmd, uint8_t opt) {
@@ -1619,6 +1674,7 @@ static void handle_dollar(char *s) {
         if (sz < 16384L || sz > 6L * 1024L * 1024L) {
             cdc_print("\r\nOTA BADSIZE\r\n"); r_error(); return;
         }
+        if (s_ota_active) { cdc_print("\r\nOTA BUSY\r\n"); r_error(); return; }
         const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
         if (!next) { cdc_print("\r\nOTA NOPART\r\n"); r_error(); return; }
         esp_ota_handle_t h = 0;
@@ -1629,54 +1685,20 @@ static void handle_dollar(char *s) {
         if (esp_ota_begin(next, OTA_WITH_SEQUENTIAL_WRITES, &h) != ESP_OK) {
             cdc_print("\r\nOTA BEGIN-FAIL\r\n"); r_error(); return;
         }
+        /* Arm OTA-receive MODE and return immediately. The stream is consumed
+         * chunk-by-chunk by on_cdc_rx -> ota_feed() as TinyUSB delivers it; a
+         * blocking loop here would starve itself (we run on the TinyUSB task,
+         * so we'd block the very task that refills the RX ringbuffer -> got=0,
+         * TIMEOUT). Completion/commit/reboot and all failure paths (which arm
+         * the drain) live in ota_feed. */
+        s_ota_h = h; s_ota_part = next; s_ota_sz = sz; s_ota_got = 0;
+        s_ota_mark = 256L * 1024;
+        s_ota_last_us = esp_timer_get_time();
+        s_ota_active = true;
         disk_logf("ota: begin sz=%ld part=%s @0x%lx free=%u", sz, next->label,
                   (unsigned long)next->address, (unsigned)esp_get_free_heap_size());
         cdc_print("\r\nOTA READY\r\n");
-        /* From here the host is streaming <sz> raw firmware bytes. Any exit
-         * before esp_restart() leaves the rest of that stream in flight, so
-         * EVERY post-READY failure path must arm the drain (ota_arm_drain)
-         * before returning, or the leftover bytes hit the AT parser and can
-         * clobber the live config. The disk_logf trail records exactly where
-         * a desync happens so the under-consumption can be root-caused. */
-        long got = 0, next_mark = 256L * 1024;
-        unsigned long empties = 0;
-        int64_t last_rx_us = esp_timer_get_time();
-        const char *failcode = NULL;
-        static uint8_t buf[1024];   /* SRAM trim 2026-06-02 (was 2048) */
-        while (got < sz) {
-            size_t want = (size_t)(sz - got);
-            if (want > sizeof buf) want = sizeof buf;
-            size_t n = 0;
-            if (tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, buf, want, &n) == ESP_OK && n > 0) {
-                if (esp_ota_write(h, buf, n) != ESP_OK) { failcode = "WRITE-FAIL"; break; }
-                got += (long)n;
-                last_rx_us = esp_timer_get_time();
-                if (got >= next_mark) {
-                    disk_logf("ota: %ld/%ld KB free=%u empties=%lu", got >> 10, sz >> 10,
-                              (unsigned)esp_get_free_heap_size(), empties);
-                    next_mark += 256L * 1024;
-                }
-            } else {
-                empties++;
-                if (esp_timer_get_time() - last_rx_us > 8 * 1000 * 1000LL) { failcode = "TIMEOUT"; break; }
-                vTaskDelay(pdMS_TO_TICKS(2));
-            }
-        }
-        if (failcode)                              esp_ota_abort(h);
-        else if (esp_ota_end(h) != ESP_OK)         failcode = "END-FAIL";
-        else if (esp_ota_set_boot_partition(next) != ESP_OK) failcode = "SETBOOT-FAIL";
-        if (failcode) {
-            disk_logf("ota: FAIL %s got=%ld/%ld empties=%lu -- arming parser drain",
-                      failcode, got, sz, empties);
-            ota_arm_drain();   /* swallow the in-flight firmware stream */
-            char m[40];
-            snprintf(m, sizeof m, "\r\nOTA %s\r\n", failcode);
-            cdc_print(m); r_error(); return;
-        }
-        disk_logf("ota: OK got=%ld/%ld empties=%lu -- rebooting", got, sz, empties);
-        cdc_print("\r\nOTA OK\r\n");
-        vTaskDelay(pdMS_TO_TICKS(200));
-        esp_restart();
+        return;
     } else if (!strcmp(key, "TYPE") && val && eq) {
         /* AT$TYPE=<string> -- send <string> via the USB HID keyboard.
          * See kbd.h for the token DSL (<ENTER>, <F1>, <CTRL+C>,
@@ -1911,6 +1933,12 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
         disk_logf("ota: drain done, swallowed %lu bytes", (unsigned long)s_ota_drained);
         s_ota_drain_until_us = 0;   /* quiet long enough -- process this buffer */
     }
+
+    /* CDC OTA in progress: every delivered byte is firmware. Feed it straight
+     * to flash. ota_feed handles progress, completion (commit + reboot) and
+     * failure (arms the drain). Must precede every parser path so OTA bytes
+     * are never mistaken for commands. */
+    if (s_ota_active) { ota_feed(buf, got); return; }
 
     /* CPR probe in flight (just-dialed): consume the reply before any
      * other path sees it. Stale probes time out via the deadline so a
