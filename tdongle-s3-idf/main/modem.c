@@ -1384,13 +1384,29 @@ static void cmd_dial_impl(const char *arg) {
     bool secure = s_dial_secure || (port == 443);
 
     if (secure) {
-        /* TLS termination. Quiesce httpd FIRST so the handshake (cert chain +
-         * mbedTLS state) has the internal-heap headroom this no-PSRAM part
-         * needs. esp-tls owns DNS + TCP connect + handshake, verifying the
-         * server cert against the full CA bundle (SNI/CN = host). We then adopt
-         * its socket fd, so the window controller / keepalive / NO CARRIER
-         * teardown all behave exactly as for plain TCP. */
-        app_secure_quiesce(true);
+        /* TLS termination. esp-tls owns DNS + TCP connect + handshake, verifying
+         * the server cert against the full CA bundle (SNI/CN = host). We then
+         * adopt its socket fd, so the window controller / keepalive / NO CARRIER
+         * teardown all behave exactly as for plain TCP.
+         *
+         * CONDITIONAL quiesce: only stop httpd if the heap at dial time can't
+         * safely absorb the handshake. It has a ~20 KB transient peak (cert-chain
+         * verify + bignum), and each incoming TLS record needs ONE CONTIGUOUS
+         * buffer (up to ~16 KB, dynamic-buffer mbedTLS). So quiesce when either
+         * total free is tight (a 20 KB dip would near the 5 KB guard) or the
+         * largest contiguous block is too small for a max record. At healthy idle
+         * (~35 KB free, ~26 KB largest) we SKIP it and httpd stays up; it only
+         * kicks in when the heap is already degraded (fragmentation, prior
+         * session, concurrent load). httpd is restored unconditionally in
+         * xport_close -- httpd_start_once is idempotent, so it's a no-op when we
+         * never stopped it. Thresholds are initial; the gate line logs the heap
+         * so they can be tuned against observed floors. */
+        uint32_t qfree   = esp_get_free_heap_size();
+        uint32_t qcontig = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        bool do_quiesce  = (qfree < 32 * 1024) || (qcontig < 20 * 1024);
+        disk_logf("dial: TLS gate free=%u contig=%u -> quiesce=%d",
+                  (unsigned)qfree, (unsigned)qcontig, do_quiesce);
+        if (do_quiesce) app_secure_quiesce(true);
         esp_tls_cfg_t cfg = {
             .crt_bundle_attach = esp_crt_bundle_attach,
             .timeout_ms        = 20000,
