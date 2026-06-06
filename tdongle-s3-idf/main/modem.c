@@ -122,6 +122,14 @@ static int       s_sock = -1;
  * Bracketed by the secure dial (on) and xport_close (off). Defined in main.c. */
 extern void app_secure_quiesce(bool on);
 
+/* SSH transport (ssh.c). libssh2 types stay in ssh.c; modem.c drives this
+ * plain-C API through the xport vtable. ssh_connect returns the socket fd or
+ * -1; ssh_read/ssh_write follow the recv()/send() errno=EAGAIN contract. */
+extern int  ssh_connect(const char *user, const char *pass, const char *host, uint16_t port);
+extern int  ssh_read(void *buf, size_t len);
+extern int  ssh_write(const void *buf, size_t len);
+extern void ssh_close(void);
+
 /* ---- transport abstraction (Phase 1) ----
  * The relay's PAYLOAD I/O goes through xport_read/xport_write/xport_close so the
  * same dial + relay + window machinery can carry plain TCP, TLS (esp-tls) or SSH
@@ -154,7 +162,7 @@ static int xport_read(void *buf, size_t len) {
                 r == ESP_TLS_ERR_SSL_WANT_WRITE) { errno = EAGAIN; return -1; }
             errno = EIO; return -1;                     /* real error -> teardown */
         }
-        /* Phase 3: libssh2_channel_read(s_xport_ctx, buf, len) */
+        case XPORT_SSH: return ssh_read(buf, len);      /* already recv()-contract */
         default:        return -1;
     }
 }
@@ -171,7 +179,7 @@ static int xport_write(const void *buf, size_t len) {
                 w == ESP_TLS_ERR_SSL_WANT_READ) { errno = EAGAIN; return -1; }
             errno = EIO; return -1;
         }
-        /* Phase 3: libssh2_channel_write(s_xport_ctx, buf, len) */
+        case XPORT_SSH: return ssh_write(buf, len);     /* already send()-contract */
         default:        return -1;
     }
 }
@@ -189,7 +197,14 @@ static void xport_close(void) {
         app_secure_quiesce(false);   /* restore httpd + mDNS */
         return;
     }
-    /* Phase 3: SSH frees channel+session here, then we close the fd. */
+    if (s_xport_kind == XPORT_SSH) {
+        /* Free channel + session (ssh.c), THEN close the fd we own. */
+        ssh_close();
+        if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+        s_xport_kind = XPORT_TCP;
+        app_secure_quiesce(false);   /* restore httpd + mDNS */
+        return;
+    }
     s_xport_ctx = NULL;
     if (s_sock >= 0) { close(s_sock); s_sock = -1; }
     s_xport_kind = XPORT_TCP;
@@ -391,6 +406,11 @@ static volatile bool s_at_busy = false;
 static char          s_dial_arg[128];
 static bool          s_dial_secure = false;   /* TLS-wrap this dial (ATDS / :443) */
 static TaskHandle_t  s_dial_task = NULL;
+/* AT$SSH args, staged under s_at_busy (no concurrent writer) for the worker. */
+static char          s_ssh_user[48];
+static char          s_ssh_pass[96];
+static char          s_ssh_host[96];
+static uint16_t      s_ssh_port = 22;
 static inline bool bget(uint8_t *a, uint8_t o) { return a[o >> 3] & (1 << (o & 7)); }
 static inline void bset(uint8_t *a, uint8_t o) { a[o >> 3] |=  (1 << (o & 7)); }
 static inline void bclr(uint8_t *a, uint8_t o) { a[o >> 3] &= ~(1 << (o & 7)); }
@@ -1600,6 +1620,78 @@ static void cmd_dial_task_fn(void *arg) {
     vTaskDelete(NULL);
 }
 
+/* SSH dial worker. Mirrors cmd_dial_impl's "go online" tail but the connection
+ * is an libssh2 PTY/shell channel (ssh.c) instead of a raw/TLS socket, and the
+ * pumps run BINARY (s_telnet=false): the channel already carries raw shell
+ * bytes, so the telnet IAC machine must not touch them. Result code is emitted
+ * here (CONNECT / NO CARRIER). Never logs the password. */
+static void cmd_ssh_impl(void) {
+    /* Hang up any lingering session first (same leak-safety as cmd_dial_impl). */
+    if (s_sock >= 0) {
+        s_online = false;
+        vTaskDelay(pdMS_TO_TICKS(20));
+        xport_close();
+        s_peer[0] = 0;
+    }
+
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) { r_nocarrier(); return; }
+
+    /* Conditional quiesce (same gate as the TLS dial). SSH's session struct is
+     * ~11 KB CONTIGUOUS + a handshake transient, so the contig<18 KB arm is the
+     * load-bearing one here -- it guarantees session_init's big block fits. */
+    {
+        uint32_t qfree   = esp_get_free_heap_size();
+        uint32_t qcontig = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        bool do_quiesce  = (qfree < 28 * 1024) || (qcontig < 18 * 1024);
+        disk_logf("ssh: gate free=%u contig=%u -> quiesce=%d",
+                  (unsigned)qfree, (unsigned)qcontig, do_quiesce);
+        if (do_quiesce) app_secure_quiesce(true);
+    }
+
+    int fd = ssh_connect(s_ssh_user, s_ssh_pass, s_ssh_host, s_ssh_port);
+    if (fd < 0) { app_secure_quiesce(false); r_nocarrier(); return; }
+
+    /* Adopt the fd into the relay. Interactive -> small window; keepalive +
+     * NODELAY + bounded SNDTIMEO exactly as the TCP path (the data task then
+     * sets RCVTIMEO=100 ms). */
+    int yes = 1;       setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,  &yes,      sizeof yes);
+    struct timeval stv = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof stv);
+    int rcvbuf = 2048; setsockopt(fd, SOL_SOCKET, SO_RCVBUF,     &rcvbuf,   sizeof rcvbuf);
+    int ka = 1;        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,  &ka,       sizeof ka);
+    int ka_idle = 4;   setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &ka_idle,  sizeof ka_idle);
+    int ka_intvl = 2;  setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &ka_intvl, sizeof ka_intvl);
+    int ka_cnt = 4;    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &ka_cnt,   sizeof ka_cnt);
+
+    s_sock       = fd;
+    s_xport_kind = XPORT_SSH;
+    s_telnet     = false;        /* raw channel: take the binary pump paths */
+    s_peer_port  = s_ssh_port;
+    snprintf(s_peer, sizeof s_peer, "ssh:%.32s@%.48s:%u", s_ssh_user, s_ssh_host, (unsigned)s_ssh_port);
+    s_plus_count = 0;
+    s_last_data_us = esp_timer_get_time();
+    disk_logf("ssh: connected fd=%d peer=%s", fd, s_peer);
+
+    /* Go online (same ordering as cmd_dial_impl, MINUS tn_start -- no telnet). */
+    xStreamBufferReset(s_to_cdc);
+    xStreamBufferReset(s_to_tcp);
+    s_tp_rx = 0; s_tp_cdc = 0; s_tp_blk_us = 0; s_tp_start = esp_timer_get_time();
+    s_online = true;
+    if (s_data_task)     xTaskNotifyGive(s_data_task);
+    if (s_cdc_pump_task) xTaskNotifyGive(s_cdc_pump_task);
+    if (s_tcp_pump_task) xTaskNotifyGive(s_tcp_pump_task);
+    r_connect();
+}
+
+static void cmd_ssh_task_fn(void *arg) {
+    (void)arg;
+    cmd_ssh_impl();
+    s_at_busy = false;
+    s_dial_task = NULL;
+    vTaskDelete(NULL);
+}
+
 /* Thin synchronous wrapper called from exec(). Does the cheap syntax
  * checks inline (so a malformed ATD gets an immediate ERROR) and then
  * hands off to cmd_dial_task_fn for the slow work. */
@@ -1936,13 +2028,46 @@ static void handle_dollar(char *s) {
             if (!*host || !*user) { r_error(); }
             else { ssh_spike_start(user, pass, host, sport); r_ok(); }
         }
+    } else if (!strcmp(key, "SSH") && val && eq) {
+        /* AT$SSH=user[:pass]@host[:port] -- open an interactive SSH session and
+         * relay it as a transparent pipe (the dongle terminates SSH; the DOS
+         * side just sees a raw shell, like a telnet dial). The handshake blocks
+         * for seconds (kex), so the work runs on a worker task and CONNECT / NO
+         * CARRIER is emitted from there. Password is parsed, never logged; turn
+         * AT echo off (ATE0) before this so it isn't echoed back to the host. */
+        if (s_at_busy || s_dial_task) { r_error(); return; }
+        char tmp[200];
+        strncpy(tmp, val, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
+        char *at = strchr(tmp, '@');
+        if (!at) { r_error(); return; }
+        *at = 0;
+        char *user = tmp, *pass = (char *)"";
+        char *c1 = strchr(tmp, ':');
+        if (c1) { *c1 = 0; pass = c1 + 1; }
+        char *host = at + 1; uint16_t sport = 22;
+        char *c2 = strrchr(host, ':');
+        if (c2) { *c2 = 0; int pn = atoi(c2 + 1); if (pn > 0 && pn < 65536) sport = (uint16_t)pn; }
+        if (!*host || !*user) { r_error(); return; }
+        strncpy(s_ssh_user, user, sizeof s_ssh_user - 1); s_ssh_user[sizeof s_ssh_user - 1] = 0;
+        strncpy(s_ssh_pass, pass, sizeof s_ssh_pass - 1); s_ssh_pass[sizeof s_ssh_pass - 1] = 0;
+        strncpy(s_ssh_host, host, sizeof s_ssh_host - 1); s_ssh_host[sizeof s_ssh_host - 1] = 0;
+        s_ssh_port = sport;
+        s_at_busy = true;
+        /* 20 KB stack: the mbedTLS bignum kex does heavy stack math (8 KB
+         * overflowed in the spike). CPU0, off the TinyUSB core. */
+        if (xTaskCreatePinnedToCore(cmd_ssh_task_fn, "at_ssh", 20480, NULL, 15,
+                                    &s_dial_task, 0) != pdPASS) {
+            s_at_busy = false; s_dial_task = NULL; r_error();
+        }
+        /* CONNECT / NO CARRIER emitted by cmd_ssh_impl. */
     } else if (!strcmp(key, "HELP")) {
         cdc_print(
             "\r\n"
             "ATE0/1  echo off/on        ATV0/1  numeric/verbose\r\n"
             "ATQ0/1  result codes       ATI     identity\r\n"
-            "ATZ     reset settings     ATD<host>[:port]  dial out\r\n"
+            "ATZ     reset settings     ATD<host>[:port]  dial out (ATDS=TLS)\r\n"
             "ATO     return online      ATH     hang up\r\n"
+            "AT$SSH=user[:pass]@host[:port]   open an SSH session\r\n"
             "+++     escape to cmd      (1 s guard, 3 +'s, 1 s guard)\r\n"
             "AT$WIFI=ssid,pw    set wifi creds + reconnect\r\n"
             "AT$WIFI?           show wifi status\r\n"

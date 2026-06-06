@@ -18,6 +18,7 @@ idf_component_register(
         "kbd.c"
         "display.c"
         "ssh_spike.c"
+        "ssh.c"
     INCLUDE_DIRS "."
     REQUIRES
         # Networking / WiFi
