@@ -10,14 +10,18 @@
  *      the frame is skipped.
  *   3. ATH (hang up any prior call), ATNET0 (transparent pipe -- HTTP needs
  *      it; default telnet IAC corrupts the request).
- *   4. ATDT<host>:<port>, wait CONNECT, send GET (HTTP/1.0, Connection: close).
+ *   4. Dial: ATDT<host>:<port> for http, ATDS<host>:<port> for https (the 'S'
+ *      tells the dongle to TLS-wrap -- it terminates TLS and relays plaintext,
+ *      so the GET/response below are byte-for-byte the same as plain HTTP).
+ *      Wait CONNECT, send GET (HTTP/1.0, Connection: close).
+ *      3xx with a Location: is followed (bounded), incl. http->https.
  *   5. Stream the body to <outfile>, using AH=18h block-read when available
  *      (CHUSB does -- the fast path). Cap at Content-Length, else hold back
  *      and strip the dongle's trailing "\r\nNO CARRIER".
  *   6. +++ / ATH to hang up. Print bytes + KB/s.
  *
  * Usage:  WGET [comN] <url> [outfile]
- *   url       host[:port]/path  or  http://host[:port]/path
+ *   url       host[:port]/path, http://host[:port]/path, or https://host[...]
  *   outfile   8.3 name; derived from the URL basename if omitted (else WGET.DAT)
  */
 #include <stdio.h>
@@ -181,19 +185,21 @@ static int wait_dial_result(unsigned port, unsigned timeout_ms)
     return 0;
 }
 static int parse_url(const char *url, char *h, unsigned hcap,
-                     unsigned *port_out, char *pth, unsigned pcap)
+                     unsigned *port_out, char *pth, unsigned pcap, int *secure_out)
 {
-    const char *p = url; unsigned n;
-    if (!strncmp(p, "http://", 7)) p += 7;
+    const char *p = url; unsigned n; int secure = 0;
+    if      (!strncmp(p, "https://", 8)) { secure = 1; p += 8; }
+    else if (!strncmp(p, "http://",  7)) { p += 7; }
     n = 0;
     while (*p && *p != ':' && *p != '/') { if (n + 1 >= hcap) return 0; h[n++] = *p++; }
     h[n] = '\0'; if (n == 0) return 0;
     if (*p == ':') { unsigned port = 0; ++p;
         while (*p >= '0' && *p <= '9') { port = port * 10U + (unsigned)(*p - '0'); ++p; }
-        *port_out = port ? port : 80U;
-    } else *port_out = 80U;
+        *port_out = port ? port : (secure ? 443U : 80U);
+    } else *port_out = secure ? 443U : 80U;
     if (*p == '/') { n = 0; while (*p) { if (n + 1 >= pcap) return 0; pth[n++] = *p++; } pth[n] = '\0'; }
     else { if (pcap < 2) return 0; pth[0] = '/'; pth[1] = '\0'; }
+    *secure_out = secure;
     return 1;
 }
 static int autodetect_com(void)
@@ -244,7 +250,7 @@ static void derive_filename(const char *pth, char *out, unsigned cap)
 }
 
 /* Outcome of one dial+GET+stream attempt. */
-enum { ATT_OK = 0, ATT_INCOMPLETE, ATT_DIAL_FAIL, ATT_HTTP_FATAL, ATT_IGNORED_RANGE };
+enum { ATT_OK = 0, ATT_INCOMPLETE, ATT_DIAL_FAIL, ATT_HTTP_FATAL, ATT_IGNORED_RANGE, ATT_REDIRECT };
 
 /* Return to command mode and drop any active call, so the next ATDT dials clean.
  * +++ (with the Hayes 1s guards) escapes online-data mode; ATH hangs up. Safe to
@@ -263,14 +269,16 @@ static void hangup_call(unsigned port)
  * and have_total when the response reveals the full size; sets written to the
  * absolute on-disk byte count. Returns an ATT_* code. */
 static int do_attempt(unsigned port, const char *h, unsigned pnum, const char *pth,
-                      FILE *f, unsigned long resume_from,
-                      unsigned long *total, int *have_total, unsigned long *written)
+                      int secure, FILE *f, unsigned long resume_from,
+                      unsigned long *total, int *have_total, unsigned long *written,
+                      char *location, unsigned loccap)
 {
     int n, status = 0;
     unsigned long clen = 0UL;     int have_clen = 0;
     unsigned long cr_start = 0UL, cr_total = 0UL; int have_cr = 0;
     unsigned long last_byte_ticks, last_progress_ticks, t0, max_ticks, silence_ticks;
     unsigned char hold[16]; unsigned held = 0;
+    if (location) location[0] = '\0';
 
     /* --- dial --- */
     drain_rx(port, 100);
@@ -278,7 +286,10 @@ static int do_attempt(unsigned port, const char *h, unsigned pnum, const char *p
     fossil_send_str(port, "ATNET0\r"); wait_ms(300); drain_rx(port, 100);
     {
         char dial[200];
-        snprintf(dial, sizeof(dial), "ATDT%s:%u\r", h, pnum);
+        /* ATDS = secure (TLS) dial, ATDT = plain. The dongle's 'S' modifier
+         * makes it terminate TLS and relay plaintext, so everything below
+         * (GET, status, headers, body) is identical to plain HTTP. */
+        snprintf(dial, sizeof(dial), "ATD%c%s:%u\r", secure ? 'S' : 'T', h, pnum);
         fossil_send_str(port, dial);
     }
     switch (wait_dial_result(port, 20000)) {
@@ -340,7 +351,19 @@ static int do_attempt(unsigned port, const char *h, unsigned pnum, const char *p
             if (*p == '/') ++p;
             while (*p>='0'&&*p<='9') { cr_total = cr_total*10UL + (unsigned long)(*p-'0'); ++p; }
             have_cr = 1;
+        } else if (location && (!strncmp(line,"Location:",9) || !strncmp(line,"location:",9))) {
+            const char *p = line + 9; unsigned k = 0;
+            while (*p==' '||*p=='\t') ++p;
+            while (*p && k + 1 < loccap) location[k++] = *p++;
+            location[k] = '\0';
         }
+    }
+
+    /* --- follow 3xx redirects (incl. http->https) before the Range logic --- */
+    if (status >= 300 && status < 400) {
+        if (location && location[0]) return ATT_REDIRECT;
+        fprintf(stderr, "WGET: HTTP %d redirect with no Location.\n", status);
+        return ATT_HTTP_FATAL;
     }
 
     /* --- reconcile status vs the Range we asked for --- */
@@ -415,6 +438,8 @@ int main(int argc, char **argv)
     unsigned port_num = 80;
     const char *url = NULL, *ofarg = NULL;
     int argi;
+    int secure = 0;
+    char location[256];
     unsigned long t_start;
     FILE *f;
 
@@ -440,13 +465,14 @@ int main(int argc, char **argv)
         return 1;
     }
     (void)int14(0x1E, 0x01, 0x0000, (unsigned)((3<<8)|11), (unsigned)port_index);
-    if (!parse_url(url, host, sizeof(host), &port_num, path, sizeof(path))) {
+    if (!parse_url(url, host, sizeof(host), &port_num, path, sizeof(path), &secure)) {
         fprintf(stderr, "WGET: bad URL: %s\n", url); return 1;
     }
     if (ofarg) { strncpy(outfile, ofarg, sizeof(outfile)-1); outfile[sizeof(outfile)-1]='\0'; }
     else derive_filename(path, outfile, sizeof(outfile));
 
-    printf("         COM%d  %s:%u%s  -> %s\n", port_index+1, host, port_num, path, outfile);
+    printf("         COM%d  %s%s:%u%s  -> %s\n", port_index+1,
+           secure ? "https " : "", host, port_num, path, outfile);
 
     if (!ensure_modem((unsigned)port_index)) {
         fprintf(stderr, "WGET: dongle not responding to AT (SLIP escape failed?).\n");
@@ -461,10 +487,11 @@ int main(int argc, char **argv)
 
     t_start = bios_ticks();
     {
-        int attempts = 0, consec_no_progress = 0, res = 0;
+        int attempts = 0, consec_no_progress = 0, res = 0, redirects = 0;
         unsigned long total = 0UL, written = 0UL, n_before;
         int have_total = 0;
         const int MAX_ATTEMPTS = 6;
+        const int MAX_REDIRECTS = 5;
 
         for (;;) {
             fseek(f, 0L, SEEK_END);
@@ -475,10 +502,42 @@ int main(int argc, char **argv)
                 wait_ms((unsigned)(1000UL << shift));   /* 1s / 2s / 4s backoff */
             }
             written = n_before;
-            res = do_attempt((unsigned)port_index, host, port_num, path,
-                             f, n_before, &total, &have_total, &written);
+            res = do_attempt((unsigned)port_index, host, port_num, path, secure,
+                             f, n_before, &total, &have_total, &written,
+                             location, sizeof(location));
 
             if (res == ATT_OK || res == ATT_HTTP_FATAL) break;
+
+            if (res == ATT_REDIRECT) {
+                /* Follow 3xx. Location may be absolute (http(s)://...),
+                 * root-relative (/path), or scheme-relative (//host/path).
+                 * Switch the target (host/port/path/secure), keep the same
+                 * output file, and restart from byte 0. http->https just works:
+                 * the new URL's scheme/port drives the ATDS/ATDT choice. */
+                if (++redirects > MAX_REDIRECTS) {
+                    fprintf(stderr, "WGET: too many redirects (>%d).\n", MAX_REDIRECTS);
+                    break;
+                }
+                if (location[0] == '/' && location[1] != '/') {
+                    strncpy(path, location, sizeof(path)-1); path[sizeof(path)-1] = '\0';
+                } else {
+                    char absurl[300];
+                    if (location[0]=='/' && location[1]=='/')
+                        snprintf(absurl, sizeof(absurl), "%s:%s", secure?"https":"http", location);
+                    else { strncpy(absurl, location, sizeof(absurl)-1); absurl[sizeof(absurl)-1]='\0'; }
+                    if (!parse_url(absurl, host, sizeof(host), &port_num, path, sizeof(path), &secure)) {
+                        fprintf(stderr, "WGET: bad redirect Location: %s\n", location);
+                        break;
+                    }
+                }
+                printf("         -> redirect %d to %s%s:%u%s\n", redirects,
+                       secure ? "https " : "", host, port_num, path);
+                fclose(f); f = fopen(outfile, "wb+");
+                if (!f) { fprintf(stderr, "WGET: reopen failed.\n"); return 7; }
+                total = 0UL; have_total = 0; consec_no_progress = 0; attempts = 0;
+                hangup_call((unsigned)port_index);
+                continue;
+            }
 
             if (res == ATT_IGNORED_RANGE) {
                 /* Server won't serve our Range (sent 200, or 206 from the wrong
