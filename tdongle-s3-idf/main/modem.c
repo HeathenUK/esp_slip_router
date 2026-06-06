@@ -113,6 +113,51 @@ static void modem_save_evn(void) {
 
 /* ---- online-mode state ---- */
 static int       s_sock = -1;
+
+/* ---- transport abstraction (Phase 1) ----
+ * The relay's PAYLOAD I/O goes through xport_read/xport_write/xport_close so the
+ * same dial + relay + window machinery can carry plain TCP, TLS (esp-tls) or SSH
+ * (libssh2). s_sock always holds the UNDERLYING socket fd in every mode, so the
+ * window controller (SO_RCVBUF), keepalive, timeouts, select and the loop guards
+ * (`s_sock >= 0`) keep working unchanged -- only the bytes on the wire differ:
+ *   TCP -> recv()/send()                              (byte-identical to before)
+ *   TLS -> esp_tls_conn_read/write on s_xport_ctx     (Phase 2)
+ *   SSH -> libssh2_channel_read/write on s_xport_ctx   (Phase 3)
+ * Only ever one connection at a time, so a single global instance suffices. */
+enum xport_kind { XPORT_TCP = 0, XPORT_TLS, XPORT_SSH };
+static int   s_xport_kind = XPORT_TCP;
+static void *s_xport_ctx  = NULL;   /* esp_tls* / ssh handle; NULL for plain TCP */
+
+/* recv() equivalent for the active transport. >0 = bytes, 0 = EOF/closed,
+ * <0 = error/timeout (TCP sets errno, incl. EAGAIN/EWOULDBLOCK on the 100 ms
+ * poll timeout -- the recv pump treats that as "no data this tick"). */
+static int xport_read(void *buf, size_t len) {
+    switch (s_xport_kind) {
+        case XPORT_TCP: return recv(s_sock, buf, len, 0);
+        /* Phase 2: esp_tls_conn_read(s_xport_ctx, buf, len)
+         * Phase 3: libssh2_channel_read(s_xport_ctx, buf, len) */
+        default:        return -1;
+    }
+}
+/* send() equivalent. >0 = bytes written, 0 = closed, <0 = error (errno set for
+ * TCP; tcp_send_all's EAGAIN/EWOULDBLOCK/EINTR retry logic relies on that). */
+static int xport_write(const void *buf, size_t len) {
+    switch (s_xport_kind) {
+        case XPORT_TCP: return send(s_sock, buf, len, 0);
+        default:        return -1;
+    }
+}
+/* Tear down the active transport and its socket. Idempotent; resets to TCP so
+ * the next dial starts clean. Callers keep their own s_online=false + task-park
+ * sequencing around this (this is just the close primitive). */
+static void xport_close(void) {
+    /* Phase 2/3: if s_xport_ctx, tear down esp_tls/ssh FIRST -- esp_tls_conn_destroy
+     * closes the underlying fd itself; ssh frees channel+session then we close it. */
+    s_xport_ctx = NULL;
+    if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+    s_xport_kind = XPORT_TCP;
+}
+
 static volatile bool s_online = false;
 static char      s_peer[96] = {0};       /* "host:port" string for AT$STATUS */
 static volatile uint16_t s_peer_port = 0; /* numeric port of the active dial (auto-telnet gate) */
@@ -452,7 +497,7 @@ static void ota_feed(const uint8_t *buf, size_t n) {
 
 static void tn_send3(uint8_t cmd, uint8_t opt) {
     uint8_t b[3] = {TN_IAC, cmd, opt};
-    if (s_sock >= 0) send(s_sock, b, 3, 0);
+    if (s_sock >= 0) xport_write(b, 3);
 }
 static bool tn_accept_remote(uint8_t o) { return o == OPT_BINARY || o == OPT_SGA || o == OPT_ECHO; }
 static bool tn_offer_local(uint8_t o)   { return o == OPT_BINARY || o == OPT_SGA || o == OPT_TTYPE || o == OPT_NAWS; }
@@ -520,7 +565,7 @@ static void tn_send_naws(void) {
         (uint8_t)(s_term_rows >> 8), (uint8_t)(s_term_rows & 0xFF),
         TN_IAC, TN_SE
     };
-    if (s_sock >= 0) send(s_sock, b, sizeof b, 0);
+    if (s_sock >= 0) xport_write(b, sizeof b);
 }
 static void tn_after_local_enable(uint8_t opt) {
     if (opt == OPT_NAWS) tn_send_naws();
@@ -563,10 +608,10 @@ static void tn_handle_sb(void) {
     if (s_sbopt == OPT_TTYPE && s_sblen >= 1 && s_sbbuf[0] == TT_SEND) {
         uint8_t hdr[] = {TN_IAC, TN_SB, OPT_TTYPE, TT_IS};
         if (s_sock >= 0) {
-            send(s_sock, hdr, sizeof hdr, 0);
-            send(s_sock, (const uint8_t *)s_term_type, strlen(s_term_type), 0);
+            xport_write(hdr, sizeof hdr);
+            xport_write((const uint8_t *)s_term_type, strlen(s_term_type));
             uint8_t tail[] = {TN_IAC, TN_SE};
-            send(s_sock, tail, sizeof tail, 0);
+            xport_write(tail, sizeof tail);
         }
     }
 }
@@ -731,7 +776,7 @@ static void modem_data_task(void *arg) {
             disk_logf("relay: LOW HEAP %u<%u -- abort session (anti-wedge)",
                       (unsigned)freeb, (unsigned)LOW_HEAP_GUARD_BYTES);
             s_online = false;
-            if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+            xport_close();
             s_peer[0] = 0;
             r_nocarrier();
             break;
@@ -749,7 +794,7 @@ static void modem_data_task(void *arg) {
             disk_logf("relay: WiFi down >%ums -- abort session (resume-friendly)",
                       (unsigned)(RELAY_WIFI_GRACE_US / 1000));
             s_online = false;
-            if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+            xport_close();
             s_peer[0] = 0;
             r_nocarrier();
             break;
@@ -803,7 +848,7 @@ static void modem_data_task(void *arg) {
             ctl_last = nowus; ctl_blk = blk; ctl_rx = s_tp_rx;
         }
 
-        int n = recv(s_sock, inbuf, sizeof inbuf, 0);
+        int n = xport_read(inbuf, sizeof inbuf);
         if (n > 0) s_tp_rx += (uint32_t)n;
         if (n > 0 && autosniff) {
             /* Decide from the connection OPENING; flip BEFORE the dispatch
@@ -916,7 +961,7 @@ static void modem_data_task(void *arg) {
         s_online = false;                      /* pump parks once s_to_cdc is empty */
         vTaskDelay(pdMS_TO_TICKS(10));          /* let it write its last chunk + idle */
         drain_cdc_fifo();                       /* wait for the host to pull the tail */
-        if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+        xport_close();
         s_peer[0] = 0;
         r_nocarrier();
         drain_cdc_fifo();                       /* and that NO CARRIER lands too */
@@ -999,7 +1044,7 @@ static void online_push_bytes(const uint8_t *buf, size_t n) {
 static void tcp_send_all(const uint8_t *buf, size_t n) {
     size_t off = 0;
     while (off < n && s_online && s_sock >= 0) {
-        int w = send(s_sock, buf + off, n - off, 0);
+        int w = xport_write(buf + off, n - off);
         if (w > 0) {
             off += (size_t)w;
             continue;
@@ -1251,8 +1296,7 @@ static void cmd_dial_impl(const char *arg) {
     if (s_sock >= 0) {
         s_online = false;
         vTaskDelay(pdMS_TO_TICKS(20));   /* let the pump/data tasks park */
-        close(s_sock);
-        s_sock = -1;
+        xport_close();
         s_peer[0] = 0;
     }
 
@@ -1855,7 +1899,7 @@ static void exec(char *line) {
         case 'Z': s_echo = true; s_verbose = true; s_quiet = false; s_telnet = true; r_ok(); return;
         case 'D': cmd_dial(p + 1); return;
         case 'H': {
-            if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+            xport_close();
             s_online = false;
             s_peer[0] = 0;
             r_ok();
