@@ -1671,7 +1671,10 @@ static void cmd_ssh_impl(void) {
     snprintf(s_peer, sizeof s_peer, "ssh:%.32s@%.48s:%u", s_ssh_user, s_ssh_host, (unsigned)s_ssh_port);
     s_plus_count = 0;
     s_last_data_us = esp_timer_get_time();
-    disk_logf("ssh: connected fd=%d peer=%s", fd, s_peer);
+    disk_logf("ssh: connected fd=%d peer=%s stack_used=%u/12288 min_free=%u",
+              fd, s_peer,
+              (unsigned)(12288 - uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)),
+              (unsigned)esp_get_minimum_free_heap_size());
 
     /* Go online (same ordering as cmd_dial_impl, MINUS tn_start -- no telnet). */
     xStreamBufferReset(s_to_cdc);
@@ -2053,9 +2056,13 @@ static void handle_dollar(char *s) {
         strncpy(s_ssh_host, host, sizeof s_ssh_host - 1); s_ssh_host[sizeof s_ssh_host - 1] = 0;
         s_ssh_port = sport;
         s_at_busy = true;
-        /* 20 KB stack: the mbedTLS bignum kex does heavy stack math (8 KB
-         * overflowed in the spike). CPU0, off the TinyUSB core. */
-        if (xTaskCreatePinnedToCore(cmd_ssh_task_fn, "at_ssh", 20480, NULL, 15,
+        /* 12 KB stack: the worker's stack is heap that's HELD through the
+         * handshake, competing with libssh2's ~11 KB session + the bignum kex
+         * transient -- a 20 KB stack drove min-free to 652 B (measured). The
+         * spike's stack high-water was ~6.9 KB, so 12 KB keeps a ~5 KB margin
+         * AND frees 8 KB back to the handshake. CPU0, off the TinyUSB core.
+         * (8 KB overflowed in the spike; do not go below ~10 KB.) */
+        if (xTaskCreatePinnedToCore(cmd_ssh_task_fn, "at_ssh", 12288, NULL, 15,
                                     &s_dial_task, 0) != pdPASS) {
             s_at_busy = false; s_dial_task = NULL; r_error();
         }
