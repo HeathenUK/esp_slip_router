@@ -46,20 +46,15 @@ static void ssh_spike_run(const char *user, const char *pass, const char *host, 
     app_secure_quiesce(true);
     s_lo = esp_get_free_heap_size();
     base = s_lo;
-    disk_logf("sshspike: post-quiesce free=%u", (unsigned)base);
+    disk_logf("sshspike: post-quiesce free=%u lfb=%u", (unsigned)base,
+              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
-    char ps[8];
-    snprintf(ps, sizeof ps, "%u", (unsigned)port);
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-    if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) { disk_logf("sshspike: DNS fail"); goto restore; }
-    sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) { disk_logf("sshspike: socket fail"); goto restore; }
-    struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) { disk_logf("sshspike: connect fail"); goto restore; }
-    sample("connected");
-
+    /* Allocate the libssh2 session FIRST, while the heap is freshest and most
+     * contiguous (right after the quiesce). The session struct needs ONE
+     * contiguous ~11 KB block; doing DNS/socket/connect first fragments the
+     * heap and the largest free block collapses below that (measured: 25 KB
+     * idle -> 9 KB after connect). Matches the plan's "allocate the crypto
+     * session at entry" guidance. */
     extern size_t libssh2_session_struct_size(void);
     disk_logf("sshspike: sizeof(LIBSSH2_SESSION)=%u", (unsigned)libssh2_session_struct_size());
     int ir = libssh2_init(0);
@@ -77,6 +72,18 @@ static void ssh_spike_run(const char *user, const char *pass, const char *host, 
     }
     libssh2_session_set_blocking(session, 1);
     sample("session");
+
+    char ps[8];
+    snprintf(ps, sizeof ps, "%u", (unsigned)port);
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) { disk_logf("sshspike: DNS fail"); goto teardown; }
+    sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) { disk_logf("sshspike: socket fail"); goto teardown; }
+    struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) { disk_logf("sshspike: connect fail"); goto teardown; }
+    sample("connected");
 
     if (libssh2_session_handshake(session, sock)) { disk_logf("sshspike: handshake FAIL"); goto teardown; }
     sample("handshake");   /* key-exchange peak */
