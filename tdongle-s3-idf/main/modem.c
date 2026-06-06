@@ -71,6 +71,20 @@ static bool s_verbose = true;
 static bool s_quiet   = false;
 static bool s_telnet  = true;     /* Telnet IAC handling on by default */
 
+/* Post-OTA parser drain. A CDC OTA (AT$OTASTART) that bails before the reboot
+ * leaves the host still streaming raw firmware bytes. Without this latch those
+ * in-flight bytes fall through to the command-mode AT parser in on_cdc_rx and
+ * get executed as commands -- one such misparse staged ssid="ssid" and
+ * clobbered the LIVE WiFi config (the recurring "lost creds"; NVS itself was
+ * never touched, thanks to deferred-persist). While armed, on_cdc_rx discards
+ * all RX; the deadline re-extends on every byte so the whole interrupted
+ * stream is swallowed, then normal parsing resumes once RX stays quiet.
+ * See memory: cdc-ota-corrupts-live-wifi. */
+static volatile int64_t s_ota_drain_until_us = 0;
+static void ota_arm_drain(void) {
+    s_ota_drain_until_us = esp_timer_get_time() + 3LL * 1000 * 1000; /* 3 s seed */
+}
+
 /* ---- NVS-persisted modem flags (E/V/N) ----
  *
  * Old build's AT&W packs E/V/N into a single byte; AT&F resets to
@@ -1613,35 +1627,51 @@ static void handle_dollar(char *s) {
         if (esp_ota_begin(next, OTA_WITH_SEQUENTIAL_WRITES, &h) != ESP_OK) {
             cdc_print("\r\nOTA BEGIN-FAIL\r\n"); r_error(); return;
         }
+        disk_logf("ota: begin sz=%ld part=%s @0x%lx free=%u", sz, next->label,
+                  (unsigned long)next->address, (unsigned)esp_get_free_heap_size());
         cdc_print("\r\nOTA READY\r\n");
-        long got = 0;
+        /* From here the host is streaming <sz> raw firmware bytes. Any exit
+         * before esp_restart() leaves the rest of that stream in flight, so
+         * EVERY post-READY failure path must arm the drain (ota_arm_drain)
+         * before returning, or the leftover bytes hit the AT parser and can
+         * clobber the live config. The disk_logf trail records exactly where
+         * a desync happens so the under-consumption can be root-caused. */
+        long got = 0, next_mark = 256L * 1024;
+        unsigned long empties = 0;
         int64_t last_rx_us = esp_timer_get_time();
+        const char *failcode = NULL;
         static uint8_t buf[1024];   /* SRAM trim 2026-06-02 (was 2048) */
         while (got < sz) {
             size_t want = (size_t)(sz - got);
             if (want > sizeof buf) want = sizeof buf;
             size_t n = 0;
             if (tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, buf, want, &n) == ESP_OK && n > 0) {
-                if (esp_ota_write(h, buf, n) != ESP_OK) {
-                    esp_ota_abort(h);
-                    cdc_print("\r\nOTA WRITE-FAIL\r\n"); r_error(); return;
-                }
+                if (esp_ota_write(h, buf, n) != ESP_OK) { failcode = "WRITE-FAIL"; break; }
                 got += (long)n;
                 last_rx_us = esp_timer_get_time();
-            } else {
-                if (esp_timer_get_time() - last_rx_us > 8 * 1000 * 1000LL) {
-                    esp_ota_abort(h);
-                    cdc_print("\r\nOTA TIMEOUT\r\n"); r_error(); return;
+                if (got >= next_mark) {
+                    disk_logf("ota: %ld/%ld KB free=%u empties=%lu", got >> 10, sz >> 10,
+                              (unsigned)esp_get_free_heap_size(), empties);
+                    next_mark += 256L * 1024;
                 }
+            } else {
+                empties++;
+                if (esp_timer_get_time() - last_rx_us > 8 * 1000 * 1000LL) { failcode = "TIMEOUT"; break; }
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
         }
-        if (esp_ota_end(h) != ESP_OK) {
-            cdc_print("\r\nOTA END-FAIL\r\n"); r_error(); return;
+        if (failcode)                              esp_ota_abort(h);
+        else if (esp_ota_end(h) != ESP_OK)         failcode = "END-FAIL";
+        else if (esp_ota_set_boot_partition(next) != ESP_OK) failcode = "SETBOOT-FAIL";
+        if (failcode) {
+            disk_logf("ota: FAIL %s got=%ld/%ld empties=%lu -- arming parser drain",
+                      failcode, got, sz, empties);
+            ota_arm_drain();   /* swallow the in-flight firmware stream */
+            char m[40];
+            snprintf(m, sizeof m, "\r\nOTA %s\r\n", failcode);
+            cdc_print(m); r_error(); return;
         }
-        if (esp_ota_set_boot_partition(next) != ESP_OK) {
-            cdc_print("\r\nOTA SETBOOT-FAIL\r\n"); r_error(); return;
-        }
+        disk_logf("ota: OK got=%ld/%ld empties=%lu -- rebooting", got, sz, empties);
         cdc_print("\r\nOTA OK\r\n");
         vTaskDelay(pdMS_TO_TICKS(200));
         esp_restart();
@@ -1865,6 +1895,18 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
     size_t got = 0;
     if (tinyusb_cdcacm_read(itf, buf, sizeof buf, &got) != ESP_OK) return;
     if (got == 0) return;
+
+    /* Swallow the tail of a failed CDC OTA before it can reach any parser.
+     * Re-extend the window while bytes keep flowing; resume once the stream
+     * has been quiet for the window. See ota_arm_drain / s_ota_drain_until_us. */
+    if (s_ota_drain_until_us) {
+        int64_t now = esp_timer_get_time();
+        if (now < s_ota_drain_until_us) {
+            s_ota_drain_until_us = now + 500LL * 1000;  /* keep draining */
+            return;
+        }
+        s_ota_drain_until_us = 0;   /* quiet long enough -- process this buffer */
+    }
 
     /* CPR probe in flight (just-dialed): consume the reply before any
      * other path sees it. Stale probes time out via the deadline so a

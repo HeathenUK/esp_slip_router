@@ -43,15 +43,38 @@ fi
 SIZE=$(wc -c < "$FW" | tr -d ' ')
 echo "flash: $FW ($SIZE bytes) -> $DONGLE"
 
-python3 - "$DONGLE" "$FW" "$SIZE" <<'PY'
-import sys, time, serial
+# Pre-flash firmware version (from ATI "ver=<hash>"). The ONLY trustworthy
+# success signal is this version CHANGING after the reboot -- NOT an in-band
+# "OTA OK" match: the 1 MB firmware contains the literal bytes "OTA OK"/"OTA
+# READY" in .rodata, and a desynced OTA used to echo them back, faking success
+# while nothing flashed. (Mirrors ota-http.sh's version-flip rule.) Pre-stream
+# "OTA READY" is still safe to match -- no firmware bytes are in the stream yet.
+PREVF=$(mktemp)
 
-dev, fw_path, sz = sys.argv[1], sys.argv[2], int(sys.argv[3])
+python3 - "$DONGLE" "$FW" "$SIZE" "$PREVF" <<'PY'
+import sys, time, re, serial
+
+dev, fw_path, sz, prevf = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 p = serial.Serial(dev, 115200, timeout=10)
 time.sleep(0.3)
 p.reset_input_buffer()
 
+def read_for(secs):
+    end = time.time() + secs; buf = b""
+    while time.time() < end:
+        b = p.read(p.in_waiting or 1)
+        if b: buf += b
+    return buf
+
+# Capture the running version so the post-reboot check can confirm it changed.
+p.write(b"ATI\r"); p.flush()
+m = re.search(rb"ver=([0-9a-fA-F]+)", read_for(1.5))
+prev = m.group(1).decode() if m else ""
+open(prevf, "w").write(prev)
+print(f"flash: pre-flash version: {prev or '(unknown)'}")
+
 # Trigger the OTA receive loop on the dongle.
+p.reset_input_buffer()
 p.write(f"AT$OTASTART={sz}\r".encode())
 p.flush()
 
@@ -67,7 +90,7 @@ def wait_line(needle, max_wait=8.0):
     return False, buf
 
 # esp_ota_begin() erases the inactive partition before responding — that's
-# 3-5s on flash. Give it a generous window before declaring failure.
+# 3-5s on flash. Safe to match in-band: no firmware bytes are in flight yet.
 ok, txt = wait_line(b"OTA READY", max_wait=20.0)
 if not ok:
     print("flash: dongle didn't enter OTA mode. Reply:", txt[:256], file=sys.stderr)
@@ -92,45 +115,67 @@ p.flush()
 dt = time.time() - t0
 print(f"flash: sent {sent} bytes in {dt:.1f}s ({sent/dt/1024:.0f} KB/s)")
 
-ok, txt = wait_line(b"OTA OK", max_wait=15.0)
-if not ok:
-    print("flash: no OTA OK. Tail:", txt[-256:].decode('latin-1', 'replace'), file=sys.stderr)
-    sys.exit(3)
-
-print("flash: dongle reports OTA OK — rebooting into new firmware now")
+# Fast-fail ONLY on an explicit device error code (OTA WRITE-FAIL / TIMEOUT /
+# END-FAIL / SETBOOT-FAIL). We do NOT trust an in-band "OTA OK" -- success is
+# proven by the version flip below. On a real failure the firmware now arms a
+# parser drain and stays up on the OLD version (creds safe), so the version
+# simply won't change.
+txt = read_for(6.0)
+for code in (b"WRITE-FAIL", b"TIMEOUT", b"END-FAIL", b"SETBOOT-FAIL", b"BADSIZE", b"NOPART", b"BEGIN-FAIL"):
+    if b"OTA " + code in txt:
+        print(f"flash: device reported OTA {code.decode()} — flash aborted on-device (still on old fw).", file=sys.stderr)
+        p.close(); sys.exit(3)
 p.close()
+print("flash: stream sent; verifying by version change (authoritative)...")
 PY
 RC=$?
-[ "$RC" -ne 0 ] && exit "$RC"
+[ "$RC" -ne 0 ] && { rm -f "$PREVF"; exit "$RC"; }
+PREV=$(cat "$PREVF" 2>/dev/null); rm -f "$PREVF"
 
 # Post-reboot: the dongle USB-disappears for ~1-2s then reappears at the same
 # path (TinyUSB serial is MAC-based, stable across reboots). Wait for the gap
-# (so we don't open the stale tty), then wait for it to reappear, then verify.
+# (so we don't open the stale tty), then wait for it to reappear, then verify
+# by polling ATI until "ver=" differs from PREV. A failed OTA does NOT reboot
+# (it drains and stays up), so a version that never flips == flash did not take.
 echo "flash: waiting for dongle to reboot..."
 for i in $(seq 1 30); do
     sleep 0.3
     [ ! -e "$DONGLE" ] && { echo "flash:  -> disappeared (rebooting)"; break; }
 done
 echo "flash: waiting for new firmware to enumerate..."
-for i in $(seq 1 30); do
+for i in $(seq 1 40); do
     sleep 0.3
     [ -e "$DONGLE" ] && { echo "flash:  -> back at $DONGLE"; break; }
 done
 [ -e "$DONGLE" ] || { echo "flash: dongle didn't reappear — manual replug?" >&2; exit 5; }
 sleep 1.0    # let descriptors settle
-python3 - "$DONGLE" <<'PY'
-import serial, time, sys
-for attempt in range(5):
+python3 - "$DONGLE" "$PREV" <<'PY'
+import serial, time, sys, re
+dev, prev = sys.argv[1], sys.argv[2]
+deadline = time.time() + 30          # generous: covers reboot + descriptor settle
+while time.time() < deadline:
     try:
-        p = serial.Serial(sys.argv[1], 115200, timeout=2); break
+        p = serial.Serial(dev, 115200, timeout=2)
     except Exception:
-        time.sleep(0.5)
-else:
-    print("flash: couldn't open port after reboot", file=sys.stderr); sys.exit(6)
-time.sleep(0.5)
-p.reset_input_buffer(); p.write(b"AT\r"); p.flush(); time.sleep(0.5)
-r = p.read(64)
-print("flash: post-reboot AT ->", repr(r))
-p.close()
-sys.exit(0 if b"OK" in r else 4)
+        time.sleep(0.5); continue
+    try:
+        time.sleep(0.3); p.reset_input_buffer()
+        p.write(b"ATI\r"); p.flush(); time.sleep(0.8)
+        r = p.read(512)
+        m = re.search(rb"ver=([0-9a-fA-F]+)", r)
+        cur = m.group(1).decode() if m else ""
+        p.close()
+        if cur and cur != prev:
+            print(f"flash: FLASHED OK — version {prev or '?'} -> {cur}")
+            sys.exit(0)
+        if cur and cur == prev:
+            # device is up but unchanged; keep polling a little in case it's
+            # still the pre-reboot instance answering, then conclude.
+            pass
+    except Exception:
+        try: p.close()
+        except Exception: pass
+    time.sleep(1.0)
+print(f"flash: version did NOT change from {prev or '?'} — flash did not take (device still on old fw, creds intact).", file=sys.stderr)
+sys.exit(4)
 PY
