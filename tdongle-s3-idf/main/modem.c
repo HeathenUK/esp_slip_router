@@ -80,8 +80,10 @@ static bool s_telnet  = true;     /* Telnet IAC handling on by default */
  * all RX; the deadline re-extends on every byte so the whole interrupted
  * stream is swallowed, then normal parsing resumes once RX stays quiet.
  * See memory: cdc-ota-corrupts-live-wifi. */
-static volatile int64_t s_ota_drain_until_us = 0;
+static volatile int64_t  s_ota_drain_until_us = 0;
+static volatile uint32_t s_ota_drained        = 0;   /* bytes swallowed this drain */
 static void ota_arm_drain(void) {
+    s_ota_drained = 0;
     s_ota_drain_until_us = esp_timer_get_time() + 3LL * 1000 * 1000; /* 3 s seed */
 }
 
@@ -1902,9 +1904,11 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
     if (s_ota_drain_until_us) {
         int64_t now = esp_timer_get_time();
         if (now < s_ota_drain_until_us) {
+            s_ota_drained += (uint32_t)got;
             s_ota_drain_until_us = now + 500LL * 1000;  /* keep draining */
             return;
         }
+        disk_logf("ota: drain done, swallowed %lu bytes", (unsigned long)s_ota_drained);
         s_ota_drain_until_us = 0;   /* quiet long enough -- process this buffer */
     }
 
