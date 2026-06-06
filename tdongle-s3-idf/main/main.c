@@ -849,6 +849,18 @@ static void httpd_start_once(void) {
     disk_logf("httpd listening on :80");
 }
 
+/* Secure-session quiesce: free the HTTP server (its 8 KB task stack + per-conn
+ * buffers) while a TLS/SSH crypto session holds heap, then bring it back. CDC OTA
+ * (AT$OTASTART) + AT$RESET stay available throughout, so control/recovery is never
+ * lost (honors never-starve-SRAM). Called from the modem secure-dial path. */
+void app_secure_quiesce(bool on) {
+    if (on) {
+        if (s_httpd) { httpd_stop(s_httpd); s_httpd = NULL; disk_logf("secure: httpd quiesced"); }
+    } else {
+        httpd_start_once();
+    }
+}
+
 static void mdns_start_once(void) {
     static bool up = false;
     if (up) return;

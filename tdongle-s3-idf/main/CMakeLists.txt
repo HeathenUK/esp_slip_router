@@ -17,6 +17,7 @@ idf_component_register(
         "dns_forwarder.c"
         "kbd.c"
         "display.c"
+        "ssh_spike.c"
     INCLUDE_DIRS "."
     REQUIRES
         # Networking / WiFi
