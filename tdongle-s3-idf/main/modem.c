@@ -992,20 +992,33 @@ static void modem_data_task(void *arg) {
             break;
         }
 
-        /* +++ guard expired -> command mode, socket stays open (ATO returns). */
+        /* +++ guard expired. */
         int64_t now = esp_timer_get_time();
         if (s_plus_count == 3 && (now - s_plus_time_us) > GUARD_US) {
             s_plus_count = 0;
-            /* Drain the full CDC pipeline (stream buffer AND USB FIFO) before
-             * printing OK, so all in-flight payload lands before the prompt --
-             * same EOF-tail issue as the peer_closed path. Socket stays open
-             * here (ATO can resume), so we don't close it. */
+            /* Drain the full CDC pipeline (stream buffer AND USB FIFO) first, so
+             * all in-flight payload lands before the result code -- same
+             * EOF-tail issue as the peer_closed path. */
             while (s_to_cdc && xStreamBufferBytesAvailable(s_to_cdc) > 0)
                 vTaskDelay(pdMS_TO_TICKS(2));
             s_online = false;
             vTaskDelay(pdMS_TO_TICKS(10));
             drain_cdc_fifo();
-            r_ok();
+            if (s_xport_kind != XPORT_TCP) {
+                /* SECURE (TLS/SSH) session: +++ HANGS UP rather than just
+                 * escaping. These sessions quiesce httpd, so leaving the socket
+                 * open for ATO would strand HTTP until an ATH the user may not
+                 * know to send. xport_close frees the crypto session, closes the
+                 * fd and restores httpd. (The data task is the sole closer of
+                 * s_sock, so this is the right place.) Plain TCP/telnet keep the
+                 * standard escape-to-command-mode (socket open for ATO). */
+                xport_close();
+                s_peer[0] = 0;
+                r_nocarrier();
+            } else {
+                /* Plain session: escape to command mode, socket stays open. */
+                r_ok();
+            }
             break;
         }
     }
