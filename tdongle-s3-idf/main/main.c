@@ -808,9 +808,19 @@ static esp_err_t h_modem_stats(httpd_req_t *req) {
 }
 
 static httpd_handle_t s_httpd = NULL;
+/* "httpd should be running" intent. A secure-session teardown that hits a
+ * fragmented heap can't alloc the 8 KB httpd task stack (needs ONE contiguous
+ * block; post-session the largest free block can be < 8 KB even with ample
+ * total free), so httpd_start fails and stays down. app_secure_quiesce sets
+ * this; the app_main housekeeping loop retries httpd_start_once until the heap
+ * coalesces. s_httpd_starting guards against a concurrent start (the retry loop
+ * vs an inline quiesce(false)). */
+static volatile bool s_httpd_wanted   = true;
+static volatile bool s_httpd_starting = false;
 
 static void httpd_start_once(void) {
-    if (s_httpd) return;
+    if (s_httpd || s_httpd_starting) return;
+    s_httpd_starting = true;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     cfg.stack_size       = 8192;
@@ -834,6 +844,7 @@ static void httpd_start_once(void) {
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed");
         s_httpd = NULL;
+        s_httpd_starting = false;
         return;
     }
     const httpd_uri_t routes[] = {
@@ -863,6 +874,7 @@ static void httpd_start_once(void) {
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; ++i)
         httpd_register_uri_handler(s_httpd, &routes[i]);
+    s_httpd_starting = false;
     disk_logf("httpd listening on :80");
 }
 
@@ -872,9 +884,15 @@ static void httpd_start_once(void) {
  * lost (honors never-starve-SRAM). Called from the modem secure-dial path. */
 void app_secure_quiesce(bool on) {
     if (on) {
+        s_httpd_wanted = false;
         if (s_httpd) { httpd_stop(s_httpd); s_httpd = NULL; disk_logf("secure: httpd quiesced"); }
     } else {
+        s_httpd_wanted = true;     /* the app_main loop keeps retrying until it sticks */
         httpd_start_once();
+        if (!s_httpd)
+            disk_logf("secure: httpd restart deferred (free=%u lfb=%u, needs ~8K contig) -- retrying",
+                      (unsigned)esp_get_free_heap_size(),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
 }
 
@@ -1175,6 +1193,10 @@ void app_main(void) {
      * STA is connected. Subsequent phases will start additional tasks
      * (AT engine, SLIP polling) here. */
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        /* Backstop a deferred httpd restart: if a secure-session teardown
+         * couldn't alloc the 8 KB httpd task on a fragmented heap, retry now
+         * that the heap has had time to coalesce. No-op once it's up. */
+        if (s_httpd_wanted && !s_httpd) httpd_start_once();
     }
 }
