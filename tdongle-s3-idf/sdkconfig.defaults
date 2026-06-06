@@ -199,3 +199,16 @@ CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 # Stack high-water monitoring via uxTaskGetSystemState (/tasks endpoint).
 # ~160 B for the full task table; kept as a permanent diagnostic.
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+
+# ===== TLS termination (Phase 2 -- HTTPS relay) =====
+# The relay can TLS-wrap a dial (ATDS / port 443) so a DOS client reaches
+# HTTPS hosts in plaintext over CDC. On this no-PSRAM part the SSL I/O
+# buffers are the heap cost: a default mbedTLS session pins ~37 KB of
+# internal heap (two 16 KB record buffers + state), which we don't have.
+# DYNAMIC_BUFFER grows/shrinks those buffers on demand instead of
+# allocating the worst case up front -- ~22 KB/session, and it frees the
+# big buffers between records so the steady-state hit is far smaller. This
+# is THE enabler for TLS on this hardware. (Cert verification uses the
+# already-enabled full bundle; the secure dial also quiesces httpd to free
+# room -- see app_secure_quiesce / xport_close in modem.c + main.c.)
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y

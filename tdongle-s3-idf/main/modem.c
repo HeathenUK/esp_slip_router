@@ -37,6 +37,8 @@
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"   /* esp_app_get_description()->version for ATI */
+#include "esp_tls.h"        /* TLS termination for secure dials (Phase 2) */
+#include "esp_crt_bundle.h" /* esp_crt_bundle_attach -- verify against the CA bundle */
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "soc/rtc_cntl_reg.h"
@@ -114,6 +116,12 @@ static void modem_save_evn(void) {
 /* ---- online-mode state ---- */
 static int       s_sock = -1;
 
+/* Free the HTTP server + mDNS while a TLS/SSH relay session is live, so the
+ * crypto session has the internal-heap headroom it needs on this no-PSRAM part
+ * (proven mandatory by the SSH spike). CDC OTA + AT stay up throughout.
+ * Bracketed by the secure dial (on) and xport_close (off). Defined in main.c. */
+extern void app_secure_quiesce(bool on);
+
 /* ---- transport abstraction (Phase 1) ----
  * The relay's PAYLOAD I/O goes through xport_read/xport_write/xport_close so the
  * same dial + relay + window machinery can carry plain TCP, TLS (esp-tls) or SSH
@@ -134,8 +142,19 @@ static void *s_xport_ctx  = NULL;   /* esp_tls* / ssh handle; NULL for plain TCP
 static int xport_read(void *buf, size_t len) {
     switch (s_xport_kind) {
         case XPORT_TCP: return recv(s_sock, buf, len, 0);
-        /* Phase 2: esp_tls_conn_read(s_xport_ctx, buf, len)
-         * Phase 3: libssh2_channel_read(s_xport_ctx, buf, len) */
+        case XPORT_TLS: {
+            /* The underlying socket keeps the 100 ms SO_RCVTIMEO the data task
+             * set, so a quiet peer makes mbedtls_ssl_read return WANT_READ each
+             * tick -- map that to EAGAIN so the recv pump's poll cadence (+++
+             * guard, heap checks) is preserved exactly as for plain TCP. */
+            int r = esp_tls_conn_read((esp_tls_t *)s_xport_ctx, buf, len);
+            if (r > 0) return r;
+            if (r == 0) return 0;                       /* peer closed -> teardown */
+            if (r == ESP_TLS_ERR_SSL_WANT_READ ||
+                r == ESP_TLS_ERR_SSL_WANT_WRITE) { errno = EAGAIN; return -1; }
+            errno = EIO; return -1;                     /* real error -> teardown */
+        }
+        /* Phase 3: libssh2_channel_read(s_xport_ctx, buf, len) */
         default:        return -1;
     }
 }
@@ -144,6 +163,15 @@ static int xport_read(void *buf, size_t len) {
 static int xport_write(const void *buf, size_t len) {
     switch (s_xport_kind) {
         case XPORT_TCP: return send(s_sock, buf, len, 0);
+        case XPORT_TLS: {
+            int w = esp_tls_conn_write((esp_tls_t *)s_xport_ctx, buf, len);
+            if (w >= 0) return w;
+            /* WANT_READ/WANT_WRITE -> tcp_send_all retries on EAGAIN. */
+            if (w == ESP_TLS_ERR_SSL_WANT_WRITE ||
+                w == ESP_TLS_ERR_SSL_WANT_READ) { errno = EAGAIN; return -1; }
+            errno = EIO; return -1;
+        }
+        /* Phase 3: libssh2_channel_write(s_xport_ctx, buf, len) */
         default:        return -1;
     }
 }
@@ -151,8 +179,17 @@ static int xport_write(const void *buf, size_t len) {
  * the next dial starts clean. Callers keep their own s_online=false + task-park
  * sequencing around this (this is just the close primitive). */
 static void xport_close(void) {
-    /* Phase 2/3: if s_xport_ctx, tear down esp_tls/ssh FIRST -- esp_tls_conn_destroy
-     * closes the underlying fd itself; ssh frees channel+session then we close it. */
+    if (s_xport_kind == XPORT_TLS && s_xport_ctx) {
+        /* esp_tls_conn_destroy() closes the underlying fd itself -- don't
+         * double-close. */
+        esp_tls_conn_destroy((esp_tls_t *)s_xport_ctx);
+        s_xport_ctx = NULL;
+        s_sock = -1;
+        s_xport_kind = XPORT_TCP;
+        app_secure_quiesce(false);   /* restore httpd + mDNS */
+        return;
+    }
+    /* Phase 3: SSH frees channel+session here, then we close the fd. */
     s_xport_ctx = NULL;
     if (s_sock >= 0) { close(s_sock); s_sock = -1; }
     s_xport_kind = XPORT_TCP;
@@ -352,6 +389,7 @@ static size_t        s_cpr_len = 0;
  * the TinyUSB task is blocked so no command runs anyway). */
 static volatile bool s_at_busy = false;
 static char          s_dial_arg[128];
+static bool          s_dial_secure = false;   /* TLS-wrap this dial (ATDS / :443) */
 static TaskHandle_t  s_dial_task = NULL;
 static inline bool bget(uint8_t *a, uint8_t o) { return a[o >> 3] & (1 << (o & 7)); }
 static inline void bset(uint8_t *a, uint8_t o) { a[o >> 3] |=  (1 << (o & 7)); }
@@ -1338,33 +1376,75 @@ static void cmd_dial_impl(const char *arg) {
         s_cpr_pending = false;
     }
 
-    char portstr[8];
-    snprintf(portstr, sizeof portstr, "%u", (unsigned)port);
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
-        disk_logf("modem: dial DNS-fail '%s'", host);
-        r_nodialtone();   /* distinct from connect-fail NO CARRIER (host shows "not resolved") */
-        return;
-    }
+    /* Secure dial when asked explicitly (ATDS) or implicitly by port (:443).
+     * From here `sock` is the connected fd in BOTH paths; the post-connect
+     * socket-option block, the window controller and teardown act on it
+     * identically -- only the handshake + the payload codec (xport_*) differ. */
+    int sock = -1;
+    bool secure = s_dial_secure || (port == 443);
 
-    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) { freeaddrinfo(res); r_nocarrier(); return; }
-    /* 20 s timeouts for the connect() itself. Once we're in the data
-     * phase, modem_data_task overrides RCVTIMEO to 100 ms and tcp_send_all
-     * relies on a bounded SNDTIMEO (3 s) so the pump task doesn't block
-     * forever if the TCP window stays closed. */
-    struct timeval ctv = { .tv_sec = 20, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &ctv, sizeof ctv);
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof ctv);
+    if (secure) {
+        /* TLS termination. Quiesce httpd FIRST so the handshake (cert chain +
+         * mbedTLS state) has the internal-heap headroom this no-PSRAM part
+         * needs. esp-tls owns DNS + TCP connect + handshake, verifying the
+         * server cert against the full CA bundle (SNI/CN = host). We then adopt
+         * its socket fd, so the window controller / keepalive / NO CARRIER
+         * teardown all behave exactly as for plain TCP. */
+        app_secure_quiesce(true);
+        esp_tls_cfg_t cfg = {
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .timeout_ms        = 20000,
+        };
+        esp_tls_t *tls = esp_tls_init();
+        if (!tls) { app_secure_quiesce(false); r_nocarrier(); return; }
+        disk_logf("dial: TLS connect %s:%u (quiesced, free=%u)",
+                  host, (unsigned)port, (unsigned)esp_get_free_heap_size());
+        int r = esp_tls_conn_new_sync(host, (int)strlen(host), (int)port, &cfg, tls);
+        if (r != 1) {
+            disk_logf("dial: TLS FAIL r=%d free=%u", r, (unsigned)esp_get_free_heap_size());
+            esp_tls_conn_destroy(tls);
+            app_secure_quiesce(false);
+            r_nocarrier();
+            return;
+        }
+        if (esp_tls_get_conn_sockfd(tls, &sock) != ESP_OK || sock < 0) {
+            esp_tls_conn_destroy(tls);
+            app_secure_quiesce(false);
+            r_nocarrier();
+            return;
+        }
+        s_xport_ctx  = tls;
+        s_xport_kind = XPORT_TLS;
+        disk_logf("dial: TLS up fd=%d free=%u", sock, (unsigned)esp_get_free_heap_size());
+    } else {
+        char portstr[8];
+        snprintf(portstr, sizeof portstr, "%u", (unsigned)port);
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+        struct addrinfo *res = NULL;
+        if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
+            disk_logf("modem: dial DNS-fail '%s'", host);
+            r_nodialtone();   /* distinct from connect-fail NO CARRIER (host shows "not resolved") */
+            return;
+        }
 
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        close(sock);
+        sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (sock < 0) { freeaddrinfo(res); r_nocarrier(); return; }
+        /* 20 s timeouts for the connect() itself. Once we're in the data
+         * phase, modem_data_task overrides RCVTIMEO to 100 ms and tcp_send_all
+         * relies on a bounded SNDTIMEO (3 s) so the pump task doesn't block
+         * forever if the TCP window stays closed. */
+        struct timeval ctv = { .tv_sec = 20, .tv_usec = 0 };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &ctv, sizeof ctv);
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof ctv);
+
+        if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+            close(sock);
+            freeaddrinfo(res);
+            r_nocarrier();
+            return;
+        }
         freeaddrinfo(res);
-        r_nocarrier();
-        return;
     }
-    freeaddrinfo(res);
 
     int yes = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes);
@@ -1504,10 +1584,17 @@ static void cmd_dial_task_fn(void *arg) {
  * hands off to cmd_dial_task_fn for the slow work. */
 static void cmd_dial(const char *arg) {
     while (*arg == ' ' || *arg == '\t') arg++;
-    if (*arg == 'T' || *arg == 'P' || *arg == 'R') arg++;
+    /* One leading Hayes dial modifier: T/P/R are ignored; S means "secure"
+     * (TLS-wrap), so ATDS<host> dials with TLS. Only ONE char is consumed
+     * (matches the original behaviour) so a hostname starting with T/P/R/S
+     * isn't eaten. Auto-secure on :443 is applied later in cmd_dial_impl. */
+    bool secure = false;
+    if      (*arg == 'T' || *arg == 'P' || *arg == 'R') arg++;
+    else if (*arg == 'S') { secure = true; arg++; }
     while (*arg == ' ' || *arg == '\t') arg++;
     if (!*arg) { r_error(); return; }
     if (s_at_busy || s_dial_task) { r_error(); return; }
+    s_dial_secure = secure;
 
     size_t n = strnlen(arg, sizeof s_dial_arg);
     if (n >= sizeof s_dial_arg) { r_error(); return; }
