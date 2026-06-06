@@ -409,6 +409,11 @@ static char          s_ssh_user[48];
 static char          s_ssh_pass[96];
 static char          s_ssh_host[96];
 static uint16_t      s_ssh_port = 22;
+/* Interactive SSH password entry: when AT$SSH is given no password, the modem
+ * prompts and on_cdc_rx captures the typed line (echo suppressed) into
+ * s_ssh_pass, then spawns the worker. */
+static volatile bool s_ssh_pw_capture = false;
+static uint16_t      s_ssh_pw_len = 0;
 static inline bool bget(uint8_t *a, uint8_t o) { return a[o >> 3] & (1 << (o & 7)); }
 static inline void bset(uint8_t *a, uint8_t o) { a[o >> 3] |=  (1 << (o & 7)); }
 static inline void bclr(uint8_t *a, uint8_t o) { a[o >> 3] &= ~(1 << (o & 7)); }
@@ -1693,6 +1698,21 @@ static void cmd_ssh_task_fn(void *arg) {
     vTaskDelete(NULL);
 }
 
+/* Spawn the SSH worker. Called by AT$SSH when a password was supplied inline,
+ * and by on_cdc_rx after an interactive password prompt completes. Caller has
+ * already staged s_ssh_user/pass/host/port and checked the busy guard.
+ * 12 KB stack: it's heap held through the handshake, competing with libssh2's
+ * ~11 KB session + the bignum kex transient -- a 20 KB stack drove min-free to
+ * 652 B (measured); the spike's high-water was ~6.9 KB, so 12 KB keeps ~5 KB
+ * margin. CPU0, off the TinyUSB core. */
+static void ssh_spawn_worker(void) {
+    s_at_busy = true;
+    if (xTaskCreatePinnedToCore(cmd_ssh_task_fn, "at_ssh", 12288, NULL, 15,
+                                &s_dial_task, 0) != pdPASS) {
+        s_at_busy = false; s_dial_task = NULL; r_error();
+    }
+}
+
 /* Thin synchronous wrapper called from exec(). Does the cheap syntax
  * checks inline (so a malformed ATD gets an immediate ERROR) and then
  * hands off to cmd_dial_task_fn for the slow work. */
@@ -2021,54 +2041,56 @@ static void handle_dollar(char *s) {
         char tmp[200];
         strncpy(tmp, val, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
         char *user, *pass = (char *)"", *host; uint16_t sport = 22;
-        char *at = strchr(tmp, '@');
+        char *at = strrchr(tmp, '@');   /* LAST '@' so a password may contain '@' */
         if (at) {
             *at = 0;
             user = tmp;
-            char *c1 = strchr(tmp, ':');
+            char *c1 = strchr(tmp, ':');   /* first ':' -> user:pass (pass may hold ':') */
             if (c1) { *c1 = 0; pass = c1 + 1; }
             host = at + 1;
-            char *c2 = strrchr(host, ':');
+            char *c2 = strrchr(host, ':'); /* last ':' on the host side -> :port */
             if (c2) { *c2 = 0; int pn = atoi(c2 + 1); if (pn > 0 && pn < 65536) sport = (uint16_t)pn; }
         } else if (strchr(tmp, ',')) {
-            /* '@'-free alternate for keyboards/terminals that can't transmit '@'
-             * (common on non-US DOS layouts): AT$SSH=user,pass,host[,port]. */
-            user = strtok(tmp, ",");
-            pass = strtok(NULL, ",");
-            host = strtok(NULL, ",");
-            char *ps = strtok(NULL, ",");
-            if (!user) user = (char *)"";
-            if (!pass) pass = (char *)"";
-            if (!host) { r_error(); return; }
-            if (ps) { int pn = atoi(ps); if (pn > 0 && pn < 65536) sport = (uint16_t)pn; }
+            /* '@'-free form for keyboards/terminals that can't transmit '@'
+             * (common on non-US DOS layouts):
+             *   user,host             -> prompt for the password
+             *   user,pass,host[,port] -> password inline
+             * Manual split (not strtok) so empty fields and the 2-field form
+             * are handled exactly. */
+            char *f1 = tmp;
+            char *f2 = strchr(f1, ','); if (f2) *f2++ = 0;
+            char *f3 = f2 ? strchr(f2, ',') : NULL; if (f3) *f3++ = 0;
+            char *f4 = f3 ? strchr(f3, ',') : NULL; if (f4) *f4++ = 0;
+            user = f1;
+            if (f3) { pass = f2; host = f3;
+                      if (f4) { int pn = atoi(f4); if (pn > 0 && pn < 65536) sport = (uint16_t)pn; } }
+            else    { host = f2; }            /* user,host -> empty pass -> prompt */
         } else {
             /* No '@' AND no ',' -- the separator didn't arrive. Log the received
-             * bytes (hex) so we can SEE exactly what came in (e.g. is there a 0x40
-             * where '@' should be?). Only logs on this already-malformed path, so
-             * a valid password is never dumped. */
+             * bytes (hex) so we can SEE exactly what came in. Only logs on this
+             * already-malformed path, so a valid password is never dumped. */
             char hx[120]; int k = 0;
             for (const char *q = val; *q && k < (int)sizeof hx - 4; ++q)
                 k += snprintf(hx + k, sizeof hx - k, "%02x ", (unsigned char)*q);
             disk_logf("ssh: no '@'/',' sep -- rx len=%d hex=%s", (int)strlen(val), hx);
             r_error(); return;
         }
-        if (!*host || !*user) { r_error(); return; }
+        if (!host || !*host || !*user) { r_error(); return; }
         strncpy(s_ssh_user, user, sizeof s_ssh_user - 1); s_ssh_user[sizeof s_ssh_user - 1] = 0;
-        strncpy(s_ssh_pass, pass, sizeof s_ssh_pass - 1); s_ssh_pass[sizeof s_ssh_pass - 1] = 0;
         strncpy(s_ssh_host, host, sizeof s_ssh_host - 1); s_ssh_host[sizeof s_ssh_host - 1] = 0;
         s_ssh_port = sport;
-        s_at_busy = true;
-        /* 12 KB stack: the worker's stack is heap that's HELD through the
-         * handshake, competing with libssh2's ~11 KB session + the bignum kex
-         * transient -- a 20 KB stack drove min-free to 652 B (measured). The
-         * spike's stack high-water was ~6.9 KB, so 12 KB keeps a ~5 KB margin
-         * AND frees 8 KB back to the handshake. CPU0, off the TinyUSB core.
-         * (8 KB overflowed in the spike; do not go below ~10 KB.) */
-        if (xTaskCreatePinnedToCore(cmd_ssh_task_fn, "at_ssh", 12288, NULL, 15,
-                                    &s_dial_task, 0) != pdPASS) {
-            s_at_busy = false; s_dial_task = NULL; r_error();
+        if (*pass) {
+            /* Password supplied inline (spaces OK -- preserved by the parser). */
+            strncpy(s_ssh_pass, pass, sizeof s_ssh_pass - 1); s_ssh_pass[sizeof s_ssh_pass - 1] = 0;
+            ssh_spawn_worker();
+            return;
         }
-        /* CONNECT / NO CARRIER emitted by cmd_ssh_impl. */
+        /* No password -- prompt and capture it with echo suppressed (like a
+         * normal ssh client). on_cdc_rx reads the line and spawns the worker. */
+        s_ssh_pass[0] = 0; s_ssh_pw_len = 0;
+        s_ssh_pw_capture = true;
+        cdc_print("\r\nPassword: ");
+        return;
     } else if (!strcmp(key, "HELP")) {
         cdc_print(
             "\r\n"
@@ -2078,6 +2100,7 @@ static void handle_dollar(char *s) {
             "ATO     return online      ATH     hang up\r\n"
             "AT$SSH=user[:pass]@host[:port]   open an SSH session\r\n"
             "AT$SSH=user,pass,host[,port]     (same, comma form -- no '@' key)\r\n"
+            "   omit the password (user@host or user,host) to be prompted\r\n"
             "+++     escape to cmd      (1 s guard, 3 +'s, 1 s guard)\r\n"
             "AT$WIFI=ssid,pw    set wifi creds + reconnect\r\n"
             "AT$WIFI?           show wifi status\r\n"
@@ -2219,6 +2242,27 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
         }
         disk_logf("ota: drain done, swallowed %lu bytes", (unsigned long)s_ota_drained);
         s_ota_drain_until_us = 0;   /* quiet long enough -- process this buffer */
+    }
+
+    /* Interactive SSH password entry (AT$SSH given no password): capture the
+     * typed line with echo SUPPRESSED, then spawn the worker on Enter. Space
+     * (0x20) is allowed, so passwords with spaces work. */
+    if (s_ssh_pw_capture) {
+        for (size_t i = 0; i < got; ++i) {
+            uint8_t b = buf[i];
+            if (b == '\r' || b == '\n') {
+                s_ssh_pass[s_ssh_pw_len] = 0;
+                s_ssh_pw_capture = false;
+                cdc_print("\r\n");
+                ssh_spawn_worker();
+                return;
+            }
+            if (b == 0x08 || b == 0x7F) { if (s_ssh_pw_len) s_ssh_pw_len--; continue; }
+            if (b < 0x20 || b > 0x7E) continue;
+            if (s_ssh_pw_len + 1 < sizeof s_ssh_pass) s_ssh_pass[s_ssh_pw_len++] = (char)b;
+            /* no echo -- it's a password */
+        }
+        return;
     }
 
     /* CDC OTA in progress: every delivered byte is firmware. Feed it straight
