@@ -11,7 +11,6 @@ idf_component_register(
         "kex.c" "mac.c" "mbedtls.c" "misc.c" "packet.c" "pem.c" "session.c"
         "transport.c" "userauth.c" "userauth_kbd_packet.c"
         "bcrypt_pbkdf.c" "blowfish.c"
-        "idf_introspect.c"
     INCLUDE_DIRS "."
     REQUIRES mbedtls lwip
 )

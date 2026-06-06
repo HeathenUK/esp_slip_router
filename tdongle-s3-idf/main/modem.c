@@ -311,8 +311,6 @@ static volatile int64_t  s_tp_start = 0;    /* session start (esp_timer) */
 #define RELAY_WIFI_GRACE_US (3*1000*1000)
 /* Defined in main.c: us the WiFi link has been down (0 if up / never connected). */
 extern int64_t wifi_down_us(void);
-/* Phase-0 SSH feasibility spike (ssh_spike.c). Throwaway. */
-extern void ssh_spike_start(const char *user, const char *pass, const char *host, uint16_t port);
 /* Dump the disk-log over CDC (AT$LOG) -- WiFi-independent diagnostics (main.c). */
 extern void disk_log_foreach(void (*cb)(const char *line, void *ctx), void *ctx);
 
@@ -2012,25 +2010,6 @@ static void handle_dollar(char *s) {
         cdc_print("\r\n");
         disk_log_foreach(log_cdc_emit, NULL);
         r_ok();
-    } else if (!strcmp(key, "SSHTEST") && val && eq) {
-        /* Phase-0 spike: AT$SSHTEST=user:pass@host[:port] -- opens one libssh2
-         * session and logs peak heap to /disk-log (GATE for SSH feasibility).
-         * Throwaway. Password is parsed but never logged. */
-        char tmp[200];
-        strncpy(tmp, val, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
-        char *at = strchr(tmp, '@');
-        if (!at) { r_error(); }
-        else {
-            *at = 0;
-            char *user = tmp, *pass = (char *)"";
-            char *c1 = strchr(tmp, ':');
-            if (c1) { *c1 = 0; pass = c1 + 1; }
-            char *host = at + 1; uint16_t sport = 22;
-            char *c2 = strrchr(host, ':');
-            if (c2) { *c2 = 0; int pn = atoi(c2 + 1); if (pn > 0 && pn < 65536) sport = (uint16_t)pn; }
-            if (!*host || !*user) { r_error(); }
-            else { ssh_spike_start(user, pass, host, sport); r_ok(); }
-        }
     } else if (!strcmp(key, "SSH") && val && eq) {
         /* AT$SSH=user[:pass]@host[:port] -- open an interactive SSH session and
          * relay it as a transparent pipe (the dongle terminates SSH; the DOS

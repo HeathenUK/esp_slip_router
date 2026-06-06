@@ -17,7 +17,6 @@ idf_component_register(
         "dns_forwarder.c"
         "kbd.c"
         "display.c"
-        "ssh_spike.c"
         "ssh.c"
     INCLUDE_DIRS "."
     REQUIRES
