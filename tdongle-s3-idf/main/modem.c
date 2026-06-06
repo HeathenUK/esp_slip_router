@@ -1403,7 +1403,12 @@ static void cmd_dial_impl(const char *arg) {
          * so they can be tuned against observed floors. */
         uint32_t qfree   = esp_get_free_heap_size();
         uint32_t qcontig = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-        bool do_quiesce  = (qfree < 32 * 1024) || (qcontig < 20 * 1024);
+        /* 28 KB / 18 KB sit just BELOW the healthy idle baseline (~31-35 KB free,
+         * ~22-26 KB largest), so idle keeps httpd up; the gate only fires once a
+         * prior session / fragmentation / load has eaten into the margin. The
+         * ~20 KB handshake transient from 28 KB still clears the 5 KB guard
+         * (~8 KB floor), and 18 KB contig still admits a max ~16 KB TLS record. */
+        bool do_quiesce  = (qfree < 28 * 1024) || (qcontig < 18 * 1024);
         disk_logf("dial: TLS gate free=%u contig=%u -> quiesce=%d",
                   (unsigned)qfree, (unsigned)qcontig, do_quiesce);
         if (do_quiesce) app_secure_quiesce(true);
