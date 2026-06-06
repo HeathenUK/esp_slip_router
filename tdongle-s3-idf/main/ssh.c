@@ -28,6 +28,7 @@
 #include "lwip/netdb.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "libssh2_idf.h"   /* defines ESP32, then includes libssh2.h */
 #include "disk.h"
 
@@ -64,11 +65,17 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
     }
     libssh2_session_set_blocking(s_session, 1);   /* blocking for setup */
 
+    /* Per-step timing to locate the ~27 s handshake cost. */
+    int64_t t_step = esp_timer_get_time();
+#define SSH_STEP(name) do { int64_t _n = esp_timer_get_time(); \
+    disk_logf("ssh: " name " +%dms", (int)((_n - t_step) / 1000)); t_step = _n; } while (0)
+
     snprintf(ps, sizeof ps, "%u", (unsigned)port);
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) { disk_logf("ssh: DNS fail"); goto fail; }
+    SSH_STEP("dns");
     sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (sock < 0) { freeaddrinfo(res); disk_logf("ssh: socket fail"); goto fail; }
     {
@@ -80,14 +87,21 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
         freeaddrinfo(res); disk_logf("ssh: connect fail"); goto fail;
     }
     freeaddrinfo(res); res = NULL;
+    SSH_STEP("tcp");
 
     if (libssh2_session_handshake(s_session, sock)) { disk_logf("ssh: handshake FAIL"); goto fail; }
+    SSH_STEP("handshake");
     if (libssh2_userauth_password(s_session, user, pass)) { disk_logf("ssh: AUTH FAILED for %s", user); goto fail; }
+    SSH_STEP("auth");
 
     s_channel = libssh2_channel_open_session(s_session);
     if (!s_channel) { disk_logf("ssh: channel-open fail"); goto fail; }
+    SSH_STEP("channel");
     libssh2_channel_request_pty(s_channel, "vt100");
+    SSH_STEP("pty");
     if (libssh2_channel_shell(s_channel)) { disk_logf("ssh: shell fail"); goto fail; }
+    SSH_STEP("shell");
+#undef SSH_STEP
 
     /* Relay phase: keep the session BLOCKING but bound each call with a short
      * libssh2 timeout, so libssh2_channel_read returns LIBSSH2_ERROR_TIMEOUT on
