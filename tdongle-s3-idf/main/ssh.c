@@ -33,6 +33,7 @@
 
 static LIBSSH2_SESSION *s_session = NULL;
 static LIBSSH2_CHANNEL *s_channel = NULL;
+static int s_rx_seen = 0;   /* logged the first relayed channel byte yet? */
 
 /* Open an SSH session + interactive shell to user@host:port. Returns the
  * connected socket fd (caller adopts it as the relay's s_sock) on success, or
@@ -46,6 +47,7 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
 
     s_session = NULL;
     s_channel = NULL;
+    s_rx_seen = 0;
 
     if (libssh2_init(0) != 0) { disk_logf("ssh: libssh2_init fail"); return -1; }
 
@@ -87,7 +89,13 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
     libssh2_channel_request_pty(s_channel, "vt100");
     if (libssh2_channel_shell(s_channel)) { disk_logf("ssh: shell fail"); goto fail; }
 
-    libssh2_session_set_blocking(s_session, 0);   /* non-blocking for the relay */
+    /* Relay phase: keep the session BLOCKING but bound each call with a short
+     * libssh2 timeout, so libssh2_channel_read returns LIBSSH2_ERROR_TIMEOUT on
+     * an idle channel (-> the recv pump polls ~10x/s) instead of wedging. A
+     * NON-blocking session over our blocking-with-SO_RCVTIMEO socket stalled the
+     * transport after the first packet (only ~61 B ever relayed); blocking + a
+     * short session timeout is the robust poll model for a single-channel relay. */
+    libssh2_session_set_timeout(s_session, 100);   /* ms */
     disk_logf("ssh: up %s@%s:%u free=%u", user, host, (unsigned)port,
               (unsigned)esp_get_free_heap_size());
     return sock;
@@ -105,8 +113,13 @@ fail:
 int ssh_read(void *buf, size_t len)
 {
     ssize_t r = libssh2_channel_read(s_channel, (char *)buf, len);
-    if (r > 0) return (int)r;
-    if (r == LIBSSH2_ERROR_EAGAIN) { errno = EAGAIN; return -1; }
+    if (r > 0) {
+        if (!s_rx_seen) { s_rx_seen = 1; disk_logf("ssh: first channel data (%d B)", (int)r); }
+        return (int)r;
+    }
+    /* Blocking session w/ libssh2 timeout: TIMEOUT == "idle this poll". */
+    if (r == LIBSSH2_ERROR_EAGAIN || r == LIBSSH2_ERROR_TIMEOUT) { errno = EAGAIN; return -1; }
+    if (r < 0) disk_logf("ssh: read err %d", (int)r);
     return 0;   /* 0 (EOF) or other negative error -> relay tears down */
 }
 
@@ -116,7 +129,7 @@ int ssh_write(const void *buf, size_t len)
 {
     ssize_t w = libssh2_channel_write(s_channel, (const char *)buf, len);
     if (w > 0) return (int)w;
-    if (w == LIBSSH2_ERROR_EAGAIN) { errno = EAGAIN; return -1; }
+    if (w == LIBSSH2_ERROR_EAGAIN || w == LIBSSH2_ERROR_TIMEOUT) { errno = EAGAIN; return -1; }
     return 0;
 }
 
