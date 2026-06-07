@@ -106,16 +106,15 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
     if (sock < 0) { freeaddrinfo(res); disk_logf("ssh: socket fail"); goto fail; }
     {
         struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
-        /* Clamp the RX window BEFORE connect, so the advertised window is small
-         * from the start. A flood from the remote (e.g. a 256-colour dump) on an
-         * interactive shell otherwise piles a full TCP_WND_DEFAULT (16 KB) of RX
-         * pbufs -- ~32 KB with pbuf/WiFi overhead -- on this socket while the slow
-         * DOS consumer backpressures the relay drain, cratering free heap into the
-         * anti-wedge guard (NO CARRIER). modem.c's post-adopt SO_RCVBUF is too late:
-         * lwIP won't shrink an already-established window. Trace-confirmed -- close(fd)
-         * released ~32.5 KB of held pbufs. 4 KB matches the libssh2 channel window. */
-        int rcvbuf = 4096;
-        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+        /* Deliberately NO SO_RCVBUF here: on this lwIP build it is a no-op for TCP
+         * (recv_bufsize is consulted only for UDP/RAW; the TCP receive window is
+         * pinned to the global TCP_WND = 16 KB and there is no per-socket window
+         * knob). A remote flood (e.g. a 256-colour dump) is bounded instead by two
+         * things working together: (a) the small libssh2 channel window (4 KB,
+         * opened below), and (b) READ-PACING in the relay loop (modem.c) -- it stops
+         * draining the channel while the CDC downstream is backed up, so libssh2
+         * stops calling recv (stops re-opening the TCP window) and the remote stalls
+         * at the channel window instead of piling ~16 KB of RX pbufs into heap. */
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     }

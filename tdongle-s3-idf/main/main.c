@@ -823,7 +823,7 @@ static void httpd_start_once(void) {
     s_httpd_starting = true;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
-    cfg.stack_size       = 8192;
+    cfg.stack_size       = 4096;   /* SRAM: high-water showed ~2.4K used (was 8192) */
     cfg.max_uri_handlers = 24;
     cfg.lru_purge_enable = true;
     /* 2 s was the default; OTA upload kept stalling at ~168 KB because

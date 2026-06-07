@@ -980,7 +980,22 @@ static void modem_data_task(void *arg) {
             ctl_last = nowus; ctl_blk = blk; ctl_rx = s_tp_rx;
         }
 
-        int n = xport_read(inbuf, sizeof inbuf);
+        /* Read-pacing (secure sessions). libssh2 drains the socket on EVERY read,
+         * which calls tcp_recved and re-opens the full TCP_WND -- inviting the remote
+         * to keep ~16 KB in flight. Reading while the CDC downstream is backed up
+         * lets that window of encrypted pbufs pile into heap (the 256-colour flood
+         * crater). So don't pull from the channel until s_to_cdc has room: the unread
+         * data stops tcp_recved re-opening the window, and libssh2's 4 KB channel
+         * window becomes the binding flow-control. (SO_RCVBUF can't do this -- no-op
+         * for TCP on this lwIP build.) Plain TCP is already paced by its small reads
+         * + CDC backpressure, so it keeps the dynamic RX-window controller above. */
+        int n;
+        if (s_xport_kind != XPORT_TCP && s_to_cdc &&
+            xStreamBufferSpacesAvailable(s_to_cdc) < (size_t)sizeof inbuf) {
+            n = -1; errno = EAGAIN;   /* downstream full: skip read, fall to idle yield */
+        } else {
+            n = xport_read(inbuf, sizeof inbuf);
+        }
         if (n > 0) s_tp_rx += (uint32_t)n;
         /* DEBUG (256-colour flood repro): snapshot heap right after each read on a
          * secure session -- libssh2 allocates here, and the top-of-loop anti-wedge

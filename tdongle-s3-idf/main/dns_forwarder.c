@@ -183,5 +183,5 @@ static void dns_task(void *arg) {
 }
 
 void dns_forwarder_init(void) {
-    xTaskCreatePinnedToCore(dns_task, "dns_fwd", 4096, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(dns_task, "dns_fwd", 3072, NULL, 5, NULL, 0);  /* SRAM: ~1.9K used (was 4096) */
 }

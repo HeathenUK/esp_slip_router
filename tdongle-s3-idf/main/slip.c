@@ -389,7 +389,7 @@ esp_err_t slip_init(void) {
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&bcfg);
-    xTaskCreatePinnedToCore(btn_task, "boot_btn", 2048, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(btn_task, "boot_btn", 1280, NULL, 4, NULL, 0);  /* SRAM: ~0.7K used (was 2048) */
 
     disk_logf("[slip] init: nif up, local=%d.%d.%d.%d/24, mode=%s",
               SLIP_LOCAL_A, SLIP_LOCAL_B, SLIP_LOCAL_C, SLIP_LOCAL_D,
