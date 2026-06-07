@@ -1743,6 +1743,18 @@ static void cmd_ssh_impl(void) {
     wifi_ap_record_t ap;
     if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) { r_nocarrier(); return; }
 
+    /* Auto-detect the terminal's real size via a DSR-CPR probe (same as the
+     * telnet dial). The SSH PTY is sized from s_term_rows/cols below; without
+     * this it stays the 80x24->25 default, so on an 80x50 (text/pal) or 80x30
+     * (gfx) usbterm screen, full-screen apps (nano/vim) put their bottom bar at
+     * row ~25 -- the vertical MIDDLE of the screen. Runs in command mode while
+     * CDC is fully serviced; AT$NAWS still overrides for peers that don't CPR. */
+    tn_query_size();
+    while (s_cpr_pending && esp_timer_get_time() < s_cpr_deadline_us)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    s_cpr_pending = false;
+    disk_logf("ssh: cpr size cols=%u rows=%u", (unsigned)s_term_cols, (unsigned)s_term_rows);
+
     /* Conditional quiesce (same gate as the TLS dial). SSH's session struct is
      * ~11 KB CONTIGUOUS + a handshake transient, so the contig<18 KB arm is the
      * load-bearing one here -- it guarantees session_init's big block fits. */
