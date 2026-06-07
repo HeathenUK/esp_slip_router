@@ -29,12 +29,27 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "libssh2_idf.h"   /* defines ESP32, then includes libssh2.h */
 #include "disk.h"
 
 static LIBSSH2_SESSION *s_session = NULL;
 static LIBSSH2_CHANNEL *s_channel = NULL;
 static int s_rx_seen = 0;   /* logged the first relayed channel byte yet? */
+
+/* libssh2 is NOT reentrant on a single session: the relay reads (recv pump task)
+ * and writes (keystroke pump task) the SAME s_session/s_channel concurrently, so
+ * a keystroke arriving mid-output used to interleave two libssh2 calls -- which
+ * corrupted the cipher state (-> libssh2_channel_read returns -12 DECRYPT) and
+ * the session's internal buffers (-> PANIC reboot). This mutex serializes every
+ * libssh2 session/channel call so read and write can never overlap. Created once
+ * and never destroyed (lifetime static), so a task blocked on it during teardown
+ * can't fault on a deleted handle. */
+static SemaphoreHandle_t s_ssh_lock = NULL;
+static void ssh_lock_init(void) { if (!s_ssh_lock) s_ssh_lock = xSemaphoreCreateMutex(); }
+#define SSH_LOCK()   do { if (s_ssh_lock) xSemaphoreTake(s_ssh_lock, portMAX_DELAY); } while (0)
+#define SSH_UNLOCK() do { if (s_ssh_lock) xSemaphoreGive(s_ssh_lock); } while (0)
 
 /* Open an SSH session + interactive shell to user@host:port. Returns the
  * connected socket fd (caller adopts it as the relay's s_sock) on success, or
@@ -50,6 +65,7 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
     s_session = NULL;
     s_channel = NULL;
     s_rx_seen = 0;
+    ssh_lock_init();   /* serialize read/write/close across the relay tasks */
 
     if (libssh2_init(0) != 0) { disk_logf("ssh: libssh2_init fail"); return -1; }
 
@@ -120,7 +136,10 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
      * NON-blocking session over our blocking-with-SO_RCVTIMEO socket stalled the
      * transport after the first packet (only ~61 B ever relayed); blocking + a
      * short session timeout is the robust poll model for a single-channel relay. */
-    libssh2_session_set_timeout(s_session, 100);   /* ms */
+    /* 30 ms (was 100): an idle read holds the serialization lock for the whole
+     * timeout, so a shorter timeout caps how long a keystroke write waits behind
+     * an idle read (~30 ms vs ~100 ms) at the cost of a slightly faster poll. */
+    libssh2_session_set_timeout(s_session, 30);   /* ms */
     disk_logf("ssh: up %s@%s:%u free=%u", user, host, (unsigned)port,
               (unsigned)esp_get_free_heap_size());
     return sock;
@@ -137,7 +156,10 @@ fail:
  * no data is available this poll (non-blocking channel). */
 int ssh_read(void *buf, size_t len)
 {
-    ssize_t r = libssh2_channel_read(s_channel, (char *)buf, len);
+    ssize_t r;
+    SSH_LOCK();
+    r = s_channel ? libssh2_channel_read(s_channel, (char *)buf, len) : 0;
+    SSH_UNLOCK();
     if (r > 0) {
         if (!s_rx_seen) { s_rx_seen = 1; disk_logf("ssh: first channel data (%d B)", (int)r); }
         return (int)r;
@@ -152,7 +174,10 @@ int ssh_read(void *buf, size_t len)
  * channel window is momentarily full (tcp_send_all retries), 0 on error. */
 int ssh_write(const void *buf, size_t len)
 {
-    ssize_t w = libssh2_channel_write(s_channel, (const char *)buf, len);
+    ssize_t w;
+    SSH_LOCK();
+    w = s_channel ? libssh2_channel_write(s_channel, (const char *)buf, len) : 0;
+    SSH_UNLOCK();
     if (w > 0) return (int)w;
     if (w == LIBSSH2_ERROR_EAGAIN || w == LIBSSH2_ERROR_TIMEOUT) { errno = EAGAIN; return -1; }
     return 0;
@@ -162,7 +187,12 @@ int ssh_write(const void *buf, size_t len)
  * fd -- modem.c's xport_close owns s_sock. Idempotent. */
 void ssh_close(void)
 {
+    /* Take the lock so we never free the session/channel while the recv or
+     * keystroke task is mid-call inside libssh2. After this, s_channel is NULL,
+     * so any later ssh_read/ssh_write returns EOF instead of using freed state. */
+    SSH_LOCK();
     if (s_channel) { libssh2_channel_free(s_channel); s_channel = NULL; }
     if (s_session) { libssh2_session_free(s_session); s_session = NULL; }
     libssh2_exit();
+    SSH_UNLOCK();
 }
