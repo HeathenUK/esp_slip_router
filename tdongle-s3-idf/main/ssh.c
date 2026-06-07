@@ -106,6 +106,16 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
     if (sock < 0) { freeaddrinfo(res); disk_logf("ssh: socket fail"); goto fail; }
     {
         struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
+        /* Clamp the RX window BEFORE connect, so the advertised window is small
+         * from the start. A flood from the remote (e.g. a 256-colour dump) on an
+         * interactive shell otherwise piles a full TCP_WND_DEFAULT (16 KB) of RX
+         * pbufs -- ~32 KB with pbuf/WiFi overhead -- on this socket while the slow
+         * DOS consumer backpressures the relay drain, cratering free heap into the
+         * anti-wedge guard (NO CARRIER). modem.c's post-adopt SO_RCVBUF is too late:
+         * lwIP won't shrink an already-established window. Trace-confirmed -- close(fd)
+         * released ~32.5 KB of held pbufs. 4 KB matches the libssh2 channel window. */
+        int rcvbuf = 4096;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     }

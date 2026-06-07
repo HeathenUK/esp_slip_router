@@ -227,10 +227,18 @@ static void xport_close(void) {
     }
     if (s_xport_kind == XPORT_SSH) {
         /* Free channel + session (ssh.c), THEN close the fd we own. */
+        uint32_t f0 = esp_get_free_heap_size();
         ssh_close();
+        uint32_t f1 = esp_get_free_heap_size();
         if (s_sock >= 0) { close(s_sock); s_sock = -1; }
+        uint32_t f2 = esp_get_free_heap_size();
         s_xport_kind = XPORT_TCP;
         app_secure_quiesce(false);   /* restore httpd + mDNS */
+        /* DEBUG (heap-leak probe): how much each teardown step reclaims, so we
+         * can tell whether ssh_close frees the full libssh2 state or leaks it. */
+        disk_logf("ssh-trace: teardown free %u ->ssh_close %u ->fd %u ->unquiesce %u",
+                  (unsigned)f0, (unsigned)f1, (unsigned)f2,
+                  (unsigned)esp_get_free_heap_size());
         return;
     }
     s_xport_ctx = NULL;
@@ -878,6 +886,10 @@ static void modem_data_task(void *arg) {
 
     bool peer_closed = false;
 
+    /* DEBUG (256-colour flood repro): baseline for the secure-session heap-descent
+     * trace below. Reset to the freshest free at relay start. */
+    uint32_t trace_free = esp_get_free_heap_size();
+
     while (s_online && s_sock >= 0) {
         /* Anti-wedge: bail before starvation can take out the OTA paths.
          * Close the socket FIRST (frees the held RX pbuf backlog -> heap
@@ -970,6 +982,21 @@ static void modem_data_task(void *arg) {
 
         int n = xport_read(inbuf, sizeof inbuf);
         if (n > 0) s_tp_rx += (uint32_t)n;
+        /* DEBUG (256-colour flood repro): snapshot heap right after each read on a
+         * secure session -- libssh2 allocates here, and the top-of-loop anti-wedge
+         * guard would otherwise abort on a single-read crater before we could trace
+         * it. Delta-gated (>=3K step down / >=8K recovery) so it can't spam the ring.
+         * `n` reveals whether a big free-drop rode a small read (per-packet alloc) or
+         * a large one (data volume). Remove once the cliff is pinned. */
+        if (n > 0 && s_xport_kind != XPORT_TCP) {
+            uint32_t fr = esp_get_free_heap_size();
+            if (fr + 3072 < trace_free || fr > trace_free + 8192) {
+                disk_logf("ssh-trace: postread n=%d rx=%u free=%u min=%u",
+                          n, (unsigned)s_tp_rx, (unsigned)fr,
+                          (unsigned)esp_get_minimum_free_heap_size());
+                trace_free = fr;
+            }
+        }
         if (n > 0 && autosniff) {
             /* Decide from the connection OPENING; flip BEFORE the dispatch
              * below so this chunk routes through the IAC machine (negotiation
