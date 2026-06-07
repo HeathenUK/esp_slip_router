@@ -812,6 +812,21 @@ static void modem_data_task(void *arg) {
      * per dial). */
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+    /* Secure sessions: the SSH/TLS handshake ran on a big (12 KB) worker stack
+     * that self-deletes immediately after notifying us -- but a self-deleted
+     * task's stack is reclaimed LATER, by the idle task. If we start relaying
+     * (libssh2 begins allocating per-packet receive buffers) before that
+     * reclaim, the 12 KB is still held and free heap craters below the 5 KB
+     * anti-wedge guard on the FIRST packet -> NO CARRIER right after connect
+     * (measured floor ~2 KB). Yield first so idle reclaims the worker stack,
+     * THEN relay with the full heap. Plain TCP has no such worker -> skip. */
+    if (s_xport_kind != XPORT_TCP) {
+        uint32_t before = esp_get_free_heap_size();
+        vTaskDelay(pdMS_TO_TICKS(60));
+        disk_logf("ssh: pre-relay reclaim free %u->%u",
+                  (unsigned)before, (unsigned)esp_get_free_heap_size());
+    }
+
     /* Loose 100 ms poll. The recv timeout means we wake periodically
      * to check for +++ guard expiry / socket close even when the peer
      * is silent. */
