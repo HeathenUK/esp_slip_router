@@ -111,7 +111,7 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
     if (libssh2_userauth_password(s_session, user, pass)) { disk_logf("ssh: AUTH FAILED for %s", user); goto fail; }
     SSH_STEP("auth");
 
-    /* Open with a SMALL channel window (8 KB) + packet size (4 KB) instead of
+    /* Open with a SMALL channel window (4 KB) + packet size (2 KB) instead of
      * libssh2's defaults (2 MB window / 32 KB packet). On this no-PSRAM device
      * the defaults let the server's first burst make libssh2 allocate big
      * receive/queue buffers -> free heap craters to ~1.9 KB and the relay's
@@ -120,7 +120,7 @@ int ssh_connect(const char *user, const char *pass, const char *host, uint16_t p
      * server to our (CDC-paced) consumption rate -- the heap-safe trade for an
      * interactive relay. open_session() is just open_ex(...,"session",...defaults). */
     s_channel = libssh2_channel_open_ex(s_session, "session", sizeof("session") - 1,
-                                        8192 /*window*/, 4096 /*packet*/, NULL, 0);
+                                        4096 /*window*/, 2048 /*packet*/, NULL, 0);
     if (!s_channel) { disk_logf("ssh: channel-open fail"); goto fail; }
     SSH_STEP("channel");
     /* Advertise the caller's TERM + real cell size so the remote shell/apps
