@@ -79,18 +79,21 @@ static uint8_t  s_cmd_elen   = 0;
 /* Command history ring (Up/Down recall). Newest written at s_hist_head; the
  * k-th most recent (k=1..count) is at (head-k) mod N. s_hist_view = 0 means the
  * live line, 1..count means browsing that many entries back. */
-#define HIST_N 8
-static char     s_hist[HIST_N][CMD_LINE_MAX];
+/* Kept small: this BSS competes with the SSH session's heap headroom (an oversized
+ * ring once pushed the relay's low-heap floor under the guard). 6 entries of 96B
+ * is plenty for AT lines and costs 576 B instead of 2 KB. */
+#define HIST_N 6
+#define HIST_ENTRY 96
+static char     s_hist[HIST_N][HIST_ENTRY];
 static uint8_t  s_hist_head  = 0;
 static uint8_t  s_hist_count = 0;
 static uint8_t  s_hist_view  = 0;
-/* F-key macros (AT$Fn=string, NVS-persisted): pressing F<n> in command mode runs
- * <string> as if typed + Enter. Lazy-loaded from NVS on first use. */
+/* F-key macros (AT$Fn=string): stored in NVS, read ON DEMAND (no RAM cache -- the
+ * 12x96 cache cost the SSH session its heap margin). Pressing F<n> in command mode
+ * runs the stored string + Enter. */
 #define MACRO_MAX 96
-static char     s_macro[12][MACRO_MAX];
-static bool     s_macro_loaded = false;
-static void     macros_ensure(void);              /* defined below; used by handle_dollar above it */
-static void     macro_set(int idx, const char *str);
+static void     macro_set(int idx, const char *str);   /* defined below; used by handle_dollar above it */
+static bool     macro_get(int idx, char *buf, size_t n);
 
 static bool s_echo    = true;
 static bool s_verbose = true;
@@ -2228,16 +2231,16 @@ static void handle_dollar(char *s) {
     } else if (key[0] == 'F' && key[1] >= '1' && key[1] <= '9') {
         /* AT$Fn=string : bind a command-mode macro to function key n (1..12),
          * persisted in NVS. Press F<n> in command mode to run <string> + Enter
-         * (one-keypress dial; types the '@' the keyboard can't). AT$Fn? queries.
-         * The value keeps its case + any '=' (e.g. at$ssh=user@host). */
+         * (one-keypress dial). AT$Fn? queries. The value keeps its case + any '='
+         * (e.g. at$ssh=user@host). */
         int fn = atoi(key + 1);                  /* "F12" -> 12 */
         if (fn < 1 || fn > 12) { r_error(); return; }
-        macros_ensure();
         if (val && eq) {
             macro_set(fn - 1, val);
             r_ok();
         } else {
-            cdc_print("\r\n"); cdc_print(s_macro[fn - 1]); cdc_print("\r\n");
+            char m[MACRO_MAX]; macro_get(fn - 1, m, sizeof m);
+            cdc_print("\r\n"); cdc_print(m); cdc_print("\r\n");
             r_ok();
         }
     } else if (!strcmp(key, "LOG")) {
@@ -2485,7 +2488,12 @@ static void hist_push(const char *line) {
         uint8_t last = (uint8_t)((s_hist_head + HIST_N - 1) % HIST_N);
         if (strcmp(s_hist[last], line) == 0) return;
     }
-    snprintf(s_hist[s_hist_head], CMD_LINE_MAX, "%s", line);
+    {   /* bounded copy: a command longer than an entry is truncated in history */
+        size_t n = strlen(line);
+        if (n >= HIST_ENTRY) n = HIST_ENTRY - 1;
+        memcpy(s_hist[s_hist_head], line, n);
+        s_hist[s_hist_head][n] = '\0';
+    }
     s_hist_head = (uint8_t)((s_hist_head + 1) % HIST_N);
     if (s_hist_count < HIST_N) s_hist_count++;
 }
@@ -2504,33 +2512,32 @@ static void hist_down(void) {                    /* recall newer / back to live 
     else if (s_hist_view == 1){ s_hist_view = 0; s_cmd_len = 0; s_cmd_pos = 0; cmd_repaint(); }
 }
 
-/* ---- F-key macros ---- */
-static void macros_ensure(void) {                /* lazy-load the macro table from NVS */
-    nvs_handle_t h;
-    if (s_macro_loaded) return;
-    s_macro_loaded = true;
-    if (nvs_open("slip-router", NVS_READONLY, &h) != ESP_OK) return;
-    for (int i = 0; i < 12; i++) {
-        char k[8]; size_t n = MACRO_MAX;
-        snprintf(k, sizeof k, "mac%d", i);
-        if (nvs_get_str(h, k, s_macro[i], &n) != ESP_OK) s_macro[i][0] = '\0';
+/* ---- F-key macros (NVS-backed, no RAM cache) ---- */
+static bool macro_get(int idx, char *buf, size_t n) {   /* read macro idx -> buf; true if non-empty */
+    nvs_handle_t h; bool ok = false;
+    buf[0] = '\0';
+    if (idx < 0 || idx >= 12) return false;
+    if (nvs_open("slip-router", NVS_READONLY, &h) == ESP_OK) {
+        char k[8]; size_t len = n;
+        snprintf(k, sizeof k, "mac%d", idx);
+        if (nvs_get_str(h, k, buf, &len) == ESP_OK && buf[0]) ok = true;
+        nvs_close(h);
     }
-    nvs_close(h);
+    return ok;
 }
-static void macro_set(int idx, const char *str) {  /* store + persist macro idx (0..11) */
+static void macro_set(int idx, const char *str) {      /* persist macro idx (0..11) */
     nvs_handle_t h;
-    macros_ensure();
-    snprintf(s_macro[idx], MACRO_MAX, "%s", str);
+    if (idx < 0 || idx >= 12) return;
     if (nvs_open("slip-router", NVS_READWRITE, &h) == ESP_OK) {
         char k[8]; snprintf(k, sizeof k, "mac%d", idx);
-        nvs_set_str(h, k, s_macro[idx]); nvs_commit(h); nvs_close(h);
+        nvs_set_str(h, k, str); nvs_commit(h); nvs_close(h);
     }
 }
 /* Fire macro idx in command mode: replace the line, show it, run it. */
 static void cmd_fire_macro(int idx) {
-    macros_ensure();
-    if (idx < 0 || idx >= 12 || !s_macro[idx][0]) return;
-    snprintf(s_cmd, CMD_LINE_MAX, "%s", s_macro[idx]);
+    char m[MACRO_MAX];
+    if (!macro_get(idx, m, sizeof m)) return;
+    snprintf(s_cmd, CMD_LINE_MAX, "%s", m);
     s_cmd_len = (uint16_t)strlen(s_cmd);
     s_cmd_pos = s_cmd_len;
     cmd_repaint();                               /* show the expanded command */
