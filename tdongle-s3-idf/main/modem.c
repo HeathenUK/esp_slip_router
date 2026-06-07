@@ -1833,21 +1833,23 @@ static void cmd_ssh_impl(void) {
     s_cpr_pending = false;
     disk_logf("ssh: cpr size cols=%u rows=%u", (unsigned)s_term_cols, (unsigned)s_term_rows);
 
-    /* Conditional quiesce (same gate as the TLS dial). SSH's session struct is
-     * ~11 KB CONTIGUOUS + a handshake transient, so the contig<18 KB arm is the
-     * load-bearing one here -- it guarantees session_init's big block fits. */
+    /* ALWAYS quiesce for SSH. Unlike TLS (bounded records), an interactive SSH
+     * session is flood-prone -- the remote can dump a screenful any time (ls, a
+     * 256-colour test, the ttydemo stress repaint) -- and the non-quiesced path
+     * lacks the headroom to absorb it: a session that passed the old conditional
+     * gate (free>=28K, contig>=18K) then got stress-flooded craters to near-OOM
+     * (observed min_free 524 B, one alloc short of a PANIC). Quiescing httpd+mDNS
+     * frees ~15K, giving the ~37K relay floor that survives a full RX-pool flood.
+     * httpd/mDNS restart on teardown; CDC OTA + AT$RESET stay up the whole time. */
     {
         uint32_t qfree   = esp_get_free_heap_size();
         uint32_t qcontig = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-        bool do_quiesce  = (qfree < 28 * 1024) || (qcontig < 18 * 1024);
-        disk_logf("ssh: gate free=%u contig=%u -> quiesce=%d",
-                  (unsigned)qfree, (unsigned)qcontig, do_quiesce);
-        if (do_quiesce) {
-            app_secure_quiesce(true);
-            disk_logf("ssh: post-quiesce free=%u contig=%u (session needs ~11K contig)",
-                      (unsigned)esp_get_free_heap_size(),
-                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        }
+        disk_logf("ssh: gate free=%u contig=%u -> quiesce=1 (always)",
+                  (unsigned)qfree, (unsigned)qcontig);
+        app_secure_quiesce(true);
+        disk_logf("ssh: post-quiesce free=%u contig=%u (session needs ~11K contig)",
+                  (unsigned)esp_get_free_heap_size(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
 
     /* PTY size: cols/rows from AT$NAWS if set, else 80x25 (the DOS text-mode
