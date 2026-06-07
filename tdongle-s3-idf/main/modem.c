@@ -1001,6 +1001,16 @@ static void modem_data_task(void *arg) {
             disk_logf("modem: recv err=%d", errno);
             peer_closed = true;
             break;
+        } else {
+            /* Idle tick (no data this poll). Yield the core for 10 ms WITHOUT
+             * holding any lock. Critical for SSH: this task and the keystroke
+             * pump (ssh_write) are both core 0 / prio 16 and serialize on the
+             * libssh2 mutex; without a yield this loop re-takes the lock
+             * back-to-back and the equal-priority keystroke task never wins it
+             * (typed input is silently dropped). The delay guarantees a
+             * lock-free window each idle poll. No effect on throughput: it only
+             * runs when the read returned no data (n < 0 / EAGAIN). */
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
 
         /* +++ guard expired. */
