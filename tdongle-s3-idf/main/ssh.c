@@ -51,10 +51,19 @@ static void ssh_lock_init(void) { if (!s_ssh_lock) s_ssh_lock = xSemaphoreCreate
 #define SSH_LOCK()   do { if (s_ssh_lock) xSemaphoreTake(s_ssh_lock, portMAX_DELAY); } while (0)
 #define SSH_UNLOCK() do { if (s_ssh_lock) xSemaphoreGive(s_ssh_lock); } while (0)
 
-/* Open an SSH session + interactive shell to user@host:port. Returns the
- * connected socket fd (caller adopts it as the relay's s_sock) on success, or
- * -1 on any failure (all libssh2 state freed, socket closed). The session is
- * left NON-BLOCKING. Never logs `pass`. */
+/**
+ * @brief Open an SSH session + interactive shell to user@host:port.
+ * @param user Login username.
+ * @param pass Password (never logged); NULL/empty for keyboard-interactive.
+ * @param host Target hostname or IP.
+ * @param port TCP port (typically 22).
+ * @param term TERM string advertised to the remote PTY.
+ * @param cols PTY width in cells.
+ * @param rows PTY height in cells.
+ * @return Connected socket fd (caller adopts it as the relay's s_sock) on
+ *         success, or -1 on any failure (all libssh2 state freed, socket
+ *         closed). On success the session is left NON-BLOCKING.
+ */
 int ssh_connect(const char *user, const char *pass, const char *host, uint16_t port,
                 const char *term, int cols, int rows)
 {
@@ -161,8 +170,13 @@ fail:
     return -1;
 }
 
-/* recv()-contract read: >0 bytes, 0 = EOF/closed, -1 with errno=EAGAIN when
- * no data is available this poll (non-blocking channel). */
+/**
+ * @brief recv()-contract read from the SSH channel.
+ * @param buf Destination buffer.
+ * @param len Maximum bytes to read.
+ * @return >0 bytes read, 0 on EOF/closed, or -1 with errno=EAGAIN when no data
+ *         is available this poll.
+ */
 int ssh_read(void *buf, size_t len)
 {
     ssize_t r;
@@ -179,8 +193,13 @@ int ssh_read(void *buf, size_t len)
     return 0;   /* 0 (EOF) or other negative error -> relay tears down */
 }
 
-/* send()-contract write: >0 bytes written, -1 with errno=EAGAIN when the
- * channel window is momentarily full (tcp_send_all retries), 0 on error. */
+/**
+ * @brief send()-contract write to the SSH channel.
+ * @param buf Source buffer.
+ * @param len Bytes to write.
+ * @return >0 bytes written, -1 with errno=EAGAIN when the channel window is
+ *         momentarily full (tcp_send_all retries), or 0 on error.
+ */
 int ssh_write(const void *buf, size_t len)
 {
     ssize_t w;
@@ -192,8 +211,12 @@ int ssh_write(const void *buf, size_t len)
     return 0;
 }
 
-/* Free the channel + session and shut libssh2 down. Does NOT close the socket
- * fd -- modem.c's xport_close owns s_sock. Idempotent. */
+/**
+ * @brief Free the channel + session and shut libssh2 down.
+ *
+ * Does NOT close the socket fd -- modem.c's xport_close owns s_sock.
+ * Idempotent.
+ */
 void ssh_close(void)
 {
     /* Take the lock so we never free the session/channel while the recv or

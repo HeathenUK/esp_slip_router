@@ -2439,16 +2439,23 @@ static void exec(char *line) {
 
 /* ---- command-mode line editor helpers ---- */
 
-/* Place the terminal cursor at s_cmd_pos. The command line starts at column 0
- * (it follows the previous result code's trailing CR/LF), so CR homes to its
- * start and CUF advances to the cursor. */
+/**
+ * @brief Place the terminal cursor at s_cmd_pos on the command line.
+ *
+ * The command line starts at column 0 (it follows the previous result code's
+ * trailing CR/LF), so CR homes to its start and CUF advances to the cursor.
+ */
 static void cmd_place(void) {
     if (!s_echo) return;
     cdc_byte('\r');
     if (s_cmd_pos) { char t[12]; snprintf(t, sizeof t, "\x1b[%uC", (unsigned)s_cmd_pos); cdc_print(t); }
 }
-/* Redraw the whole line from column 0, clear any trailing remnant, reposition.
- * Used after edits that change the line content (insert/delete mid-line). */
+/**
+ * @brief Redraw the command line from column 0 and reposition the cursor.
+ *
+ * Clears any trailing remnant (the line may have shrunk). Used after edits
+ * that change line content (mid-line insert/delete).
+ */
 static void cmd_repaint(void) {
     if (!s_echo) return;
     cdc_byte('\r');
@@ -2459,6 +2466,10 @@ static void cmd_repaint(void) {
         cdc_print(t);
     }
 }
+/**
+ * @brief Insert one character at the cursor, shifting the tail right.
+ * @param c Character to insert.
+ */
 static void cmd_insert(uint8_t c) {
     if (s_cmd_len + 1 >= sizeof s_cmd) { s_cmd_overflow = true; return; }
     memmove(s_cmd + s_cmd_pos + 1, s_cmd + s_cmd_pos, (size_t)(s_cmd_len - s_cmd_pos));
@@ -2467,14 +2478,20 @@ static void cmd_insert(uint8_t c) {
     if (s_cmd_pos == s_cmd_len) { if (s_echo) cdc_byte(c); }   /* fast append at end */
     else cmd_repaint();
 }
-static void cmd_backspace(void) {     /* delete the char left of the cursor */
+/**
+ * @brief Delete the character left of the cursor (Backspace).
+ */
+static void cmd_backspace(void) {
     if (s_cmd_pos == 0) return;
     memmove(s_cmd + s_cmd_pos - 1, s_cmd + s_cmd_pos, (size_t)(s_cmd_len - s_cmd_pos));
     s_cmd_len--; s_cmd_pos--;
     if (s_cmd_pos == s_cmd_len) { if (s_echo) cdc_print("\b \b"); }  /* fast delete at end */
     else cmd_repaint();
 }
-static void cmd_delete(void) {        /* delete the char AT the cursor (Del key) */
+/**
+ * @brief Delete the character at the cursor (Del key).
+ */
+static void cmd_delete(void) {
     if (s_cmd_pos >= s_cmd_len) return;
     memmove(s_cmd + s_cmd_pos, s_cmd + s_cmd_pos + 1, (size_t)(s_cmd_len - s_cmd_pos - 1));
     s_cmd_len--;
@@ -2482,6 +2499,11 @@ static void cmd_delete(void) {        /* delete the char AT the cursor (Del key)
 }
 
 /* ---- command history ---- */
+/**
+ * @brief Push a command line onto the history ring.
+ * @param line NUL-terminated command. Blank lines and exact repeats of the
+ *             most recent entry are ignored; longer than an entry is truncated.
+ */
 static void hist_push(const char *line) {
     if (!line[0]) return;                       /* don't store blank lines */
     if (s_hist_count) {                          /* skip if identical to the most recent */
@@ -2497,23 +2519,40 @@ static void hist_push(const char *line) {
     s_hist_head = (uint8_t)((s_hist_head + 1) % HIST_N);
     if (s_hist_count < HIST_N) s_hist_count++;
 }
-static void hist_load(uint8_t view) {            /* view 1..count -> load into the line */
+/**
+ * @brief Load a history entry into the live command line.
+ * @param view Distance back into history, 1..s_hist_count.
+ */
+static void hist_load(uint8_t view) {
     uint8_t idx = (uint8_t)((s_hist_head + HIST_N - view) % HIST_N);
     snprintf(s_cmd, CMD_LINE_MAX, "%s", s_hist[idx]);
     s_cmd_len = (uint16_t)strlen(s_cmd);
     s_cmd_pos = s_cmd_len;
     cmd_repaint();
 }
-static void hist_up(void) {                      /* recall older */
+/**
+ * @brief Recall the next-older history entry.
+ */
+static void hist_up(void) {
     if (s_hist_view < s_hist_count) { s_hist_view++; hist_load(s_hist_view); }
 }
-static void hist_down(void) {                    /* recall newer / back to live line */
+/**
+ * @brief Recall the next-newer history entry, or return to the live line.
+ */
+static void hist_down(void) {
     if (s_hist_view > 1)      { s_hist_view--; hist_load(s_hist_view); }
     else if (s_hist_view == 1){ s_hist_view = 0; s_cmd_len = 0; s_cmd_pos = 0; cmd_repaint(); }
 }
 
 /* ---- F-key macros (NVS-backed, no RAM cache) ---- */
-static bool macro_get(int idx, char *buf, size_t n) {   /* read macro idx -> buf; true if non-empty */
+/**
+ * @brief Read an F-key macro string from NVS.
+ * @param idx Macro slot, 0..11 (F1..F12).
+ * @param buf Destination buffer for the NUL-terminated macro body.
+ * @param n   Size of @p buf.
+ * @return true if a non-empty macro was loaded, false otherwise.
+ */
+static bool macro_get(int idx, char *buf, size_t n) {
     nvs_handle_t h; bool ok = false;
     buf[0] = '\0';
     if (idx < 0 || idx >= 12) return false;
@@ -2525,7 +2564,12 @@ static bool macro_get(int idx, char *buf, size_t n) {   /* read macro idx -> buf
     }
     return ok;
 }
-static void macro_set(int idx, const char *str) {      /* persist macro idx (0..11) */
+/**
+ * @brief Persist an F-key macro string to NVS.
+ * @param idx Macro slot, 0..11 (F1..F12).
+ * @param str NUL-terminated macro body to store.
+ */
+static void macro_set(int idx, const char *str) {
     nvs_handle_t h;
     if (idx < 0 || idx >= 12) return;
     if (nvs_open("slip-router", NVS_READWRITE, &h) == ESP_OK) {
@@ -2533,7 +2577,10 @@ static void macro_set(int idx, const char *str) {      /* persist macro idx (0..
         nvs_set_str(h, k, str); nvs_commit(h); nvs_close(h);
     }
 }
-/* Fire macro idx in command mode: replace the line, show it, run it. */
+/**
+ * @brief Run an F-key macro: replace the line, echo it, execute, then clear.
+ * @param idx Macro slot, 0..11. No-op if the slot is empty.
+ */
 static void cmd_fire_macro(int idx) {
     char m[MACRO_MAX];
     if (!macro_get(idx, m, sizeof m)) return;
@@ -2546,7 +2593,11 @@ static void cmd_fire_macro(int idx) {
     exec(s_cmd);
     s_cmd_len = 0; s_cmd_pos = 0; s_hist_view = 0;
 }
-/* CSI tilde-form F-key (ESC[15~ .. ESC[24~) param -> macro index, or -1. */
+/**
+ * @brief Map a CSI tilde-form F-key parameter to a macro index.
+ * @param p NUL-terminated CSI parameter string (e.g. "15" for ESC[15~).
+ * @return Macro index 0..11, or -1 if the parameter is not an F-key.
+ */
 static int fkey_csi(const char *p) {
     if (!strcmp(p, "15")) return 4;
     if (!strcmp(p, "17")) return 5;
