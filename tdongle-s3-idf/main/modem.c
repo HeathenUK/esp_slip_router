@@ -67,6 +67,15 @@
 static char     s_cmd[CMD_LINE_MAX];
 static uint16_t s_cmd_len      = 0;
 static bool     s_cmd_overflow = false;
+/* Command-mode line editor (only in AT-command mode -- the relay is transparent
+ * in a session, so this can't interfere with a TUI). Cursor within s_cmd plus a
+ * tiny ESC/CSI/SS3 collector for the arrow/Home/End/Del/F-key sequences usbterm
+ * sends. The dongle echoes edits back via ANSI; usbterm just renders them. The
+ * command always starts at screen column 0 (it follows the previous "OK\r\n"). */
+static uint16_t s_cmd_pos    = 0;     /* cursor position within s_cmd */
+static uint8_t  s_cmd_estate = 0;     /* 0=normal, 1=after-ESC, 2=collecting CSI/SS3 */
+static char     s_cmd_eseq[8];        /* collected param bytes of the escape */
+static uint8_t  s_cmd_elen   = 0;
 
 static bool s_echo    = true;
 static bool s_verbose = true;
@@ -2395,6 +2404,50 @@ static void exec(char *line) {
     }
 }
 
+/* ---- command-mode line editor helpers ---- */
+
+/* Place the terminal cursor at s_cmd_pos. The command line starts at column 0
+ * (it follows the previous result code's trailing CR/LF), so CR homes to its
+ * start and CUF advances to the cursor. */
+static void cmd_place(void) {
+    if (!s_echo) return;
+    cdc_byte('\r');
+    if (s_cmd_pos) { char t[12]; snprintf(t, sizeof t, "\x1b[%uC", (unsigned)s_cmd_pos); cdc_print(t); }
+}
+/* Redraw the whole line from column 0, clear any trailing remnant, reposition.
+ * Used after edits that change the line content (insert/delete mid-line). */
+static void cmd_repaint(void) {
+    if (!s_echo) return;
+    cdc_byte('\r');
+    if (s_cmd_len) cdc_write(s_cmd, s_cmd_len);
+    cdc_print("\x1b[K");                 /* clear to EOL (line may have shrunk) */
+    if (s_cmd_pos < s_cmd_len) {
+        char t[12]; snprintf(t, sizeof t, "\x1b[%uD", (unsigned)(s_cmd_len - s_cmd_pos));
+        cdc_print(t);
+    }
+}
+static void cmd_insert(uint8_t c) {
+    if (s_cmd_len + 1 >= sizeof s_cmd) { s_cmd_overflow = true; return; }
+    memmove(s_cmd + s_cmd_pos + 1, s_cmd + s_cmd_pos, (size_t)(s_cmd_len - s_cmd_pos));
+    s_cmd[s_cmd_pos] = (char)c;
+    s_cmd_len++; s_cmd_pos++;
+    if (s_cmd_pos == s_cmd_len) { if (s_echo) cdc_byte(c); }   /* fast append at end */
+    else cmd_repaint();
+}
+static void cmd_backspace(void) {     /* delete the char left of the cursor */
+    if (s_cmd_pos == 0) return;
+    memmove(s_cmd + s_cmd_pos - 1, s_cmd + s_cmd_pos, (size_t)(s_cmd_len - s_cmd_pos));
+    s_cmd_len--; s_cmd_pos--;
+    if (s_cmd_pos == s_cmd_len) { if (s_echo) cdc_print("\b \b"); }  /* fast delete at end */
+    else cmd_repaint();
+}
+static void cmd_delete(void) {        /* delete the char AT the cursor (Del key) */
+    if (s_cmd_pos >= s_cmd_len) return;
+    memmove(s_cmd + s_cmd_pos, s_cmd + s_cmd_pos + 1, (size_t)(s_cmd_len - s_cmd_pos - 1));
+    s_cmd_len--;
+    cmd_repaint();
+}
+
 /* ---- CDC RX callback (TinyUSB task context) ---- */
 
 static void on_cdc_rx(int itf, cdcacm_event_t *event) {
@@ -2484,9 +2537,39 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
         return;
     }
 
-    /* Command mode: line-buffered AT parser. */
+    /* Command mode: line EDITOR (cursor + arrow/Home/End/Del via a small ESC
+     * collector). Transparent in a session, so a TUI is never affected. */
     for (size_t i = 0; i < got; ++i) {
         uint8_t b = buf[i];
+
+        /* --- ESC / CSI / SS3 collector for special keys --- */
+        if (s_cmd_estate == 1) {                 /* byte after ESC */
+            if (b == '[' || b == 'O') { s_cmd_estate = 2; s_cmd_elen = 0; }
+            else s_cmd_estate = 0;               /* lone ESC / unknown: drop */
+            continue;
+        }
+        if (s_cmd_estate == 2) {                 /* collecting until a final byte */
+            if (b >= 0x40 && b <= 0x7E) {        /* final */
+                s_cmd_eseq[s_cmd_elen] = '\0';
+                switch (b) {
+                    case 'C': if (s_cmd_pos < s_cmd_len) { s_cmd_pos++; cmd_place(); } break; /* Right */
+                    case 'D': if (s_cmd_pos > 0)         { s_cmd_pos--; cmd_place(); } break; /* Left  */
+                    case 'H': s_cmd_pos = 0;          cmd_place(); break;                     /* Home  */
+                    case 'F': s_cmd_pos = s_cmd_len;  cmd_place(); break;                     /* End   */
+                    case '~':
+                        if (s_cmd_eseq[0] == '3' && s_cmd_eseq[1] == '\0') cmd_delete();      /* Del   */
+                        break;
+                    /* 'A'/'B' (history) and F-keys (macros) handled in later commits */
+                    default: break;
+                }
+                s_cmd_estate = 0;
+            } else if (s_cmd_elen < sizeof s_cmd_eseq - 1) {
+                s_cmd_eseq[s_cmd_elen++] = (char)b;     /* params: digits / ';' */
+            }
+            continue;
+        }
+        if (b == 0x1B) { s_cmd_estate = 1; continue; }  /* ESC -> collect a sequence */
+
         if (b == '\r' || b == '\n') {
             if (s_echo) cdc_print("\r\n");
             if (s_cmd_overflow) {
@@ -2496,23 +2579,12 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
                 s_cmd[s_cmd_len] = '\0';
                 exec(s_cmd);
             }
-            s_cmd_len = 0;
+            s_cmd_len = 0; s_cmd_pos = 0;
             continue;
         }
-        if (b == 0x08 || b == 0x7F) {
-            if (s_cmd_len > 0) {
-                s_cmd_len--;
-                if (s_echo) cdc_print("\b \b");
-            }
-            continue;
-        }
+        if (b == 0x08 || b == 0x7F) { cmd_backspace(); continue; }
         if (b < 0x20 || b > 0x7E) continue;
-        if (s_cmd_len + 1 < sizeof s_cmd) {
-            s_cmd[s_cmd_len++] = (char)b;
-            if (s_echo) cdc_byte(b);
-        } else {
-            s_cmd_overflow = true;
-        }
+        cmd_insert(b);
     }
 }
 
