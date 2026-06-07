@@ -76,6 +76,14 @@ static uint16_t s_cmd_pos    = 0;     /* cursor position within s_cmd */
 static uint8_t  s_cmd_estate = 0;     /* 0=normal, 1=after-ESC, 2=collecting CSI/SS3 */
 static char     s_cmd_eseq[8];        /* collected param bytes of the escape */
 static uint8_t  s_cmd_elen   = 0;
+/* Command history ring (Up/Down recall). Newest written at s_hist_head; the
+ * k-th most recent (k=1..count) is at (head-k) mod N. s_hist_view = 0 means the
+ * live line, 1..count means browsing that many entries back. */
+#define HIST_N 8
+static char     s_hist[HIST_N][CMD_LINE_MAX];
+static uint8_t  s_hist_head  = 0;
+static uint8_t  s_hist_count = 0;
+static uint8_t  s_hist_view  = 0;
 
 static bool s_echo    = true;
 static bool s_verbose = true;
@@ -2448,6 +2456,32 @@ static void cmd_delete(void) {        /* delete the char AT the cursor (Del key)
     cmd_repaint();
 }
 
+/* ---- command history ---- */
+static void hist_push(const char *line) {
+    if (!line[0]) return;                       /* don't store blank lines */
+    if (s_hist_count) {                          /* skip if identical to the most recent */
+        uint8_t last = (uint8_t)((s_hist_head + HIST_N - 1) % HIST_N);
+        if (strcmp(s_hist[last], line) == 0) return;
+    }
+    snprintf(s_hist[s_hist_head], CMD_LINE_MAX, "%s", line);
+    s_hist_head = (uint8_t)((s_hist_head + 1) % HIST_N);
+    if (s_hist_count < HIST_N) s_hist_count++;
+}
+static void hist_load(uint8_t view) {            /* view 1..count -> load into the line */
+    uint8_t idx = (uint8_t)((s_hist_head + HIST_N - view) % HIST_N);
+    snprintf(s_cmd, CMD_LINE_MAX, "%s", s_hist[idx]);
+    s_cmd_len = (uint16_t)strlen(s_cmd);
+    s_cmd_pos = s_cmd_len;
+    cmd_repaint();
+}
+static void hist_up(void) {                      /* recall older */
+    if (s_hist_view < s_hist_count) { s_hist_view++; hist_load(s_hist_view); }
+}
+static void hist_down(void) {                    /* recall newer / back to live line */
+    if (s_hist_view > 1)      { s_hist_view--; hist_load(s_hist_view); }
+    else if (s_hist_view == 1){ s_hist_view = 0; s_cmd_len = 0; s_cmd_pos = 0; cmd_repaint(); }
+}
+
 /* ---- CDC RX callback (TinyUSB task context) ---- */
 
 static void on_cdc_rx(int itf, cdcacm_event_t *event) {
@@ -2556,10 +2590,12 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
                     case 'D': if (s_cmd_pos > 0)         { s_cmd_pos--; cmd_place(); } break; /* Left  */
                     case 'H': s_cmd_pos = 0;          cmd_place(); break;                     /* Home  */
                     case 'F': s_cmd_pos = s_cmd_len;  cmd_place(); break;                     /* End   */
+                    case 'A': hist_up();   break;   /* Up   -> older command   */
+                    case 'B': hist_down(); break;   /* Down -> newer / blank   */
                     case '~':
                         if (s_cmd_eseq[0] == '3' && s_cmd_eseq[1] == '\0') cmd_delete();      /* Del   */
                         break;
-                    /* 'A'/'B' (history) and F-keys (macros) handled in later commits */
+                    /* F-keys (macros) handled next commit */
                     default: break;
                 }
                 s_cmd_estate = 0;
@@ -2577,9 +2613,10 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
                 s_cmd_overflow = false;
             } else {
                 s_cmd[s_cmd_len] = '\0';
+                hist_push(s_cmd);          /* record before exec (exec may mutate s_cmd) */
                 exec(s_cmd);
             }
-            s_cmd_len = 0; s_cmd_pos = 0;
+            s_cmd_len = 0; s_cmd_pos = 0; s_hist_view = 0;
             continue;
         }
         if (b == 0x08 || b == 0x7F) { cmd_backspace(); continue; }
