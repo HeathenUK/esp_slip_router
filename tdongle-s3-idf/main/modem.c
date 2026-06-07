@@ -878,7 +878,7 @@ static void modem_data_task(void *arg) {
          * tick shrank it. So shrink to the floor IMMEDIATELY the moment heap
          * crosses the clamp line; the tick below re-grows once heap recovers
          * above WINCTL_HEAP_HIGH. Different heap regimes => no oscillation. */
-        if (freeb < WINCTL_HEAP_LOW && win > WINCTL_MIN) {
+        if (s_xport_kind == XPORT_TCP && freeb < WINCTL_HEAP_LOW && win > WINCTL_MIN) {
             /* Gentle step (-2*STEP), same law as the tick's clamp branch but
              * per-iteration: re-fires next chunk if still low, so it converges
              * progressively rather than slamming to MIN and lurching throughput.
@@ -893,8 +893,14 @@ static void modem_data_task(void *arg) {
         }
 
         /* --- adaptive window controller tick (time-gated, ~500ms) --- */
+        /* PLAIN TCP ONLY. A secure (SSH/TLS) session already holds libssh2/mbedTLS
+         * state (~11 KB), so growing the RX window on top lets a data burst fill
+         * the enlarged pbuf backlog and crash free heap to near-zero -- a libssh2
+         * decrypt-buffer alloc then fails (read err -12) and the session drops
+         * (min_free seen at 540 B). Secure sessions keep the fixed WINCTL_START
+         * (4 KB) window set at session init; only the heap guard above applies. */
         int64_t nowus = esp_timer_get_time();
-        if (nowus - ctl_last >= WINCTL_TICK_US) {
+        if (s_xport_kind == XPORT_TCP && nowus - ctl_last >= WINCTL_TICK_US) {
             uint64_t blk = s_tp_blk_us, blk_delta = blk - ctl_blk;
             uint32_t rxd = s_tp_rx - ctl_rx;   /* bytes pulled from TCP this tick */
             int newin = win;
