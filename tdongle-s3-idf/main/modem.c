@@ -580,8 +580,13 @@ static void tn_query_size(void) {
     s_cpr_pending = true;
     s_cpr_len = 0;
     s_cpr_deadline_us = esp_timer_get_time() + CPR_TIMEOUT_US;
-    /* Bottom-right park + DSR-CPR. Two CSI sequences, 11 bytes total. */
-    cdc_print("\x1b[999;999H\x1b[6n");
+    /* Save cursor (DECSC) -> park bottom-right -> DSR-CPR -> restore cursor
+     * (DECRC). The save/restore is essential: without it the cursor is stranded
+     * at the bottom-right corner, so the first byte of shell output (the 'L' of
+     * "Last login") lands in the last column, wraps, and scrolls the screen. The
+     * \x1b is split from the following digit ("\x1b" "7") so the C compiler
+     * doesn't fold \x1b7 into one out-of-range hex escape. */
+    cdc_print("\x1b" "7" "\x1b[999;999H\x1b[6n" "\x1b" "8");
 }
 
 /* Feed bytes received while s_cpr_pending into the CPR parser. State is
