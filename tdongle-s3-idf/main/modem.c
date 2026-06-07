@@ -1752,7 +1752,12 @@ static void cmd_ssh_impl(void) {
         bool do_quiesce  = (qfree < 28 * 1024) || (qcontig < 18 * 1024);
         disk_logf("ssh: gate free=%u contig=%u -> quiesce=%d",
                   (unsigned)qfree, (unsigned)qcontig, do_quiesce);
-        if (do_quiesce) app_secure_quiesce(true);
+        if (do_quiesce) {
+            app_secure_quiesce(true);
+            disk_logf("ssh: post-quiesce free=%u contig=%u (session needs ~11K contig)",
+                      (unsigned)esp_get_free_heap_size(),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        }
     }
 
     /* PTY size: cols/rows from AT$NAWS if set, else 80x25 (the DOS text-mode

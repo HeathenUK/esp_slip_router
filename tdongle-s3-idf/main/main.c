@@ -878,14 +878,19 @@ static void httpd_start_once(void) {
     disk_logf("httpd listening on :80");
 }
 
+static void mdns_start_once(void);
+static void mdns_stop(void);
+
 /* Secure-session quiesce: free the HTTP server (its 8 KB task stack + per-conn
- * buffers) while a TLS/SSH crypto session holds heap, then bring it back. CDC OTA
- * (AT$OTASTART) + AT$RESET stay available throughout, so control/recovery is never
- * lost (honors never-starve-SRAM). Called from the modem secure-dial path. */
+ * buffers) AND mDNS (its task stack + buffers) while a TLS/SSH crypto session
+ * holds heap, then bring both back. CDC OTA (AT$OTASTART) + AT$RESET stay
+ * available throughout, so control/recovery is never lost (honors
+ * never-starve-SRAM). Called from the modem secure-dial path. */
 void app_secure_quiesce(bool on) {
     if (on) {
         s_httpd_wanted = false;
         if (s_httpd) { httpd_stop(s_httpd); s_httpd = NULL; disk_logf("secure: httpd quiesced"); }
+        mdns_stop();               /* also reclaim the mDNS task stack + buffers */
     } else {
         s_httpd_wanted = true;     /* the app_main loop keeps retrying until it sticks */
         httpd_start_once();
@@ -893,20 +898,30 @@ void app_secure_quiesce(bool on) {
             disk_logf("secure: httpd restart deferred (free=%u lfb=%u, needs ~8K contig) -- retrying",
                       (unsigned)esp_get_free_heap_size(),
                       (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        mdns_start_once();         /* bring mDNS back */
     }
 }
 
+static bool s_mdns_up = false;
 static void mdns_start_once(void) {
-    static bool up = false;
-    if (up) return;
+    if (s_mdns_up) return;
     if (mdns_init() != ESP_OK) {
         ESP_LOGE(TAG, "mdns_init failed");
         return;
     }
     mdns_hostname_set(MDNS_HOSTNAME);
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
-    up = true;
+    s_mdns_up = true;
     disk_logf("mdns up as " MDNS_HOSTNAME ".local");
+}
+
+/* Tear mDNS down to reclaim its task stack + buffers during a secure-session
+ * quiesce; mdns_start_once() brings it back afterwards. */
+static void mdns_stop(void) {
+    if (!s_mdns_up) return;
+    mdns_free();
+    s_mdns_up = false;
+    disk_logf("mdns quiesced");
 }
 
 /* ===== WiFi STA ====================================================== */
