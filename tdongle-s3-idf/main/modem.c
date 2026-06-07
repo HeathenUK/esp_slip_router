@@ -84,6 +84,13 @@ static char     s_hist[HIST_N][CMD_LINE_MAX];
 static uint8_t  s_hist_head  = 0;
 static uint8_t  s_hist_count = 0;
 static uint8_t  s_hist_view  = 0;
+/* F-key macros (AT$Fn=string, NVS-persisted): pressing F<n> in command mode runs
+ * <string> as if typed + Enter. Lazy-loaded from NVS on first use. */
+#define MACRO_MAX 96
+static char     s_macro[12][MACRO_MAX];
+static bool     s_macro_loaded = false;
+static void     macros_ensure(void);              /* defined below; used by handle_dollar above it */
+static void     macro_set(int idx, const char *str);
 
 static bool s_echo    = true;
 static bool s_verbose = true;
@@ -2218,6 +2225,21 @@ static void handle_dollar(char *s) {
             cdc_print("\r\n"); cdc_print(s_ssh_term); cdc_print("\r\n");
             r_ok();
         }
+    } else if (key[0] == 'F' && key[1] >= '1' && key[1] <= '9') {
+        /* AT$Fn=string : bind a command-mode macro to function key n (1..12),
+         * persisted in NVS. Press F<n> in command mode to run <string> + Enter
+         * (one-keypress dial; types the '@' the keyboard can't). AT$Fn? queries.
+         * The value keeps its case + any '=' (e.g. at$ssh=user@host). */
+        int fn = atoi(key + 1);                  /* "F12" -> 12 */
+        if (fn < 1 || fn > 12) { r_error(); return; }
+        macros_ensure();
+        if (val && eq) {
+            macro_set(fn - 1, val);
+            r_ok();
+        } else {
+            cdc_print("\r\n"); cdc_print(s_macro[fn - 1]); cdc_print("\r\n");
+            r_ok();
+        }
     } else if (!strcmp(key, "LOG")) {
         /* Dump the disk-log over CDC -- WiFi-independent diagnostics. */
         cdc_print("\r\n");
@@ -2482,6 +2504,54 @@ static void hist_down(void) {                    /* recall newer / back to live 
     else if (s_hist_view == 1){ s_hist_view = 0; s_cmd_len = 0; s_cmd_pos = 0; cmd_repaint(); }
 }
 
+/* ---- F-key macros ---- */
+static void macros_ensure(void) {                /* lazy-load the macro table from NVS */
+    nvs_handle_t h;
+    if (s_macro_loaded) return;
+    s_macro_loaded = true;
+    if (nvs_open("slip-router", NVS_READONLY, &h) != ESP_OK) return;
+    for (int i = 0; i < 12; i++) {
+        char k[8]; size_t n = MACRO_MAX;
+        snprintf(k, sizeof k, "mac%d", i);
+        if (nvs_get_str(h, k, s_macro[i], &n) != ESP_OK) s_macro[i][0] = '\0';
+    }
+    nvs_close(h);
+}
+static void macro_set(int idx, const char *str) {  /* store + persist macro idx (0..11) */
+    nvs_handle_t h;
+    macros_ensure();
+    snprintf(s_macro[idx], MACRO_MAX, "%s", str);
+    if (nvs_open("slip-router", NVS_READWRITE, &h) == ESP_OK) {
+        char k[8]; snprintf(k, sizeof k, "mac%d", idx);
+        nvs_set_str(h, k, s_macro[idx]); nvs_commit(h); nvs_close(h);
+    }
+}
+/* Fire macro idx in command mode: replace the line, show it, run it. */
+static void cmd_fire_macro(int idx) {
+    macros_ensure();
+    if (idx < 0 || idx >= 12 || !s_macro[idx][0]) return;
+    snprintf(s_cmd, CMD_LINE_MAX, "%s", s_macro[idx]);
+    s_cmd_len = (uint16_t)strlen(s_cmd);
+    s_cmd_pos = s_cmd_len;
+    cmd_repaint();                               /* show the expanded command */
+    if (s_echo) cdc_print("\r\n");
+    hist_push(s_cmd);
+    exec(s_cmd);
+    s_cmd_len = 0; s_cmd_pos = 0; s_hist_view = 0;
+}
+/* CSI tilde-form F-key (ESC[15~ .. ESC[24~) param -> macro index, or -1. */
+static int fkey_csi(const char *p) {
+    if (!strcmp(p, "15")) return 4;
+    if (!strcmp(p, "17")) return 5;
+    if (!strcmp(p, "18")) return 6;
+    if (!strcmp(p, "19")) return 7;
+    if (!strcmp(p, "20")) return 8;
+    if (!strcmp(p, "21")) return 9;
+    if (!strcmp(p, "23")) return 10;
+    if (!strcmp(p, "24")) return 11;
+    return -1;
+}
+
 /* ---- CDC RX callback (TinyUSB task context) ---- */
 
 static void on_cdc_rx(int itf, cdcacm_event_t *event) {
@@ -2592,10 +2662,14 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
                     case 'F': s_cmd_pos = s_cmd_len;  cmd_place(); break;                     /* End   */
                     case 'A': hist_up();   break;   /* Up   -> older command   */
                     case 'B': hist_down(); break;   /* Down -> newer / blank   */
+                    case 'P': cmd_fire_macro(0); break;   /* F1 (SS3) */
+                    case 'Q': cmd_fire_macro(1); break;   /* F2 */
+                    case 'R': cmd_fire_macro(2); break;   /* F3 */
+                    case 'S': cmd_fire_macro(3); break;   /* F4 */
                     case '~':
-                        if (s_cmd_eseq[0] == '3' && s_cmd_eseq[1] == '\0') cmd_delete();      /* Del   */
+                        if (s_cmd_eseq[0] == '3' && s_cmd_eseq[1] == '\0') cmd_delete();      /* Del */
+                        else { int fk = fkey_csi(s_cmd_eseq); if (fk >= 0) cmd_fire_macro(fk); } /* F5..F12 */
                         break;
-                    /* F-keys (macros) handled next commit */
                     default: break;
                 }
                 s_cmd_estate = 0;
