@@ -52,6 +52,17 @@ int ftp_pwd(char *out, size_t n);
  */
 int ftp_cwd(const char *dir);
 
+/** @brief Sink callback for streamed data (directory listings; later, file bodies). */
+typedef void (*ftp_sink_fn)(const uint8_t *data, size_t len);
+
+/**
+ * @brief List a directory: TYPE A + PASV + LIST, streaming the text to @p sink.
+ * @param path Directory/glob, or NULL/"" for the current directory.
+ * @param sink Called with each chunk of listing text (NULL to discard).
+ * @return The final FTP reply code (226 on success), or -1 on socket error.
+ */
+int ftp_list(const char *path, ftp_sink_fn sink);
+
 /** @brief Send QUIT (best-effort) and close the control connection. */
 void ftp_quit(void);
 

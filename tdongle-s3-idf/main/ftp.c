@@ -171,6 +171,71 @@ int ftp_cwd(const char *dir)
     }
 }
 
+/**
+ * @brief Enter passive mode and open the data socket to the server's PASV addr.
+ * @return The connected data socket fd, or -1 on failure.
+ */
+static int ftp_open_data(void)
+{
+    char resp[160];
+    int  code = ftp_command("PASV", resp, sizeof resp);
+    int  h0, h1, h2, h3, p0, p1;
+    char *p;
+    struct sockaddr_in sa;
+    int  ds;
+
+    if (code != 227) { disk_logf("ftp: PASV code=%d", code); return -1; }
+    p = strchr(resp, '(');
+    if (!p || sscanf(p + 1, "%d,%d,%d,%d,%d,%d", &h0, &h1, &h2, &h3, &p0, &p1) != 6) {
+        disk_logf("ftp: PASV parse fail"); return -1;
+    }
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family      = AF_INET;
+    sa.sin_port        = htons((uint16_t)(p0 * 256 + p1));
+    sa.sin_addr.s_addr = htonl(((uint32_t)h0 << 24) | ((uint32_t)h1 << 16) |
+                               ((uint32_t)h2 << 8)  |  (uint32_t)h3);
+    /* 0.0.0.0 means "reuse the control connection's server IP". */
+    if (sa.sin_addr.s_addr == 0) {
+        struct sockaddr_in pa; socklen_t pl = sizeof pa;
+        if (getpeername(s_ctrl, (struct sockaddr *)&pa, &pl) == 0) sa.sin_addr = pa.sin_addr;
+    }
+    ds = socket(AF_INET, SOCK_STREAM, 0);
+    if (ds < 0) return -1;
+    { struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
+      setsockopt(ds, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      setsockopt(ds, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
+    if (connect(ds, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        disk_logf("ftp: data connect fail"); close(ds); return -1;
+    }
+    return ds;
+}
+
+int ftp_list(const char *path, ftp_sink_fn sink)
+{
+    int ds, code;
+
+    ftp_command("TYPE A", NULL, 0);              /* ASCII for listings */
+    ds = ftp_open_data();
+    if (ds < 0) return -1;
+
+    {
+        char cmd[256];
+        if (path && *path) snprintf(cmd, sizeof cmd, "LIST %s", path);
+        else               snprintf(cmd, sizeof cmd, "LIST");
+        code = ftp_command(cmd, NULL, 0);        /* 150/125 = transfer starting */
+    }
+    if (code != 150 && code != 125) { close(ds); return code < 0 ? -1 : code; }
+
+    for (;;) {
+        uint8_t buf[256];
+        int n = recv(ds, buf, sizeof buf, 0);
+        if (n > 0) { if (sink) sink(buf, (size_t)n); }
+        else break;                              /* 0 = EOF, <0 = timeout/error */
+    }
+    close(ds);
+    return ftp_read_reply(NULL, 0);              /* final 226 */
+}
+
 void ftp_quit(void)
 {
     if (s_ctrl >= 0) ftp_command("QUIT", NULL, 0);   /* best-effort */

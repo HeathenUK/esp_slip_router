@@ -165,6 +165,7 @@ extern int  ftp_connect(const char *host, uint16_t port, const char *user, const
                         char *banner, size_t banner_len);
 extern int  ftp_pwd(char *out, size_t n);
 extern int  ftp_cwd(const char *dir);
+extern int  ftp_list(const char *path, void (*sink)(const uint8_t *, size_t));
 extern void ftp_quit(void);
 
 /* ---- transport abstraction (Phase 1) ----
@@ -1952,6 +1953,9 @@ static void ssh_spawn_worker(void) {
 
 static void ftp_prompt(void) { cdc_print("\r\nftp> "); }
 
+/* Stream sink for ftp_list(): dump directory-listing chunks straight to CDC. */
+static void ftp_cdc_sink(const uint8_t *d, size_t n) { cdc_write(d, n); }
+
 /* on_cdc_rx, while s_ftp_active: line-buffer the typed command (basic backspace
  * editing) and hand a completed line to the worker via s_ftp_q. */
 static void ftp_on_cdc_rx(const uint8_t *buf, size_t got) {
@@ -2014,9 +2018,15 @@ static void cmd_ftp_impl(void) {
         if (!*cmd) { ftp_prompt(); continue; }
         if (!strcmp(cmd, "bye") || !strcmp(cmd, "quit") || !strcmp(cmd, "exit")) break;
         if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
-            cdc_print("pwd  cd <dir>  cdup  bye\r\n"); ftp_prompt(); continue;
+            cdc_print("pwd  cd <dir>  cdup  ls [path]  bye\r\n"); ftp_prompt(); continue;
         }
-        if (!strcmp(cmd, "pwd")) {
+        if (!strcmp(cmd, "ls") || !strcmp(cmd, "dir")) {
+            int code;
+            cdc_print("\r\n");
+            code = ftp_list(arg, ftp_cdc_sink);
+            if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
+            if (code != 226 && code != 250) { char o[40]; snprintf(o, sizeof o, "(%d)\r\n", code); cdc_print(o); }
+        } else if (!strcmp(cmd, "pwd")) {
             char path[128]; int code = ftp_pwd(path, sizeof path);
             if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
             { char o[160]; snprintf(o, sizeof o, "%s\r\n", path[0] ? path : "(unknown)"); cdc_print(o); }
