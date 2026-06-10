@@ -18,9 +18,10 @@
  *   5. Exit when the session ends (the dongle prints NO CARRIER, e.g. after
  *      `bye`); Ctrl-C force-quits.
  *
- * Usage:  FTPGET [comN] [[user[:pass]@]host[:port]]
- *   With no host it just opens the link; type  AT$FTP=host  yourself, or use it
- *   as a thin FTP terminal. 8.3 local names: in the REPL use  get remote LOCAL.
+ * Usage:  FTPGET [comN] [[sftp://|ftp://][user[:pass]@]host[:port]]
+ *   Scheme picks the dial: sftp:// -> AT$SFTP (secure, over SSH), ftp:// or bare
+ *   -> AT$FTP. With no host it just opens the link; type AT$FTP=/AT$SFTP= yourself.
+ *   8.3 local names: in the REPL use  get remote LOCAL.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -270,7 +271,7 @@ int main(int argc, char **argv)
         if ((a[0]=='c'||a[0]=='C')&&(a[1]=='o'||a[1]=='O')&&(a[2]=='m'||a[2]=='M')&&
              a[3]>='1'&&a[3]<='4'&&a[4]=='\0') port_index = a[3]-'1';
         else if (a[0]=='-'&&(a[1]=='h'||a[1]=='H')) {
-            fprintf(stderr, "usage: FTPGET [comN] [[user[:pass]@]host[:port]]\n"); return 0;
+            fprintf(stderr, "usage: FTPGET [comN] [[sftp://|ftp://][user[:pass]@]host[:port]]\n"); return 0;
         } else if (!host) host = a;
     }
     if (port_index < 0) {
@@ -292,16 +293,21 @@ int main(int argc, char **argv)
     drain_rx((unsigned)port_index, 100);
 
     if (host) {
+        /* URL scheme picks the dongle dial: sftp:// -> AT$SFTP (secure, over SSH),
+         * ftp:// or bare -> AT$FTP. The OSC-5113 capture below is the same either way. */
         char dial[160];
-        snprintf(dial, sizeof dial, "AT$FTP=%s\r", host);
-        printf("         COM%d  AT$FTP=%s\n", port_index+1, host);
+        const char *verb = "AT$FTP", *h = host;
+        if      (!strncmp(h, "sftp://", 7)) { verb = "AT$SFTP"; h += 7; }
+        else if (!strncmp(h, "ftp://",  6)) { h += 6; }
+        snprintf(dial, sizeof dial, "%s=%s\r", verb, h);
+        printf("         COM%d  %s=%s\n", port_index+1, verb, h);
         fossil_send_str((unsigned)port_index, dial);
         if (!wait_for((unsigned)port_index, "CONNECT", 20000)) {
             fprintf(stderr, "FTPGET: no CONNECT (login failed / host down?).\n");
             return 3;
         }
     } else {
-        printf("         COM%d  (no host -- type AT$FTP=host yourself)\n", port_index+1);
+        printf("         COM%d  (no host -- type AT$FTP=host or AT$SFTP=... yourself)\n", port_index+1);
     }
     printf("         --- interactive (bye to quit, Ctrl-C to force) ---\n");
 
