@@ -179,11 +179,23 @@ static unsigned long dl_start = 0UL;   /* bios_ticks() when the capture began */
 static unsigned nc_match = 0;        /* "NO CARRIER" matcher */
 static int   g_done = 0;
 
+static unsigned pw_match = 0;        /* "Password:" matcher */
+static int   g_pw_mode = 0;          /* mask local echo while the dongle prompts */
+
 static void watch_no_carrier(unsigned char c)
 {
     static const char nc[] = "NO CARRIER";
     if (c == (unsigned char)nc[nc_match]) { if (nc[++nc_match] == '\0') { g_done = 1; nc_match = 0; } }
     else nc_match = (c == (unsigned char)nc[0]) ? 1u : 0u;
+}
+
+/* The dongle prints "Password: " when AT$SFTP/AT$SSH was dialed with a username
+ * but no password. Arm password-masking so the user's keystrokes echo as '*'. */
+static void watch_password(unsigned char c)
+{
+    static const char pw[] = "Password:";
+    if (c == (unsigned char)pw[pw_match]) { if (pw[++pw_match] == '\0') { g_pw_mode = 1; pw_match = 0; } }
+    else pw_match = (c == (unsigned char)pw[0]) ? 1u : 0u;
 }
 
 static void dispatch_osc(void)
@@ -246,6 +258,7 @@ static void feed(unsigned char c)
     case 0:
         if (c == 0x1BU) { ostate = 1; return; }
         watch_no_carrier(c);
+        watch_password(c);
         con_out(c);
         return;
     case 1:
@@ -358,10 +371,10 @@ int main(int argc, char **argv)
         snprintf(dial, sizeof dial, "%s=%s\r", verb, h);
         printf("         COM%d  %s=%s\n", port_index+1, verb, h);
         fossil_send_str((unsigned)port_index, dial);
-        if (!wait_for((unsigned)port_index, "CONNECT", 20000)) {
-            fprintf(stderr, "FTPGET: no CONNECT (login failed / host down?).\n");
-            return 3;
-        }
+        /* No blocking wait_for("CONNECT"): the relay loop below displays whatever
+         * the dongle sends -- CONNECT on success, "Password:" if it needs one
+         * (username-only sftp://), or "NO CARRIER" on failure (-> g_done). This
+         * lets the password prompt show and the keyboard flow through. */
     } else {
         printf("         COM%d  (no host -- type AT$FTP=host or AT$SFTP=... yourself)\n", port_index+1);
     }
@@ -380,11 +393,12 @@ int main(int argc, char **argv)
                 g_line[g_linelen] = 0;
                 handle_line((unsigned)port_index, g_line);
                 g_linelen = 0;
+                g_pw_mode = 0;                         /* password line submitted */
             } else if (k == 8 || k == 127) {          /* backspace */
                 if (g_linelen) { --g_linelen; con_putc(8); con_putc(' '); con_putc(8); }
             } else if (k >= 0x20 && g_linelen < (int)sizeof g_line - 1) {
                 g_line[g_linelen++] = (char)k;
-                con_putc((unsigned char)k);           /* local echo (dongle echo is off) */
+                con_putc(g_pw_mode ? '*' : (unsigned char)k);   /* mask password echo */
             }
         }
         if (!r) dos_yield();

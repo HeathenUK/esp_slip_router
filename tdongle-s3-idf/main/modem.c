@@ -484,6 +484,7 @@ static char          s_ssh_term[32] = "xterm-256color";
  * s_ssh_pass, then spawns the worker. */
 static volatile bool s_ssh_pw_capture = false;
 static uint16_t      s_ssh_pw_len = 0;
+static bool          s_pw_is_sftp = false;   /* password prompt targets AT$SFTP, not AT$SSH */
 
 /* AT$FTP (Phase 1: control connection + nav REPL). Staged like the SSH args.
  * Unlike SSH, the FTP session is NOT a transparent relay: the worker runs a
@@ -2722,6 +2723,7 @@ static void handle_dollar(char *s) {
         /* No password -- prompt and capture it with echo suppressed (like a
          * normal ssh client). on_cdc_rx reads the line and spawns the worker. */
         s_ssh_pass[0] = 0; s_ssh_pw_len = 0;
+        s_pw_is_sftp = false;
         s_ssh_pw_capture = true;
         cdc_print("\r\nPassword: ");
         return;
@@ -2740,10 +2742,19 @@ static void handle_dollar(char *s) {
         { char *c2 = strrchr(host, ':'); if (c2) { *c2 = 0; int pn = atoi(c2 + 1); if (pn > 0 && pn < 65536) sp = (uint16_t)pn; } }
         if (!*host || !*user) { r_error(); return; }
         strncpy(s_ssh_user, user, sizeof s_ssh_user - 1); s_ssh_user[sizeof s_ssh_user - 1] = 0;
-        strncpy(s_ssh_pass, pass, sizeof s_ssh_pass - 1); s_ssh_pass[sizeof s_ssh_pass - 1] = 0;
         strncpy(s_ssh_host, host, sizeof s_ssh_host - 1); s_ssh_host[sizeof s_ssh_host - 1] = 0;
         s_ssh_port = sp;
-        sftp_spawn_worker();
+        if (*pass) {
+            strncpy(s_ssh_pass, pass, sizeof s_ssh_pass - 1); s_ssh_pass[sizeof s_ssh_pass - 1] = 0;
+            sftp_spawn_worker();
+            return;
+        }
+        /* No password -- prompt + capture raw (handles spaces/specials), then
+         * spawn the SFTP worker (s_pw_is_sftp routes the shared capture). */
+        s_ssh_pass[0] = 0; s_ssh_pw_len = 0;
+        s_pw_is_sftp = true;
+        s_ssh_pw_capture = true;
+        cdc_print("\r\nPassword: ");
         return;
     } else if (!strcmp(key, "FTP") && val && eq) {
         /* AT$FTP=[user[:pass]@]host[:port] -- interactive FTP navigation session.
@@ -3116,7 +3127,8 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
                 s_ssh_pass[s_ssh_pw_len] = 0;
                 s_ssh_pw_capture = false;
                 cdc_print("\r\n");
-                ssh_spawn_worker();
+                if (s_pw_is_sftp) sftp_spawn_worker();
+                else              ssh_spawn_worker();
                 return;
             }
             if (b == 0x08 || b == 0x7F) { if (s_ssh_pw_len) s_ssh_pw_len--; continue; }
