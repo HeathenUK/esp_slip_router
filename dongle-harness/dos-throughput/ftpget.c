@@ -154,6 +154,15 @@ static void con_putc(unsigned char c)
 {
     union REGS r; r.h.ah = 0x02U; r.h.dl = c; int86(0x21, &r, &r);
 }
+/* Display output with lone-LF -> CRLF. DOS AH=02h moves the cursor DOWN on LF
+ * but doesn't return to column 0, so text with bare '\n' (the FTP greeting, or
+ * a server's LF-only listing) staircases. Emit CR before every LF; a real CRLF
+ * just gets a harmless extra CR (cursor is already at column 0). */
+static void con_out(unsigned char c)
+{
+    if (c == 0x0AU) con_putc(0x0DU);
+    con_putc(c);
+}
 
 /* ---- OSC 5113 download capture + NO CARRIER watch ---- */
 static int   ostate = 0;            /* 0=normal, 1=after-ESC, 2=in-OSC */
@@ -206,11 +215,11 @@ static void feed(unsigned char c)
     case 0:
         if (c == 0x1BU) { ostate = 1; return; }
         watch_no_carrier(c);
-        con_putc(c);
+        con_out(c);
         return;
     case 1:
         if (c == ']') { ostate = 2; osclen = 0; return; }
-        con_putc(0x1BU); con_putc(c); ostate = 0; return;   /* pass other escapes */
+        con_putc(0x1BU); con_out(c); ostate = 0; return;   /* pass other escapes */
     case 2:
         if (c == 0x07U) { dispatch_osc(); ostate = 0; return; }   /* BEL = end OSC */
         if (osclen < sizeof oscbuf - 1) oscbuf[osclen++] = (char)c;
