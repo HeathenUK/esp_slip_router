@@ -63,6 +63,7 @@ cp "$CRTMM" ./crtmm.lib
 build_one throughput.c
 build_one httpget.c
 build_one wget.c
+build_one ftpget.c
 build_one timer.c
 build_one magicout.c
 build_one atq.c
