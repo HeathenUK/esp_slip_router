@@ -55,6 +55,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
+#include "freertos/queue.h"
 
 #include "disk.h"   /* disk_logf */
 #include "slip.h"
@@ -157,6 +158,14 @@ extern int  ssh_connect(const char *user, const char *pass, const char *host, ui
 extern int  ssh_read(void *buf, size_t len);
 extern int  ssh_write(const void *buf, size_t len);
 extern void ssh_close(void);
+
+/* FTP client engine (ftp.c). Plaintext control connection + nav verbs; the
+ * interactive REPL lives in this file. */
+extern int  ftp_connect(const char *host, uint16_t port, const char *user, const char *pass,
+                        char *banner, size_t banner_len);
+extern int  ftp_pwd(char *out, size_t n);
+extern int  ftp_cwd(const char *dir);
+extern void ftp_quit(void);
 
 /* ---- transport abstraction (Phase 1) ----
  * The relay's PAYLOAD I/O goes through xport_read/xport_write/xport_close so the
@@ -447,6 +456,21 @@ static char          s_ssh_term[32] = "xterm-256color";
  * s_ssh_pass, then spawns the worker. */
 static volatile bool s_ssh_pw_capture = false;
 static uint16_t      s_ssh_pw_len = 0;
+
+/* AT$FTP (Phase 1: control connection + nav REPL). Staged like the SSH args.
+ * Unlike SSH, the FTP session is NOT a transparent relay: the worker runs a
+ * command interpreter (pwd/cd/cdup/bye), so s_online stays false and CDC input
+ * is line-buffered here and handed to the worker via s_ftp_q. */
+#define FTP_LINE_MAX 128
+static char          s_ftp_user[48];
+static char          s_ftp_pass[96];
+static char          s_ftp_host[96];
+static uint16_t      s_ftp_port = 21;
+static volatile bool s_ftp_active = false;     /* a FTP REPL session is live */
+static bool          s_ftp_quiesced = false;   /* did this session quiesce httpd? */
+static QueueHandle_t s_ftp_q = NULL;           /* completed user lines -> worker */
+static char          s_ftp_line[FTP_LINE_MAX]; /* line being typed (on_cdc_rx ctx) */
+static uint16_t      s_ftp_line_len = 0;
 static inline bool bget(uint8_t *a, uint8_t o) { return a[o >> 3] & (1 << (o & 7)); }
 static inline void bset(uint8_t *a, uint8_t o) { a[o >> 3] |=  (1 << (o & 7)); }
 static inline void bclr(uint8_t *a, uint8_t o) { a[o >> 3] &= ~(1 << (o & 7)); }
@@ -1919,6 +1943,123 @@ static void ssh_spawn_worker(void) {
     }
 }
 
+/* ---- AT$FTP: interactive FTP navigation over CDC (Phase 1) ----
+ * NOT a transparent relay -- a command interpreter. The worker connects + logs
+ * in, then loops on s_ftp_q (lines from on_cdc_rx) running pwd/cd/cdup/bye on the
+ * FTP control socket and printing the replies. s_online stays false (no pumps);
+ * the control socket is owned by ftp.c (s_ctrl), separate from the relay's s_sock.
+ * PASV data transfers (ls/get) arrive in later phases. */
+
+static void ftp_prompt(void) { cdc_print("\r\nftp> "); }
+
+/* on_cdc_rx, while s_ftp_active: line-buffer the typed command (basic backspace
+ * editing) and hand a completed line to the worker via s_ftp_q. */
+static void ftp_on_cdc_rx(const uint8_t *buf, size_t got) {
+    for (size_t i = 0; i < got; ++i) {
+        uint8_t b = buf[i];
+        if (b == '\r' || b == '\n') {
+            if (s_echo) cdc_print("\r\n");
+            s_ftp_line[s_ftp_line_len] = '\0';
+            if (s_ftp_q) xQueueSend(s_ftp_q, s_ftp_line, 0);
+            s_ftp_line_len = 0;
+        } else if (b == 0x08 || b == 0x7F) {
+            if (s_ftp_line_len) { s_ftp_line_len--; if (s_echo) cdc_print("\b \b"); }
+        } else if (b >= 0x20 && s_ftp_line_len < FTP_LINE_MAX - 1) {
+            s_ftp_line[s_ftp_line_len++] = (char)b;
+            if (s_echo) cdc_byte(b);
+        }
+    }
+}
+
+static void cmd_ftp_impl(void) {
+    char banner[160];
+    char line[FTP_LINE_MAX];
+    int  fd;
+
+    /* Hang up any lingering relay/SSH session first (leak-safety, as SSH does). */
+    if (s_sock >= 0) { s_online = false; vTaskDelay(pdMS_TO_TICKS(20)); xport_close(); s_peer[0] = 0; }
+
+    { wifi_ap_record_t ap; if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) { r_nocarrier(); return; } }
+
+    /* Conditional quiesce: FTP is plaintext + Phase 1 is one socket, so only free
+     * httpd if heap is genuinely tight. (Tighten when the PASV data socket lands.) */
+    s_ftp_quiesced = false;
+    if (esp_get_free_heap_size() < 24 * 1024) { app_secure_quiesce(true); s_ftp_quiesced = true; }
+    disk_logf("ftp: dial %s:%u quiesce=%d free=%u", s_ftp_host, (unsigned)s_ftp_port,
+              s_ftp_quiesced, (unsigned)esp_get_free_heap_size());
+
+    fd = ftp_connect(s_ftp_host, s_ftp_port, s_ftp_user, s_ftp_pass, banner, sizeof banner);
+    if (fd < 0) { if (s_ftp_quiesced) app_secure_quiesce(false); r_nocarrier(); return; }
+
+    if (!s_ftp_q) s_ftp_q = xQueueCreate(4, FTP_LINE_MAX);
+    s_ftp_line_len = 0;
+    snprintf(s_peer, sizeof s_peer, "ftp:%.32s@%.48s:%u",
+             (s_ftp_user[0] ? s_ftp_user : "anonymous"), s_ftp_host, (unsigned)s_ftp_port);
+    s_ftp_active = true;
+
+    r_connect();
+    cdc_print("\r\n"); if (banner[0]) cdc_print(banner);
+    cdc_print("Commands: pwd  cd <dir>  cdup  bye\r\n");
+    ftp_prompt();
+
+    for (;;) {
+        char *cmd, *arg, *p;
+        if (!s_ftp_q || xQueueReceive(s_ftp_q, line, portMAX_DELAY) != pdTRUE) continue;
+
+        cmd = line; while (*cmd == ' ') cmd++;
+        { char *sp = strchr(cmd, ' ');
+          if (sp) { *sp = '\0'; arg = sp + 1; while (*arg == ' ') arg++; } else arg = (char *)""; }
+        for (p = cmd; *p; ++p) if (*p >= 'A' && *p <= 'Z') *p += 32;   /* verb -> lower */
+
+        if (!*cmd) { ftp_prompt(); continue; }
+        if (!strcmp(cmd, "bye") || !strcmp(cmd, "quit") || !strcmp(cmd, "exit")) break;
+        if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
+            cdc_print("pwd  cd <dir>  cdup  bye\r\n"); ftp_prompt(); continue;
+        }
+        if (!strcmp(cmd, "pwd")) {
+            char path[128]; int code = ftp_pwd(path, sizeof path);
+            if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
+            { char o[160]; snprintf(o, sizeof o, "%s\r\n", path[0] ? path : "(unknown)"); cdc_print(o); }
+        } else if (!strcmp(cmd, "cd") || !strcmp(cmd, "cwd")) {
+            int code = ftp_cwd(arg);
+            if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
+            { char o[40]; snprintf(o, sizeof o, "%d\r\n", code); cdc_print(o); }
+        } else if (!strcmp(cmd, "cdup") || !strcmp(cmd, "..")) {
+            int code = ftp_cwd("..");
+            if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
+            { char o[40]; snprintf(o, sizeof o, "%d\r\n", code); cdc_print(o); }
+        } else {
+            cdc_print("?Unknown (pwd/cd/cdup/bye)\r\n");
+        }
+        ftp_prompt();
+    }
+
+    /* Teardown. */
+    s_ftp_active = false;
+    ftp_quit();
+    if (s_ftp_quiesced) app_secure_quiesce(false);
+    s_peer[0] = 0;
+    r_nocarrier();
+}
+
+static void cmd_ftp_task_fn(void *arg) {
+    (void)arg;
+    cmd_ftp_impl();
+    s_at_busy = false;
+    s_dial_task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* 8 KB stack: plaintext FTP -- no libssh2/crypto. getaddrinfo + small reply
+ * buffers fit comfortably. CPU0, off the TinyUSB core. */
+static void ftp_spawn_worker(void) {
+    s_at_busy = true;
+    if (xTaskCreatePinnedToCore(cmd_ftp_task_fn, "at_ftp", 8192, NULL, 15,
+                                &s_dial_task, 0) != pdPASS) {
+        s_at_busy = false; s_dial_task = NULL; r_error();
+    }
+}
+
 /* Thin synchronous wrapper called from exec(). Does the cheap syntax
  * checks inline (so a malformed ATD gets an immediate ERROR) and then
  * hands off to cmd_dial_task_fn for the slow work. */
@@ -2326,6 +2467,40 @@ static void handle_dollar(char *s) {
         s_ssh_pw_capture = true;
         cdc_print("\r\nPassword: ");
         return;
+    } else if (!strcmp(key, "FTP") && val && eq) {
+        /* AT$FTP=[user[:pass]@]host[:port] -- interactive FTP navigation session.
+         * The dongle terminates FTP; pwd/cd/cdup/bye run over CDC (NOT a relay).
+         * No '@' -> anonymous login. Phase 1: control + navigation (ls/get land
+         * in later phases). Comma form (user,pass,host[,port]) for '@'-less keys. */
+        if (s_at_busy || s_dial_task) { disk_logf("ftp: BUSY"); r_error(); return; }
+        char tmp[200];
+        strncpy(tmp, val, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
+        char *user = (char *)"", *pass = (char *)"", *host = tmp; uint16_t fport = 21;
+        char *at = strrchr(tmp, '@');
+        if (at) {
+            *at = 0; user = tmp;
+            char *c1 = strchr(tmp, ':'); if (c1) { *c1 = 0; pass = c1 + 1; }
+            host = at + 1;
+        } else if (strchr(tmp, ',')) {
+            char *f1 = tmp;
+            char *f2 = strchr(f1, ','); if (f2) *f2++ = 0;
+            char *f3 = f2 ? strchr(f2, ',') : NULL; if (f3) *f3++ = 0;
+            char *f4 = f3 ? strchr(f3, ',') : NULL; if (f4) *f4++ = 0;
+            user = f1;
+            if (f3) { pass = f2; host = f3;
+                      if (f4) { int pn = atoi(f4); if (pn > 0 && pn < 65536) fport = (uint16_t)pn; } }
+            else    { host = f2; }
+        }
+        /* :port on the host side (works for the '@' and bare-host forms). */
+        { char *c2 = strrchr(host, ':');
+          if (c2) { *c2 = 0; int pn = atoi(c2 + 1); if (pn > 0 && pn < 65536) fport = (uint16_t)pn; } }
+        if (!host || !*host) { r_error(); return; }
+        strncpy(s_ftp_user, user, sizeof s_ftp_user - 1); s_ftp_user[sizeof s_ftp_user - 1] = 0;
+        strncpy(s_ftp_pass, pass, sizeof s_ftp_pass - 1); s_ftp_pass[sizeof s_ftp_pass - 1] = 0;
+        strncpy(s_ftp_host, host, sizeof s_ftp_host - 1); s_ftp_host[sizeof s_ftp_host - 1] = 0;
+        s_ftp_port = fport;
+        ftp_spawn_worker();
+        return;
     } else if (!strcmp(key, "HELP")) {
         cdc_print(
             "\r\n"
@@ -2703,6 +2878,13 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
      * de-framer; nothing else touches them. */
     if (slip_get_mode() == MODE_SLIP) {
         slip_feed(buf, got);
+        return;
+    }
+
+    /* AT$FTP session: a command interpreter, not a relay (s_online stays false).
+     * Line-buffer the typed command and hand it to the FTP worker via s_ftp_q. */
+    if (s_ftp_active) {
+        ftp_on_cdc_rx(buf, got);
         return;
     }
 
