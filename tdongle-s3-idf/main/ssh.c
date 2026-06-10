@@ -425,3 +425,37 @@ int sftp_rename(const char *oldn, const char *newn)
     sftp_abspath(newn, pn, sizeof pn);
     return libssh2_sftp_rename(s_sftp, po, pn) == 0 ? 0 : -1;
 }
+
+/* ---- upload (SFTP write) ---- */
+static LIBSSH2_SFTP_HANDLE *s_sftp_wh = NULL;
+
+int sftp_put_open(const char *remote)
+{
+    char p[256];
+    if (!s_sftp) return -1;
+    sftp_abspath(remote, p, sizeof p);
+    s_sftp_wh = libssh2_sftp_open(s_sftp, p,
+                    LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC, 0644);
+    return s_sftp_wh ? 0 : -1;
+}
+
+int sftp_put_write(const void *buf, size_t n)
+{
+    const char *p = buf;
+    size_t off = 0;
+    if (!s_sftp_wh) return -1;
+    while (off < n) {
+        ssize_t w = libssh2_sftp_write(s_sftp_wh, p + off, n - off);
+        if (w > 0) off += (size_t)w;
+        else if (w == LIBSSH2_ERROR_EAGAIN) continue;   /* blocking session: rare */
+        else return -1;
+    }
+    return 0;
+}
+
+int sftp_put_close(void)
+{
+    int rc = 0;
+    if (s_sftp_wh) { rc = libssh2_sftp_close(s_sftp_wh); s_sftp_wh = NULL; }
+    return rc == 0 ? 0 : -1;
+}

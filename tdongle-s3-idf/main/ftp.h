@@ -86,6 +86,13 @@ int ftp_del(const char *file);
 /** @brief RNFR <old> + RNTO <new>.  @return final reply code (250 ok) or -1. */
 int ftp_rename(const char *oldn, const char *newn);
 
+/** @brief Begin an upload: TYPE I + PASV + STOR <remote>.  @return 0 ok, else -1/code. */
+int ftp_stor_open(const char *remote);
+/** @brief Write a chunk to the open STOR data socket.  @return 0 ok, -1 error. */
+int ftp_stor_write(const void *buf, size_t n);
+/** @brief Close the STOR data socket + read the final reply.  @return reply code or -1. */
+int ftp_stor_close(void);
+
 /** @brief Send QUIT (best-effort) and close the control connection. */
 void ftp_quit(void);
 

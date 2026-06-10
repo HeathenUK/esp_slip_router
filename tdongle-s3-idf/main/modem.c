@@ -172,6 +172,9 @@ extern int  sftp_mkdir(const char *dir);
 extern int  sftp_rmdir(const char *dir);
 extern int  sftp_del(const char *file);
 extern int  sftp_rename(const char *oldn, const char *newn);
+extern int  sftp_put_open(const char *remote);
+extern int  sftp_put_write(const void *buf, size_t n);
+extern int  sftp_put_close(void);
 extern void sftp_quit(void);
 
 /* FTP client engine (ftp.c). Plaintext control connection + nav verbs; the
@@ -187,6 +190,9 @@ extern int  ftp_mkdir(const char *dir);
 extern int  ftp_rmdir(const char *dir);
 extern int  ftp_del(const char *file);
 extern int  ftp_rename(const char *oldn, const char *newn);
+extern int  ftp_stor_open(const char *remote);
+extern int  ftp_stor_write(const void *buf, size_t n);
+extern int  ftp_stor_close(void);
 extern void ftp_quit(void);
 
 /* ---- transport abstraction (Phase 1) ----
@@ -488,7 +494,9 @@ static char          s_ftp_user[48];
 static char          s_ftp_pass[96];
 static char          s_ftp_host[96];
 static uint16_t      s_ftp_port = 21;
-static volatile bool s_ftp_active = false;     /* a FTP REPL session is live */
+static volatile bool s_ftp_active = false;     /* a FTP/SFTP REPL session is live */
+static volatile bool s_ftp_uploading = false;  /* put: route raw CDC -> s_to_tcp */
+static volatile long s_ftp_up_remaining = 0;   /* put: bytes still to accept from CDC */
 static bool          s_ftp_quiesced = false;   /* did this session quiesce httpd? */
 static QueueHandle_t s_ftp_q = NULL;           /* completed user lines -> worker */
 static char          s_ftp_line[FTP_LINE_MAX]; /* line being typed (on_cdc_rx ctx) */
@@ -1969,6 +1977,7 @@ static void ssh_spawn_worker(void) {
 static void ftp_prompt(void);
 static void ftp_cdc_sink(const uint8_t *d, size_t n);
 static void ftp_get_sink(const uint8_t *d, size_t n);
+static int  ftp_recv_upload(long size, int (*wr)(const void *, size_t));
 static long s_ftp_get_remaining;
 
 /* ---- AT$SFTP: interactive SFTP nav over CDC (Phase 1, mirrors AT$FTP) ----
@@ -2051,8 +2060,23 @@ static void cmd_sftp_impl(void) {
             if (!a2) cdc_print("usage: ren <old> <new>\r\n");
             else { *a2 = 0; a2++; while (*a2 == ' ') a2++;
                    cdc_print(sftp_rename(arg, a2) == 0 ? "ok\r\n" : "failed\r\n"); }
+        } else if (!strcmp(cmd, "put")) {
+            /* ftpget sends "put <remote> <size>" then streams <size> raw bytes
+             * (after our [GO]); we sftp_write them. */
+            char *sp2 = strrchr(arg, ' ');
+            long size; int rc;
+            if (!*arg || !sp2) { cdc_print("put: need <remote> <size>\r\n"); ftp_prompt(); continue; }
+            *sp2 = 0; size = atol(sp2 + 1); if (size < 0) size = 0;
+            if (sftp_put_open(arg) != 0) { cdc_print("put: open failed\r\n"); ftp_prompt(); continue; }
+            xStreamBufferReset(s_to_tcp);
+            s_ftp_up_remaining = size; s_ftp_uploading = true;
+            cdc_print("[GO]");
+            rc = ftp_recv_upload(size, sftp_put_write);
+            s_ftp_uploading = false; s_ftp_up_remaining = 0;
+            sftp_put_close();
+            { char o[96]; snprintf(o, sizeof o, "\r\nput %s (%ld) -> %s\r\n", arg, size, rc == 0 ? "ok" : "err"); cdc_print(o); }
         } else {
-            cdc_print("?Unknown (pwd/cd/cdup/ls/get/mkdir/rmdir/del/ren/bye)\r\n");
+            cdc_print("?Unknown (pwd/cd/cdup/ls/get/put/mkdir/rmdir/del/ren/bye)\r\n");
         }
         ftp_prompt();
     }
@@ -2101,9 +2125,34 @@ static void ftp_get_sink(const uint8_t *d, size_t n) {
     s_ftp_get_remaining -= (long)take;
 }
 
-/* on_cdc_rx, while s_ftp_active: line-buffer the typed command (basic backspace
- * editing) and hand a completed line to the worker via s_ftp_q. */
+/* Drain the put upload from s_to_cdc's sibling buffer (s_to_tcp) and feed each
+ * chunk to the protocol writer until `size` bytes are written. on_cdc_rx pushes
+ * the raw bytes into s_to_tcp while s_ftp_uploading. Returns 0 ok, -1 on a write
+ * failure or a 15s stall (DOS stopped sending). */
+static int ftp_recv_upload(long size, int (*wr)(const void *, size_t)) {
+    long done = 0;
+    while (done < size) {
+        uint8_t chunk[512];
+        size_t n = xStreamBufferReceive(s_to_tcp, chunk, sizeof chunk, pdMS_TO_TICKS(15000));
+        if (n == 0) return -1;                  /* stalled */
+        if (wr(chunk, n) != 0) return -1;        /* server write failed */
+        done += (long)n;
+    }
+    return 0;
+}
+
+/* on_cdc_rx, while s_ftp_active: in upload mode route raw bytes to s_to_tcp (the
+ * put worker drains them); otherwise line-buffer the typed command and hand a
+ * completed line to the worker via s_ftp_q (basic backspace editing). */
 static void ftp_on_cdc_rx(const uint8_t *buf, size_t got) {
+    if (s_ftp_uploading) {
+        size_t take = ((long)got > s_ftp_up_remaining) ? (size_t)s_ftp_up_remaining : got;
+        if (take && s_to_tcp) xStreamBufferSend(s_to_tcp, buf, take, pdMS_TO_TICKS(500));
+        s_ftp_up_remaining -= (long)take;
+        if (s_ftp_up_remaining <= 0) s_ftp_uploading = false;
+        if (got <= take) return;                 /* all consumed by the upload */
+        buf += take; got -= take;                /* leftover -> normal line handling */
+    }
     for (size_t i = 0; i < got; ++i) {
         uint8_t b = buf[i];
         if (b == '\r' || b == '\n') {
@@ -2221,8 +2270,24 @@ static void cmd_ftp_impl(void) {
                    code = ftp_rename(arg, a2);
                    if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
                    cdc_print(code / 100 == 2 ? "ok\r\n" : "failed\r\n"); }
+        } else if (!strcmp(cmd, "put")) {
+            /* ftpget sends "put <remote> <size>" then streams <size> raw bytes
+             * (after our [GO]); we STOR them to the server. */
+            char *sp2 = strrchr(arg, ' ');
+            long size; int rc, c2;
+            if (!*arg || !sp2) { cdc_print("put: need <remote> <size>\r\n"); ftp_prompt(); continue; }
+            *sp2 = 0; size = atol(sp2 + 1); if (size < 0) size = 0;
+            if (ftp_stor_open(arg) != 0) { cdc_print("put: STOR failed\r\n"); ftp_prompt(); continue; }
+            xStreamBufferReset(s_to_tcp);
+            s_ftp_up_remaining = size; s_ftp_uploading = true;
+            cdc_print("[GO]");
+            rc = ftp_recv_upload(size, ftp_stor_write);
+            s_ftp_uploading = false; s_ftp_up_remaining = 0;
+            c2 = ftp_stor_close();
+            { char o[96]; snprintf(o, sizeof o, "\r\nput %s (%ld) -> %s\r\n", arg, size,
+                                   (rc == 0 && c2 / 100 == 2) ? "ok" : "err"); cdc_print(o); }
         } else {
-            cdc_print("?Unknown (pwd/cd/cdup/ls/get/mkdir/rmdir/del/ren/bye)\r\n");
+            cdc_print("?Unknown (pwd/cd/cdup/ls/get/put/mkdir/rmdir/del/ren/bye)\r\n");
         }
         ftp_prompt();
     }

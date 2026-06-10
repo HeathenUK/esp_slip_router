@@ -7,14 +7,15 @@
  *
  *   1. Probe FOSSIL on COMn (CHUSB provides INT 14h); ensure the dongle is in
  *      MODEM mode (AT probe, SLIP->MODEM escape frame if needed).
- *   2. ATE1 (so the REPL echoes our typing), then AT$FTP=<host> to open the
- *      interactive session; wait for CONNECT.
- *   3. Relay: keyboard -> serial, serial -> screen, so you `pwd`/`cd`/`ls`/`get`
- *      exactly as the dongle's REPL presents it.
- *   4. On a download the dongle frames the body as  ESC ] 5113 ; <size> ; <name>
- *      BEL  followed by exactly <size> raw bytes; we capture those bytes to
- *      <name> in the current DOS dir instead of printing them (length-prefixed,
- *      so binary-clean and no escaping). The dongle sends exactly <size> bytes.
+ *   2. ATE0 (dongle echo off -- we local-echo, line mode), then AT$FTP=/AT$SFTP=
+ *      <host> to open the interactive session; wait for CONNECT.
+ *   3. Line mode: keyboard -> local line buffer (local echo); on Enter the whole
+ *      line relays to the dongle's REPL -- EXCEPT `put`, which we handle locally
+ *      (the local file is DOS-side). serial -> screen shows the REPL.
+ *   4. On `get` the dongle frames the body as  ESC ] 5113 ; <size> ; <name> BEL
+ *      + exactly <size> raw bytes; we capture those to <name> in the DOS cwd
+ *      (length-prefixed, binary-clean). On `put` we send "put <remote> <size>",
+ *      wait the dongle's [GO], then stream the local file up (it STOR/writes it).
  *   5. Exit when the session ends (the dongle prints NO CARRIER, e.g. after
  *      `bye`); Ctrl-C force-quits.
  *
@@ -257,6 +258,61 @@ static void feed(unsigned char c)
     }
 }
 
+/* ---- line-mode input + put intercept ---- */
+static char g_line[256];
+static int  g_linelen = 0;
+
+/* Upload a local DOS file: tell the dongle "put <remote> <size>", wait its [GO],
+ * then stream the body. The dongle (AT$FTP or AT$SFTP) STOR/writes it; its result
+ * line comes back through the main loop's feed(). */
+static void do_put(unsigned port, const char *localfile, const char *remote)
+{
+    FILE         *f;
+    long          size, sent = 0;
+    unsigned char b[512];
+    size_t        nr;
+    char          cmd[200];
+
+    f = fopen(localfile, "rb");
+    if (!f) { con_str("\r\nput: cannot open "); con_str(localfile); con_str("\r\n"); return; }
+    fseek(f, 0L, SEEK_END); size = ftell(f); fseek(f, 0L, SEEK_SET);
+    if (size < 0) { fclose(f); con_str("\r\nput: bad size\r\n"); return; }
+    snprintf(cmd, sizeof cmd, "put %s %ld\r", remote, size);
+    fossil_send_str(port, cmd);
+    if (!wait_for(port, "[GO]", 15000)) { fclose(f); con_str("\r\nput: dongle not ready\r\n"); return; }
+    while ((nr = fread(b, 1, sizeof b, f)) > 0) {
+        size_t i;
+        for (i = 0; i < nr; ++i) fossil_send(port, b[i]);
+        sent += (long)nr;
+        { char pl[48]; snprintf(pl, sizeof pl, "\r  put %ld / %ld  ", sent, size); con_str(pl); }
+    }
+    fclose(f);
+    con_str("\r\n");   /* result line ("put ... -> ok") arrives via feed() */
+}
+
+/* A completed input line: intercept "put <local> [remote]" locally; relay all
+ * else to the dongle's REPL verbatim. */
+static void handle_line(unsigned port, char *line)
+{
+    char *p = line;
+    while (*p == ' ') ++p;
+    if ((p[0]=='p'||p[0]=='P') && (p[1]=='u'||p[1]=='U') && (p[2]=='t'||p[2]=='T') &&
+        (p[3]==' ' || p[3]=='\0')) {
+        char *a = p + 3, *local, *remote, *sp, *bs;
+        while (*a == ' ') ++a;
+        local = a;
+        sp = strchr(a, ' ');
+        if (sp) { *sp = 0; remote = sp + 1; while (*remote == ' ') ++remote; }
+        else { char *fs = strrchr(local, '/'); bs = strrchr(local, '\\');
+               if (bs && bs > fs) fs = bs; remote = fs ? fs + 1 : local; }
+        if (!*local) { con_str("usage: put <localfile> [remote]\r\n"); return; }
+        do_put(port, local, remote);
+        return;
+    }
+    fossil_send_str(port, line);
+    fossil_send(port, '\r');
+}
+
 int main(int argc, char **argv)
 {
     int port_index = -1;
@@ -288,7 +344,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "FTPGET: dongle not responding to AT.\n"); return 2;
     }
     drain_rx((unsigned)port_index, 100);
-    fossil_send_str((unsigned)port_index, "ATE1\r");    /* echo on for the REPL */
+    fossil_send_str((unsigned)port_index, "ATE0\r");    /* echo OFF -- ftpget local-echoes (line mode) */
     wait_ms(150);
     drain_rx((unsigned)port_index, 100);
 
@@ -319,7 +375,17 @@ int main(int argc, char **argv)
         if (kbhit()) {
             int k = getch();
             if (k == 0) { (void)getch(); }            /* extended key -- ignore */
-            else fossil_send((unsigned)port_index, (unsigned char)k);
+            else if (k == '\r' || k == '\n') {        /* line complete -> dispatch */
+                con_out('\n');
+                g_line[g_linelen] = 0;
+                handle_line((unsigned)port_index, g_line);
+                g_linelen = 0;
+            } else if (k == 8 || k == 127) {          /* backspace */
+                if (g_linelen) { --g_linelen; con_putc(8); con_putc(' '); con_putc(8); }
+            } else if (k >= 0x20 && g_linelen < (int)sizeof g_line - 1) {
+                g_line[g_linelen++] = (char)k;
+                con_putc((unsigned char)k);           /* local echo (dongle echo is off) */
+            }
         }
         if (!r) dos_yield();
     }

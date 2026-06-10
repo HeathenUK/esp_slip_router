@@ -17,6 +17,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -285,6 +286,40 @@ int ftp_rename(const char *oldn, const char *newn)
     if (code != 350) return code < 0 ? -1 : code;   /* 350 = ready for RNTO */
     snprintf(c, sizeof c, "RNTO %s", newn);
     return ftp_command(c, NULL, 0);
+}
+
+/* ---- upload (STOR) ---- */
+static int s_stor_fd = -1;
+
+int ftp_stor_open(const char *remote)
+{
+    int code;
+    ftp_command("TYPE I", NULL, 0);
+    s_stor_fd = ftp_open_data();
+    if (s_stor_fd < 0) return -1;
+    { char c[260]; snprintf(c, sizeof c, "STOR %s", remote); code = ftp_command(c, NULL, 0); }
+    if (code != 150 && code != 125) { close(s_stor_fd); s_stor_fd = -1; return code < 0 ? -1 : code; }
+    return 0;
+}
+
+int ftp_stor_write(const void *buf, size_t n)
+{
+    const char *p = buf;
+    size_t off = 0;
+    if (s_stor_fd < 0) return -1;
+    while (off < n) {
+        int w = send(s_stor_fd, p + off, n - off, 0);
+        if (w > 0) off += (size_t)w;
+        else if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
+        else return -1;
+    }
+    return 0;
+}
+
+int ftp_stor_close(void)
+{
+    if (s_stor_fd >= 0) { close(s_stor_fd); s_stor_fd = -1; }
+    return ftp_read_reply(NULL, 0);   /* final 226 */
 }
 
 void ftp_quit(void)
