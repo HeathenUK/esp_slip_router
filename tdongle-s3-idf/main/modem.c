@@ -158,6 +158,8 @@ extern int  ssh_connect(const char *user, const char *pass, const char *host, ui
 extern int  ssh_read(void *buf, size_t len);
 extern int  ssh_write(const void *buf, size_t len);
 extern void ssh_close(void);
+extern int  ssh_sftp_spike(const char *user, const char *pass, const char *host,
+                           uint16_t port, const char *path);   /* AT$SFTPTEST heap gate */
 
 /* FTP client engine (ftp.c). Plaintext control connection + nav verbs; the
  * interactive REPL lives in this file. */
@@ -1946,6 +1948,31 @@ static void ssh_spawn_worker(void) {
     }
 }
 
+/* AT$SFTPTEST worker: the throwaway SFTP heap-feasibility gate. Quiesce (as the
+ * real SSH/SFTP path would), run the spike against a fixed test path, unquiesce,
+ * report. Runs on a worker -- libssh2 handshake blocks for seconds, so it must
+ * NOT run in the CDC callback. Reuses the staged s_ssh_* creds. */
+static void cmd_sftptest_task_fn(void *arg) {
+    int got;
+    (void)arg;
+    app_secure_quiesce(true);
+    disk_logf("sftp-spike: post-quiesce free=%u contig=%u",
+              (unsigned)esp_get_free_heap_size(),
+              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    got = ssh_sftp_spike(s_ssh_user, s_ssh_pass, s_ssh_host, s_ssh_port, "/readme.txt");
+    app_secure_quiesce(false);
+    { char o[80]; snprintf(o, sizeof o, "\r\nSFTPTEST got=%d (see /disk-log)\r\n", got); cdc_print(o); }
+    s_at_busy = false; s_dial_task = NULL;
+    vTaskDelete(NULL);
+}
+static void sftptest_spawn(void) {
+    s_at_busy = true;
+    if (xTaskCreatePinnedToCore(cmd_sftptest_task_fn, "sftptest", 12288, NULL, 15,
+                                &s_dial_task, 0) != pdPASS) {
+        s_at_busy = false; s_dial_task = NULL; r_error();
+    }
+}
+
 /* ---- AT$FTP: interactive FTP navigation over CDC (Phase 1) ----
  * NOT a transparent relay -- a command interpreter. The worker connects + logs
  * in, then loops on s_ftp_q (lines from on_cdc_rx) running pwd/cd/cdup/bye on the
@@ -2509,6 +2536,26 @@ static void handle_dollar(char *s) {
         s_ssh_pass[0] = 0; s_ssh_pw_len = 0;
         s_ssh_pw_capture = true;
         cdc_print("\r\nPassword: ");
+        return;
+    } else if (!strcmp(key, "SFTPTEST") && val && eq) {
+        /* THROWAWAY heap-feasibility gate for AT$SFTP. AT$SFTPTEST=user:pass@host
+         * [:port] -- connects, opens SFTP, reads a fixed test file (/readme.txt,
+         * e.g. test.rebex.net demo/password), logging min_free to /disk-log. */
+        if (s_at_busy || s_dial_task) { r_error(); return; }
+        char tmp[200]; strncpy(tmp, val, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
+        char *user, *pass = (char *)"", *host; uint16_t sp = 22;
+        char *at = strrchr(tmp, '@');
+        if (!at) { r_error(); return; }
+        *at = 0; user = tmp;
+        { char *c1 = strchr(tmp, ':'); if (c1) { *c1 = 0; pass = c1 + 1; } }
+        host = at + 1;
+        { char *c2 = strrchr(host, ':'); if (c2) { *c2 = 0; int pn = atoi(c2 + 1); if (pn > 0 && pn < 65536) sp = (uint16_t)pn; } }
+        if (!*host || !*user) { r_error(); return; }
+        strncpy(s_ssh_user, user, sizeof s_ssh_user - 1); s_ssh_user[sizeof s_ssh_user - 1] = 0;
+        strncpy(s_ssh_pass, pass, sizeof s_ssh_pass - 1); s_ssh_pass[sizeof s_ssh_pass - 1] = 0;
+        strncpy(s_ssh_host, host, sizeof s_ssh_host - 1); s_ssh_host[sizeof s_ssh_host - 1] = 0;
+        s_ssh_port = sp;
+        sftptest_spawn();
         return;
     } else if (!strcmp(key, "FTP") && val && eq) {
         /* AT$FTP=[user[:pass]@]host[:port] -- interactive FTP navigation session.

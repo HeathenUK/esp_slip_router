@@ -32,6 +32,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "libssh2_idf.h"   /* defines ESP32, then includes libssh2.h */
+#include "libssh2_sftp.h"
 #include "disk.h"
 
 static LIBSSH2_SESSION *s_session = NULL;
@@ -236,4 +237,87 @@ void ssh_close(void)
     if (s_session) { libssh2_session_free(s_session); s_session = NULL; }
     libssh2_exit();
     SSH_UNLOCK();
+}
+
+/**
+ * @brief Throwaway heap-feasibility spike for AT$SFTP (GO/NO-GO).
+ *
+ * Self-contained (its own session/socket, NOT the relay's s_session) so it can't
+ * disturb relay state: connect + password auth, open the SFTP subsystem, open
+ * @p path read-only and read up to 64 KB, logging min_free at each step, then
+ * tear everything down. Caller should app_secure_quiesce() around it. Never logs
+ * the password. Returns bytes read (>=0) or -1 on failure.
+ */
+int ssh_sftp_spike(const char *user, const char *pass, const char *host,
+                   uint16_t port, const char *path)
+{
+    LIBSSH2_SESSION     *sess = NULL;
+    LIBSSH2_SFTP        *sftp = NULL;
+    LIBSSH2_SFTP_HANDLE *fh   = NULL;
+    struct addrinfo      hints, *res = NULL;
+    char                 ps[8];
+    int                  sock = -1;
+    long                 total = 0;
+
+    if (libssh2_init(0) != 0) { disk_logf("sftp-spike: init fail"); return -1; }
+    sess = libssh2_session_init();
+    if (!sess) { disk_logf("sftp-spike: session_init NULL lfb=%u",
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                 libssh2_exit(); return -1; }
+    libssh2_session_set_blocking(sess, 1);
+
+    snprintf(ps, sizeof ps, "%u", (unsigned)port);
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) { disk_logf("sftp-spike: DNS fail"); goto out; }
+    sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) { freeaddrinfo(res); disk_logf("sftp-spike: socket fail"); goto out; }
+    { struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
+      setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
+    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); disk_logf("sftp-spike: connect fail"); goto out; }
+    freeaddrinfo(res); res = NULL;
+    { int yes = 1; setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes); }
+
+    if (libssh2_session_handshake(sess, sock)) { disk_logf("sftp-spike: handshake FAIL"); goto out; }
+    disk_logf("sftp-spike: handshake min_free=%u", (unsigned)esp_get_minimum_free_heap_size());
+    if (libssh2_userauth_password(sess, user, pass)) { disk_logf("sftp-spike: AUTH FAIL"); goto out; }
+    disk_logf("sftp-spike: auth min_free=%u free=%u",
+              (unsigned)esp_get_minimum_free_heap_size(), (unsigned)esp_get_free_heap_size());
+
+    sftp = libssh2_sftp_init(sess);
+    if (!sftp) { disk_logf("sftp-spike: sftp_init FAIL"); goto out; }
+    disk_logf("sftp-spike: sftp_init min_free=%u free=%u contig=%u",
+              (unsigned)esp_get_minimum_free_heap_size(), (unsigned)esp_get_free_heap_size(),
+              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    fh = libssh2_sftp_open(sftp, path, LIBSSH2_FXF_READ, 0);
+    if (!fh) { disk_logf("sftp-spike: open '%s' FAIL", path); goto out; }
+    disk_logf("sftp-spike: opened %s min_free=%u", path, (unsigned)esp_get_minimum_free_heap_size());
+
+    {
+        char    b[1024];
+        ssize_t n;
+        int     logged = 0;
+        while ((n = libssh2_sftp_read(fh, b, sizeof b)) > 0) {
+            total += (long)n;
+            if (!logged) { logged = 1;
+                disk_logf("sftp-spike: first read n=%d min_free=%u free=%u",
+                          (int)n, (unsigned)esp_get_minimum_free_heap_size(),
+                          (unsigned)esp_get_free_heap_size()); }
+            if (total > 65536L) break;   /* enough to gauge the floor */
+        }
+    }
+    disk_logf("sftp-spike: read %ld bytes min_free=%u free=%u",
+              total, (unsigned)esp_get_minimum_free_heap_size(),
+              (unsigned)esp_get_free_heap_size());
+
+out:
+    if (fh)   libssh2_sftp_close(fh);
+    if (sftp) libssh2_sftp_shutdown(sftp);
+    if (sess) { libssh2_session_disconnect(sess, "bye"); libssh2_session_free(sess); }
+    if (sock >= 0) close(sock);
+    libssh2_exit();
+    disk_logf("sftp-spike: teardown free=%u", (unsigned)esp_get_free_heap_size());
+    return (total > 0) ? (int)total : -1;
 }

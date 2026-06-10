@@ -11,6 +11,7 @@ idf_component_register(
         "kex.c" "mac.c" "mbedtls.c" "misc.c" "packet.c" "pem.c" "session.c"
         "transport.c" "userauth.c" "userauth_kbd_packet.c"
         "bcrypt_pbkdf.c" "blowfish.c"
+        "sftp.c"   # vendored from libssh2-1.10.0 for AT$SFTP (BSD-3 header kept)
     INCLUDE_DIRS "."
     REQUIRES mbedtls lwip
 )
