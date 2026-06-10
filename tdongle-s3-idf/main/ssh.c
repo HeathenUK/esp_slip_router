@@ -357,7 +357,14 @@ int sftp_ls(const char *arg, sftp_sink_fn sink)
     if (!s_sftp) return -1;
     sftp_abspath(arg, path, sizeof path);
     d = libssh2_sftp_opendir(s_sftp, path);
-    if (!d) return -1;
+    if (!d) {
+        char *emsg = NULL;
+        int serr = libssh2_session_last_error(s_sftp_sess, &emsg, NULL, 0);
+        disk_logf("sftp: opendir(%s) FAIL libssh2=%d sftp=%lu msg=%s", path,
+                  serr, (unsigned long)libssh2_sftp_last_error(s_sftp),
+                  emsg ? emsg : "?");
+        return -1;
+    }
     while ((n = libssh2_sftp_readdir(d, name, sizeof name - 1, &at)) > 0) {
         char type = (at.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
                     LIBSSH2_SFTP_S_ISDIR(at.permissions) ? 'd' : '-';
