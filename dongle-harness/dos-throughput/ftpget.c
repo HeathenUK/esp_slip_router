@@ -163,6 +163,7 @@ static void con_out(unsigned char c)
     if (c == 0x0AU) con_putc(0x0DU);
     con_putc(c);
 }
+static void con_str(const char *s) { while (*s) con_out((unsigned char)*s++); }
 
 /* ---- OSC 5113 download capture + NO CARRIER watch ---- */
 static int   ostate = 0;            /* 0=normal, 1=after-ESC, 2=in-OSC */
@@ -172,6 +173,7 @@ static FILE *dl_file = NULL;
 static long  dl_remaining = 0L;
 static char  dl_name[16];
 static long  dl_total = 0L;
+static unsigned long dl_start = 0UL;   /* bios_ticks() when the capture began */
 static unsigned nc_match = 0;        /* "NO CARRIER" matcher */
 static int   g_done = 0;
 
@@ -195,6 +197,7 @@ static void dispatch_osc(void)
             dl_file = fopen(dl_name, "wb");   /* NULL -> consume + discard */
             dl_remaining = sz;
             dl_total = sz;
+            dl_start = bios_ticks();          /* for the throughput report */
         }
     }
     /* other OSC (e.g. a title) -- ignore */
@@ -203,11 +206,37 @@ static void dispatch_osc(void)
 static void feed(unsigned char c)
 {
     if (dl_remaining > 0L) {            /* capturing a download body */
+        static unsigned long last_prog = 0UL;
+        unsigned long now;
         if (dl_file) putc((int)c, dl_file);
-        if (--dl_remaining == 0L) {
-            if (dl_file) { fclose(dl_file); dl_file = NULL;
-                printf("\r\n[ftpget: saved %s, %ld bytes]\r\n", dl_name, dl_total); }
-            else printf("\r\n[ftpget: could not create %s -- discarded]\r\n", dl_name);
+        --dl_remaining;
+        /* Progress line (throttled to ~1s, plus a final tick at completion).
+         * Leading CR rewrites in place; trailing spaces clear any residue. */
+        now = bios_ticks();
+        if (dl_remaining == 0L || (now - last_prog) >= 18UL) {
+            char pl[64];
+            last_prog = now;
+            snprintf(pl, sizeof pl, "\r  %ld / %ld bytes   ", dl_total - dl_remaining, dl_total);
+            con_str(pl);
+        }
+        if (dl_remaining == 0L) {
+            unsigned long el = bios_ticks() - dl_start;
+            unsigned long centi, kb10;
+            char fin[96];
+            if (!el) el = 1UL;
+            centi = (el * 10000UL + 910UL) / 1820UL;                 /* ticks -> centiseconds */
+            kb10  = ((unsigned long)dl_total * 100UL / centi) * 10UL / 1024UL;
+            if (dl_file) {
+                fclose(dl_file); dl_file = NULL;
+                snprintf(fin, sizeof fin,
+                         "\r[ftpget: saved %s, %ld bytes in %lu.%02lu s = %lu.%lu KB/s]\n",
+                         dl_name, dl_total, centi/100UL, centi%100UL, kb10/10UL, kb10%10UL);
+            } else {
+                snprintf(fin, sizeof fin,
+                         "\r[ftpget: could not create %s -- discarded %ld bytes]\n",
+                         dl_name, dl_total);
+            }
+            con_str(fin);
         }
         return;
     }
