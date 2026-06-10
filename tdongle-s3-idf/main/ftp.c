@@ -16,6 +16,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -228,6 +229,41 @@ int ftp_list(const char *path, ftp_sink_fn sink)
 
     for (;;) {
         uint8_t buf[256];
+        int n = recv(ds, buf, sizeof buf, 0);
+        if (n > 0) { if (sink) sink(buf, (size_t)n); }
+        else break;                              /* 0 = EOF, <0 = timeout/error */
+    }
+    close(ds);
+    return ftp_read_reply(NULL, 0);              /* final 226 */
+}
+
+long ftp_size(const char *path)
+{
+    char cmd[256], resp[80];
+    int  code;
+    ftp_command("TYPE I", NULL, 0);              /* binary -> SIZE is the byte count */
+    snprintf(cmd, sizeof cmd, "SIZE %s", path);
+    code = ftp_command(cmd, resp, sizeof resp);
+    if (code != 213) return -1;
+    { const char *q = resp + 3; while (*q == ' ') q++; return atol(q); }
+}
+
+int ftp_retr(const char *path, ftp_sink_fn sink)
+{
+    int ds, code;
+
+    ftp_command("TYPE I", NULL, 0);
+    ds = ftp_open_data();
+    if (ds < 0) return -1;
+    {
+        char cmd[256];
+        snprintf(cmd, sizeof cmd, "RETR %s", path);
+        code = ftp_command(cmd, NULL, 0);        /* 150/125 = transfer starting */
+    }
+    if (code != 150 && code != 125) { close(ds); return code < 0 ? -1 : code; }
+
+    for (;;) {
+        uint8_t buf[512];
         int n = recv(ds, buf, sizeof buf, 0);
         if (n > 0) { if (sink) sink(buf, (size_t)n); }
         else break;                              /* 0 = EOF, <0 = timeout/error */

@@ -63,6 +63,20 @@ typedef void (*ftp_sink_fn)(const uint8_t *data, size_t len);
  */
 int ftp_list(const char *path, ftp_sink_fn sink);
 
+/**
+ * @brief Query a file's size (TYPE I + SIZE).
+ * @return Byte count (>= 0), or -1 if the server doesn't support SIZE.
+ */
+long ftp_size(const char *path);
+
+/**
+ * @brief Retrieve a file: TYPE I + PASV + RETR, streaming the body to @p sink.
+ * @param path Remote file path.
+ * @param sink Called with each chunk of file data (NULL to discard).
+ * @return The final FTP reply code (226 on success), or -1 on socket error.
+ */
+int ftp_retr(const char *path, ftp_sink_fn sink);
+
 /** @brief Send QUIT (best-effort) and close the control connection. */
 void ftp_quit(void);
 

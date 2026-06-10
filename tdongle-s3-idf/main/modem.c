@@ -166,6 +166,8 @@ extern int  ftp_connect(const char *host, uint16_t port, const char *user, const
 extern int  ftp_pwd(char *out, size_t n);
 extern int  ftp_cwd(const char *dir);
 extern int  ftp_list(const char *path, void (*sink)(const uint8_t *, size_t));
+extern long ftp_size(const char *path);
+extern int  ftp_retr(const char *path, void (*sink)(const uint8_t *, size_t));
 extern void ftp_quit(void);
 
 /* ---- transport abstraction (Phase 1) ----
@@ -1956,6 +1958,18 @@ static void ftp_prompt(void) { cdc_print("\r\nftp> "); }
 /* Stream sink for ftp_list(): dump directory-listing chunks straight to CDC. */
 static void ftp_cdc_sink(const uint8_t *d, size_t n) { cdc_write(d, n); }
 
+/* Stream sink for `get`: emit EXACTLY s_ftp_get_remaining bytes (truncate any
+ * tail past the declared SIZE) so usbterm's length-prefixed capture always
+ * completes -- never wedges on a size mismatch. The get handler pads if short. */
+static long s_ftp_get_remaining = 0;
+static void ftp_get_sink(const uint8_t *d, size_t n) {
+    size_t take;
+    if (s_ftp_get_remaining <= 0) return;
+    take = ((long)n > s_ftp_get_remaining) ? (size_t)s_ftp_get_remaining : n;
+    cdc_write(d, take);
+    s_ftp_get_remaining -= (long)take;
+}
+
 /* on_cdc_rx, while s_ftp_active: line-buffer the typed command (basic backspace
  * editing) and hand a completed line to the worker via s_ftp_q. */
 static void ftp_on_cdc_rx(const uint8_t *buf, size_t got) {
@@ -2003,7 +2017,7 @@ static void cmd_ftp_impl(void) {
 
     r_connect();
     cdc_print("\r\n"); if (banner[0]) cdc_print(banner);
-    cdc_print("Commands: pwd  cd <dir>  cdup  bye\r\n");
+    cdc_print("Commands: pwd  cd <dir>  cdup  ls [path]  get <file>  bye\r\n");
     ftp_prompt();
 
     for (;;) {
@@ -2018,7 +2032,7 @@ static void cmd_ftp_impl(void) {
         if (!*cmd) { ftp_prompt(); continue; }
         if (!strcmp(cmd, "bye") || !strcmp(cmd, "quit") || !strcmp(cmd, "exit")) break;
         if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
-            cdc_print("pwd  cd <dir>  cdup  ls [path]  bye\r\n"); ftp_prompt(); continue;
+            cdc_print("pwd  cd <dir>  cdup  ls [path]  get <remote> [local]  bye\r\n"); ftp_prompt(); continue;
         }
         if (!strcmp(cmd, "ls") || !strcmp(cmd, "dir")) {
             int code;
@@ -2038,8 +2052,27 @@ static void cmd_ftp_impl(void) {
             int code = ftp_cwd("..");
             if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
             { char o[40]; snprintf(o, sizeof o, "%d\r\n", code); cdc_print(o); }
+        } else if (!strcmp(cmd, "get")) {
+            /* get <remote> [local] -- download to a DOS file via the OSC 5113
+             * framed transfer (usbterm captures exactly <size> bytes). */
+            char *remote = arg, *local = NULL, *b, *sp2;
+            long sz; int code;
+            sp2 = strchr(remote, ' ');
+            if (sp2) { *sp2 = '\0'; local = sp2 + 1; while (*local == ' ') local++; }
+            if (!*remote) { cdc_print("usage: get <remote> [local]\r\n"); ftp_prompt(); continue; }
+            if (!local || !*local) { b = strrchr(remote, '/'); local = b ? b + 1 : remote; }
+            sz = ftp_size(remote);
+            if (sz < 0) { cdc_print("get: server lacks SIZE\r\n"); ftp_prompt(); continue; }
+            { char hdr[160]; snprintf(hdr, sizeof hdr, "\x1b]5113;%ld;%s\x07", sz, local); cdc_print(hdr); }
+            s_ftp_get_remaining = sz;
+            code = ftp_retr(remote, ftp_get_sink);
+            /* Pad a short transfer so usbterm's capture still completes. */
+            while (s_ftp_get_remaining > 0) { uint8_t z = 0; cdc_write(&z, 1); s_ftp_get_remaining--; }
+            if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
+            { char o[96]; snprintf(o, sizeof o, "\r\nget %s (%ld bytes) -> %s\r\n",
+                                   remote, sz, (code == 226) ? "ok" : "?"); cdc_print(o); }
         } else {
-            cdc_print("?Unknown (pwd/cd/cdup/bye)\r\n");
+            cdc_print("?Unknown (pwd/cd/cdup/ls/get/bye)\r\n");
         }
         ftp_prompt();
     }
