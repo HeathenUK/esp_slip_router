@@ -77,6 +77,15 @@ long ftp_size(const char *path);
  */
 int ftp_retr(const char *path, ftp_sink_fn sink);
 
+/** @brief MKD <dir>.  @return FTP reply code (257 ok) or -1. */
+int ftp_mkdir(const char *dir);
+/** @brief RMD <dir>.  @return FTP reply code (250 ok) or -1. */
+int ftp_rmdir(const char *dir);
+/** @brief DELE <file>.  @return FTP reply code (250 ok) or -1. */
+int ftp_del(const char *file);
+/** @brief RNFR <old> + RNTO <new>.  @return final reply code (250 ok) or -1. */
+int ftp_rename(const char *oldn, const char *newn);
+
 /** @brief Send QUIT (best-effort) and close the control connection. */
 void ftp_quit(void);
 

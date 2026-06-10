@@ -395,3 +395,33 @@ int sftp_get(const char *file, sftp_sink_fn sink)
     libssh2_sftp_close(fh);
     return (n < 0) ? -1 : 0;
 }
+
+int sftp_mkdir(const char *dir)
+{
+    char p[256];
+    if (!s_sftp) return -1;
+    sftp_abspath(dir, p, sizeof p);
+    return libssh2_sftp_mkdir(s_sftp, p, 0755) == 0 ? 0 : -1;
+}
+int sftp_rmdir(const char *dir)
+{
+    char p[256];
+    if (!s_sftp) return -1;
+    sftp_abspath(dir, p, sizeof p);
+    return libssh2_sftp_rmdir(s_sftp, p) == 0 ? 0 : -1;
+}
+int sftp_del(const char *file)
+{
+    char p[256];
+    if (!s_sftp) return -1;
+    sftp_abspath(file, p, sizeof p);
+    return libssh2_sftp_unlink(s_sftp, p) == 0 ? 0 : -1;
+}
+int sftp_rename(const char *oldn, const char *newn)
+{
+    char po[256], pn[256];
+    if (!s_sftp) return -1;
+    sftp_abspath(oldn, po, sizeof po);
+    sftp_abspath(newn, pn, sizeof pn);
+    return libssh2_sftp_rename(s_sftp, po, pn) == 0 ? 0 : -1;
+}

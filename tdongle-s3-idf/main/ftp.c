@@ -272,6 +272,21 @@ int ftp_retr(const char *path, ftp_sink_fn sink)
     return ftp_read_reply(NULL, 0);              /* final 226 */
 }
 
+int ftp_mkdir(const char *dir)  { char c[260]; snprintf(c, sizeof c, "MKD %s",  dir);  return ftp_command(c, NULL, 0); }
+int ftp_rmdir(const char *dir)  { char c[260]; snprintf(c, sizeof c, "RMD %s",  dir);  return ftp_command(c, NULL, 0); }
+int ftp_del(const char *file)   { char c[260]; snprintf(c, sizeof c, "DELE %s", file); return ftp_command(c, NULL, 0); }
+
+int ftp_rename(const char *oldn, const char *newn)
+{
+    char c[260];
+    int  code;
+    snprintf(c, sizeof c, "RNFR %s", oldn);
+    code = ftp_command(c, NULL, 0);
+    if (code != 350) return code < 0 ? -1 : code;   /* 350 = ready for RNTO */
+    snprintf(c, sizeof c, "RNTO %s", newn);
+    return ftp_command(c, NULL, 0);
+}
+
 void ftp_quit(void)
 {
     if (s_ctrl >= 0) ftp_command("QUIT", NULL, 0);   /* best-effort */

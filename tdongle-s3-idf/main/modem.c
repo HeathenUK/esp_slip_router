@@ -168,6 +168,10 @@ extern int  sftp_cd(const char *dir);
 extern int  sftp_ls(const char *arg, void (*sink)(const unsigned char *, size_t));
 extern long sftp_size(const char *file);
 extern int  sftp_get(const char *file, void (*sink)(const unsigned char *, size_t));
+extern int  sftp_mkdir(const char *dir);
+extern int  sftp_rmdir(const char *dir);
+extern int  sftp_del(const char *file);
+extern int  sftp_rename(const char *oldn, const char *newn);
 extern void sftp_quit(void);
 
 /* FTP client engine (ftp.c). Plaintext control connection + nav verbs; the
@@ -179,6 +183,10 @@ extern int  ftp_cwd(const char *dir);
 extern int  ftp_list(const char *path, void (*sink)(const uint8_t *, size_t));
 extern long ftp_size(const char *path);
 extern int  ftp_retr(const char *path, void (*sink)(const uint8_t *, size_t));
+extern int  ftp_mkdir(const char *dir);
+extern int  ftp_rmdir(const char *dir);
+extern int  ftp_del(const char *file);
+extern int  ftp_rename(const char *oldn, const char *newn);
 extern void ftp_quit(void);
 
 /* ---- transport abstraction (Phase 1) ----
@@ -2032,8 +2040,19 @@ static void cmd_sftp_impl(void) {
             if (sftp_get(remote, ftp_get_sink) != 0) { /* fall through to pad + report */ }
             while (s_ftp_get_remaining > 0) { uint8_t z = 0; cdc_write(&z, 1); s_ftp_get_remaining--; }
             { char o[96]; snprintf(o, sizeof o, "\r\nget %s (%ld bytes)\r\n", remote, sz); cdc_print(o); }
+        } else if (!strcmp(cmd, "mkdir") || !strcmp(cmd, "md")) {
+            cdc_print(sftp_mkdir(arg) == 0 ? "ok\r\n" : "failed\r\n");
+        } else if (!strcmp(cmd, "rmdir") || !strcmp(cmd, "rd")) {
+            cdc_print(sftp_rmdir(arg) == 0 ? "ok\r\n" : "failed\r\n");
+        } else if (!strcmp(cmd, "del") || !strcmp(cmd, "rm")) {
+            cdc_print(sftp_del(arg) == 0 ? "ok\r\n" : "failed\r\n");
+        } else if (!strcmp(cmd, "ren") || !strcmp(cmd, "mv") || !strcmp(cmd, "rename")) {
+            char *a2 = strchr(arg, ' ');
+            if (!a2) cdc_print("usage: ren <old> <new>\r\n");
+            else { *a2 = 0; a2++; while (*a2 == ' ') a2++;
+                   cdc_print(sftp_rename(arg, a2) == 0 ? "ok\r\n" : "failed\r\n"); }
         } else {
-            cdc_print("?Unknown (pwd/cd/cdup/ls/get/bye)\r\n");
+            cdc_print("?Unknown (pwd/cd/cdup/ls/get/mkdir/rmdir/del/ren/bye)\r\n");
         }
         ftp_prompt();
     }
@@ -2183,8 +2202,27 @@ static void cmd_ftp_impl(void) {
             if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
             { char o[96]; snprintf(o, sizeof o, "\r\nget %s (%ld bytes) -> %s\r\n",
                                    remote, sz, (code == 226) ? "ok" : "?"); cdc_print(o); }
+        } else if (!strcmp(cmd, "mkdir") || !strcmp(cmd, "md")) {
+            int code = ftp_mkdir(arg);
+            if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
+            cdc_print(code / 100 == 2 ? "ok\r\n" : "failed\r\n");
+        } else if (!strcmp(cmd, "rmdir") || !strcmp(cmd, "rd")) {
+            int code = ftp_rmdir(arg);
+            if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
+            cdc_print(code / 100 == 2 ? "ok\r\n" : "failed\r\n");
+        } else if (!strcmp(cmd, "del") || !strcmp(cmd, "rm")) {
+            int code = ftp_del(arg);
+            if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
+            cdc_print(code / 100 == 2 ? "ok\r\n" : "failed\r\n");
+        } else if (!strcmp(cmd, "ren") || !strcmp(cmd, "mv") || !strcmp(cmd, "rename")) {
+            char *a2 = strchr(arg, ' ');
+            if (!a2) { cdc_print("usage: ren <old> <new>\r\n"); }
+            else { int code; *a2 = 0; a2++; while (*a2 == ' ') a2++;
+                   code = ftp_rename(arg, a2);
+                   if (code < 0) { cdc_print("\r\nConnection lost\r\n"); break; }
+                   cdc_print(code / 100 == 2 ? "ok\r\n" : "failed\r\n"); }
         } else {
-            cdc_print("?Unknown (pwd/cd/cdup/ls/get/bye)\r\n");
+            cdc_print("?Unknown (pwd/cd/cdup/ls/get/mkdir/rmdir/del/ren/bye)\r\n");
         }
         ftp_prompt();
     }
