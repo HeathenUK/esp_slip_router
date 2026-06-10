@@ -158,8 +158,17 @@ extern int  ssh_connect(const char *user, const char *pass, const char *host, ui
 extern int  ssh_read(void *buf, size_t len);
 extern int  ssh_write(const void *buf, size_t len);
 extern void ssh_close(void);
-extern int  ssh_sftp_spike(const char *user, const char *pass, const char *host,
-                           uint16_t port, const char *path);   /* AT$SFTPTEST heap gate */
+
+/* SFTP client (ssh.c): connect+auth+sftp_init, then nav/transfer over the SFTP
+ * subsystem. Client-side cwd; download body via a sink (modem.c OSC-5113 frames
+ * it for ftpget). */
+extern int  sftp_open(const char *user, const char *pass, const char *host, uint16_t port);
+extern int  sftp_pwd(char *out, size_t n);
+extern int  sftp_cd(const char *dir);
+extern int  sftp_ls(const char *arg, void (*sink)(const unsigned char *, size_t));
+extern long sftp_size(const char *file);
+extern int  sftp_get(const char *file, void (*sink)(const unsigned char *, size_t));
+extern void sftp_quit(void);
 
 /* FTP client engine (ftp.c). Plaintext control connection + nav verbs; the
  * interactive REPL lives in this file. */
@@ -1948,26 +1957,102 @@ static void ssh_spawn_worker(void) {
     }
 }
 
-/* AT$SFTPTEST worker: the throwaway SFTP heap-feasibility gate. Quiesce (as the
- * real SSH/SFTP path would), run the spike against a fixed test path, unquiesce,
- * report. Runs on a worker -- libssh2 handshake blocks for seconds, so it must
- * NOT run in the CDC callback. Reuses the staged s_ssh_* creds. */
-static void cmd_sftptest_task_fn(void *arg) {
-    int got;
-    (void)arg;
+/* The SFTP REPL reuses these FTP helpers, defined later in the file. */
+static void ftp_prompt(void);
+static void ftp_cdc_sink(const uint8_t *d, size_t n);
+static void ftp_get_sink(const uint8_t *d, size_t n);
+static long s_ftp_get_remaining;
+
+/* ---- AT$SFTP: interactive SFTP nav over CDC (Phase 1, mirrors AT$FTP) ----
+ * Same REPL plumbing as AT$FTP (s_ftp_active line-queue, ftp_get_sink, OSC-5113
+ * framing -> ftpget) but the backend is libssh2 SFTP (ssh.c), and it ALWAYS
+ * quiesces (it's an SSH session -- flood-prone, like AT$SSH). Only one of FTP /
+ * SFTP is ever live, so reusing s_ftp_active/s_ftp_q is safe. */
+static void cmd_sftp_impl(void) {
+    char line[FTP_LINE_MAX];
+
+    if (s_sock >= 0) { s_online = false; vTaskDelay(pdMS_TO_TICKS(20)); xport_close(); s_peer[0] = 0; }
+    { wifi_ap_record_t ap; if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) { r_nocarrier(); return; } }
+
+    /* Always quiesce (SSH session -- see cmd_ssh_impl). */
     app_secure_quiesce(true);
-    disk_logf("sftp-spike: post-quiesce free=%u contig=%u",
+    disk_logf("sftp: post-quiesce free=%u contig=%u",
               (unsigned)esp_get_free_heap_size(),
               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    got = ssh_sftp_spike(s_ssh_user, s_ssh_pass, s_ssh_host, s_ssh_port, "/readme.txt");
+
+    if (sftp_open(s_ssh_user, s_ssh_pass, s_ssh_host, s_ssh_port) != 0) {
+        app_secure_quiesce(false); r_nocarrier(); return;
+    }
+    if (!s_ftp_q) s_ftp_q = xQueueCreate(4, FTP_LINE_MAX);
+    s_ftp_line_len = 0;
+    snprintf(s_peer, sizeof s_peer, "sftp:%.32s@%.48s:%u",
+             (s_ssh_user[0] ? s_ssh_user : "?"), s_ssh_host, (unsigned)s_ssh_port);
+    s_ftp_active = true;
+
+    r_connect();
+    { char o[300]; snprintf(o, sizeof o, "\r\nSFTP connected.  pwd cd <dir> cdup ls [path] get <remote> [local] bye\r\n"); cdc_print(o); }
+    { char p[256]; sftp_pwd(p, sizeof p); cdc_print("cwd "); cdc_print(p); cdc_print("\r\n"); }
+    ftp_prompt();
+
+    for (;;) {
+        char *cmd, *arg, *q;
+        if (!s_ftp_q || xQueueReceive(s_ftp_q, line, portMAX_DELAY) != pdTRUE) continue;
+        cmd = line; while (*cmd == ' ') cmd++;
+        { char *sp = strchr(cmd, ' ');
+          if (sp) { *sp = '\0'; arg = sp + 1; while (*arg == ' ') arg++; } else arg = (char *)""; }
+        for (q = cmd; *q; ++q) if (*q >= 'A' && *q <= 'Z') *q += 32;
+
+        if (!*cmd) { ftp_prompt(); continue; }
+        if (!strcmp(cmd, "bye") || !strcmp(cmd, "quit") || !strcmp(cmd, "exit")) break;
+        if (!strcmp(cmd, "help") || !strcmp(cmd, "?")) {
+            cdc_print("pwd  cd <dir>  cdup  ls [path]  get <remote> [local]  bye\r\n"); ftp_prompt(); continue;
+        }
+        if (!strcmp(cmd, "pwd")) {
+            char p[256]; sftp_pwd(p, sizeof p); cdc_print(p); cdc_print("\r\n");
+        } else if (!strcmp(cmd, "cd") || !strcmp(cmd, "cwd")) {
+            if (sftp_cd(arg) != 0) cdc_print("cd: failed\r\n");
+            else { char p[256]; sftp_pwd(p, sizeof p); cdc_print(p); cdc_print("\r\n"); }
+        } else if (!strcmp(cmd, "cdup") || !strcmp(cmd, "..")) {
+            if (sftp_cd("..") != 0) cdc_print("cd: failed\r\n");
+            else { char p[256]; sftp_pwd(p, sizeof p); cdc_print(p); cdc_print("\r\n"); }
+        } else if (!strcmp(cmd, "ls") || !strcmp(cmd, "dir")) {
+            cdc_print("\r\n");
+            if (sftp_ls(arg, ftp_cdc_sink) != 0) cdc_print("ls: failed\r\n");
+        } else if (!strcmp(cmd, "get")) {
+            char *remote = arg, *local = NULL, *b, *sp2;
+            long sz;
+            sp2 = strchr(remote, ' ');
+            if (sp2) { *sp2 = '\0'; local = sp2 + 1; while (*local == ' ') local++; }
+            if (!*remote) { cdc_print("usage: get <remote> [local]\r\n"); ftp_prompt(); continue; }
+            if (!local || !*local) { b = strrchr(remote, '/'); local = b ? b + 1 : remote; }
+            sz = sftp_size(remote);
+            if (sz < 0) { cdc_print("get: stat failed\r\n"); ftp_prompt(); continue; }
+            { char hdr[160]; snprintf(hdr, sizeof hdr, "\x1b]5113;%ld;%s\x07", sz, local); cdc_print(hdr); }
+            s_ftp_get_remaining = sz;
+            if (sftp_get(remote, ftp_get_sink) != 0) { /* fall through to pad + report */ }
+            while (s_ftp_get_remaining > 0) { uint8_t z = 0; cdc_write(&z, 1); s_ftp_get_remaining--; }
+            { char o[96]; snprintf(o, sizeof o, "\r\nget %s (%ld bytes)\r\n", remote, sz); cdc_print(o); }
+        } else {
+            cdc_print("?Unknown (pwd/cd/cdup/ls/get/bye)\r\n");
+        }
+        ftp_prompt();
+    }
+
+    s_ftp_active = false;
+    sftp_quit();
     app_secure_quiesce(false);
-    { char o[80]; snprintf(o, sizeof o, "\r\nSFTPTEST got=%d (see /disk-log)\r\n", got); cdc_print(o); }
+    s_peer[0] = 0;
+    r_nocarrier();
+}
+static void cmd_sftp_task_fn(void *arg) {
+    (void)arg;
+    cmd_sftp_impl();
     s_at_busy = false; s_dial_task = NULL;
     vTaskDelete(NULL);
 }
-static void sftptest_spawn(void) {
+static void sftp_spawn_worker(void) {
     s_at_busy = true;
-    if (xTaskCreatePinnedToCore(cmd_sftptest_task_fn, "sftptest", 12288, NULL, 15,
+    if (xTaskCreatePinnedToCore(cmd_sftp_task_fn, "at_sftp", 12288, NULL, 15,
                                 &s_dial_task, 0) != pdPASS) {
         s_at_busy = false; s_dial_task = NULL; r_error();
     }
@@ -2537,11 +2622,11 @@ static void handle_dollar(char *s) {
         s_ssh_pw_capture = true;
         cdc_print("\r\nPassword: ");
         return;
-    } else if (!strcmp(key, "SFTPTEST") && val && eq) {
-        /* THROWAWAY heap-feasibility gate for AT$SFTP. AT$SFTPTEST=user:pass@host
-         * [:port] -- connects, opens SFTP, reads a fixed test file (/readme.txt,
-         * e.g. test.rebex.net demo/password), logging min_free to /disk-log. */
-        if (s_at_busy || s_dial_task) { r_error(); return; }
+    } else if (!strcmp(key, "SFTP") && val && eq) {
+        /* AT$SFTP=user[:pass]@host[:port] -- interactive SFTP session over SSH
+         * (cd/ls/get), download framed as OSC 5113 for ftpget. Always quiesces.
+         * Worker task (handshake blocks). Password parsed, never logged. */
+        if (s_at_busy || s_dial_task) { disk_logf("sftp: BUSY"); r_error(); return; }
         char tmp[200]; strncpy(tmp, val, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
         char *user, *pass = (char *)"", *host; uint16_t sp = 22;
         char *at = strrchr(tmp, '@');
@@ -2555,7 +2640,7 @@ static void handle_dollar(char *s) {
         strncpy(s_ssh_pass, pass, sizeof s_ssh_pass - 1); s_ssh_pass[sizeof s_ssh_pass - 1] = 0;
         strncpy(s_ssh_host, host, sizeof s_ssh_host - 1); s_ssh_host[sizeof s_ssh_host - 1] = 0;
         s_ssh_port = sp;
-        sftptest_spawn();
+        sftp_spawn_worker();
         return;
     } else if (!strcmp(key, "FTP") && val && eq) {
         /* AT$FTP=[user[:pass]@]host[:port] -- interactive FTP navigation session.

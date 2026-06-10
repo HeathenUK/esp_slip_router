@@ -239,85 +239,159 @@ void ssh_close(void)
     SSH_UNLOCK();
 }
 
-/**
- * @brief Throwaway heap-feasibility spike for AT$SFTP (GO/NO-GO).
- *
- * Self-contained (its own session/socket, NOT the relay's s_session) so it can't
- * disturb relay state: connect + password auth, open the SFTP subsystem, open
- * @p path read-only and read up to 64 KB, logging min_free at each step, then
- * tear everything down. Caller should app_secure_quiesce() around it. Never logs
- * the password. Returns bytes read (>=0) or -1 on failure.
- */
-int ssh_sftp_spike(const char *user, const char *pass, const char *host,
-                   uint16_t port, const char *path)
-{
-    LIBSSH2_SESSION     *sess = NULL;
-    LIBSSH2_SFTP        *sftp = NULL;
-    LIBSSH2_SFTP_HANDLE *fh   = NULL;
-    struct addrinfo      hints, *res = NULL;
-    char                 ps[8];
-    int                  sock = -1;
-    long                 total = 0;
+/* ---- SFTP client (AT$SFTP) ---------------------------------------------------
+ * Its own session/socket, separate from the shell-relay s_session. SFTP has no
+ * server-side "current directory", so we track the cwd client-side (s_sftp_cwd)
+ * and build absolute paths for every op (the server resolves '..' via realpath).
+ * The download body is delivered through a sink callback (modem.c frames it as
+ * OSC 5113 so ftpget captures it). Plaintext APIs; types stay in ssh.c. */
+static LIBSSH2_SESSION *s_sftp_sess = NULL;
+static LIBSSH2_SFTP    *s_sftp      = NULL;
+static int              s_sftp_sock = -1;
+static char             s_sftp_cwd[256] = "/";
 
-    if (libssh2_init(0) != 0) { disk_logf("sftp-spike: init fail"); return -1; }
-    sess = libssh2_session_init();
-    if (!sess) { disk_logf("sftp-spike: session_init NULL lfb=%u",
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-                 libssh2_exit(); return -1; }
-    libssh2_session_set_blocking(sess, 1);
+typedef void (*sftp_sink_fn)(const unsigned char *data, size_t len);
+
+/** @brief Build an absolute server path from @p p relative to the cwd. Manual
+ *  bounded append (not a multi-%s snprintf, which trips -Werror=format-truncation);
+ *  also avoids a double slash when cwd is "/". */
+static void sftp_abspath(const char *p, char *out, size_t n)
+{
+    size_t len;
+    if (!n) return;
+    if (p && p[0] == '/') { snprintf(out, n, "%s", p); return; }   /* already absolute */
+    snprintf(out, n, "%s", s_sftp_cwd);                            /* base = cwd */
+    if (!p || !*p) return;
+    len = strlen(out);
+    if (!(len == 1 && out[0] == '/') && len + 1 < n) out[len++] = '/';
+    while (*p && len + 1 < n) out[len++] = *p++;
+    out[len] = '\0';
+}
+
+void sftp_quit(void)
+{
+    if (s_sftp)      { libssh2_sftp_shutdown(s_sftp); s_sftp = NULL; }
+    if (s_sftp_sess) { libssh2_session_disconnect(s_sftp_sess, "bye");
+                       libssh2_session_free(s_sftp_sess); s_sftp_sess = NULL; }
+    if (s_sftp_sock >= 0) { close(s_sftp_sock); s_sftp_sock = -1; }
+    libssh2_exit();
+}
+
+/**
+ * @brief Connect + auth + open the SFTP subsystem (no shell). cwd <- realpath(".").
+ * @return 0 on success, -1 on any failure (all state freed). Never logs the password.
+ */
+int sftp_open(const char *user, const char *pass, const char *host, uint16_t port)
+{
+    struct addrinfo hints, *res = NULL;
+    char ps[8];
+    int  sock = -1;
+
+    s_sftp_sess = NULL; s_sftp = NULL; s_sftp_sock = -1;
+    strcpy(s_sftp_cwd, "/");
+
+    if (libssh2_init(0) != 0) { disk_logf("sftp: init fail"); return -1; }
+    s_sftp_sess = libssh2_session_init();
+    if (!s_sftp_sess) { disk_logf("sftp: session_init NULL lfb=%u",
+                        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+                        libssh2_exit(); return -1; }
+    libssh2_session_set_blocking(s_sftp_sess, 1);
 
     snprintf(ps, sizeof ps, "%u", (unsigned)port);
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) { disk_logf("sftp-spike: DNS fail"); goto out; }
+    if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) { disk_logf("sftp: DNS fail"); goto fail; }
     sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) { freeaddrinfo(res); disk_logf("sftp-spike: socket fail"); goto out; }
+    if (sock < 0) { freeaddrinfo(res); disk_logf("sftp: socket fail"); goto fail; }
     { struct timeval tv = { .tv_sec = 15, .tv_usec = 0 };
       setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
       setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
-    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); disk_logf("sftp-spike: connect fail"); goto out; }
+    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) { freeaddrinfo(res); disk_logf("sftp: connect fail"); goto fail; }
     freeaddrinfo(res); res = NULL;
     { int yes = 1; setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes); }
+    s_sftp_sock = sock;
 
-    if (libssh2_session_handshake(sess, sock)) { disk_logf("sftp-spike: handshake FAIL"); goto out; }
-    disk_logf("sftp-spike: handshake min_free=%u", (unsigned)esp_get_minimum_free_heap_size());
-    if (libssh2_userauth_password(sess, user, pass)) { disk_logf("sftp-spike: AUTH FAIL"); goto out; }
-    disk_logf("sftp-spike: auth min_free=%u free=%u",
-              (unsigned)esp_get_minimum_free_heap_size(), (unsigned)esp_get_free_heap_size());
+    if (libssh2_session_handshake(s_sftp_sess, sock)) { disk_logf("sftp: handshake FAIL"); goto fail; }
+    if (libssh2_userauth_password(s_sftp_sess, user, pass)) { disk_logf("sftp: AUTH FAILED %s", user); goto fail; }
+    s_sftp = libssh2_sftp_init(s_sftp_sess);
+    if (!s_sftp) { disk_logf("sftp: sftp_init FAIL"); goto fail; }
 
-    sftp = libssh2_sftp_init(sess);
-    if (!sftp) { disk_logf("sftp-spike: sftp_init FAIL"); goto out; }
-    disk_logf("sftp-spike: sftp_init min_free=%u free=%u contig=%u",
-              (unsigned)esp_get_minimum_free_heap_size(), (unsigned)esp_get_free_heap_size(),
-              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    /* Land in the login dir: realpath(".") -> absolute home. */
+    { char home[256];
+      int n = libssh2_sftp_realpath(s_sftp, ".", home, sizeof home - 1);
+      if (n > 0) { home[n] = 0; strncpy(s_sftp_cwd, home, sizeof s_sftp_cwd - 1);
+                   s_sftp_cwd[sizeof s_sftp_cwd - 1] = 0; } }
+    disk_logf("sftp: up %s@%s:%u cwd=%s min_free=%u", user, host, (unsigned)port,
+              s_sftp_cwd, (unsigned)esp_get_minimum_free_heap_size());
+    return 0;
 
-    fh = libssh2_sftp_open(sftp, path, LIBSSH2_FXF_READ, 0);
-    if (!fh) { disk_logf("sftp-spike: open '%s' FAIL", path); goto out; }
-    disk_logf("sftp-spike: opened %s min_free=%u", path, (unsigned)esp_get_minimum_free_heap_size());
+fail:
+    sftp_quit();
+    return -1;
+}
 
-    {
-        char    b[1024];
-        ssize_t n;
-        int     logged = 0;
-        while ((n = libssh2_sftp_read(fh, b, sizeof b)) > 0) {
-            total += (long)n;
-            if (!logged) { logged = 1;
-                disk_logf("sftp-spike: first read n=%d min_free=%u free=%u",
-                          (int)n, (unsigned)esp_get_minimum_free_heap_size(),
-                          (unsigned)esp_get_free_heap_size()); }
-            if (total > 65536L) break;   /* enough to gauge the floor */
-        }
+int sftp_pwd(char *out, size_t n) { snprintf(out, n, "%s", s_sftp_cwd); return 0; }
+
+int sftp_cd(const char *dir)
+{
+    char want[256], canon[256];
+    LIBSSH2_SFTP_HANDLE *d;
+    int rc;
+    if (!s_sftp) return -1;
+    sftp_abspath(dir, want, sizeof want);
+    rc = libssh2_sftp_realpath(s_sftp, want, canon, sizeof canon - 1);
+    if (rc > 0) canon[rc] = 0; else { strncpy(canon, want, sizeof canon - 1); canon[sizeof canon - 1] = 0; }
+    d = libssh2_sftp_opendir(s_sftp, canon);   /* verify it's a readable dir */
+    if (!d) return -1;
+    libssh2_sftp_closedir(d);
+    strncpy(s_sftp_cwd, canon, sizeof s_sftp_cwd - 1); s_sftp_cwd[sizeof s_sftp_cwd - 1] = 0;
+    return 0;
+}
+
+int sftp_ls(const char *arg, sftp_sink_fn sink)
+{
+    char path[256], line[320], name[256];
+    LIBSSH2_SFTP_HANDLE *d;
+    LIBSSH2_SFTP_ATTRIBUTES at;
+    int n;
+    if (!s_sftp) return -1;
+    sftp_abspath(arg, path, sizeof path);
+    d = libssh2_sftp_opendir(s_sftp, path);
+    if (!d) return -1;
+    while ((n = libssh2_sftp_readdir(d, name, sizeof name - 1, &at)) > 0) {
+        char type = (at.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+                    LIBSSH2_SFTP_S_ISDIR(at.permissions) ? 'd' : '-';
+        unsigned long sz = (at.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (unsigned long)at.filesize : 0UL;
+        int len;
+        name[n] = 0;
+        len = snprintf(line, sizeof line, "%c %10lu  %s\r\n", type, sz, name);
+        if (sink) sink((const unsigned char *)line, (size_t)len);
     }
-    disk_logf("sftp-spike: read %ld bytes min_free=%u free=%u",
-              total, (unsigned)esp_get_minimum_free_heap_size(),
-              (unsigned)esp_get_free_heap_size());
+    libssh2_sftp_closedir(d);
+    return 0;
+}
 
-out:
-    if (fh)   libssh2_sftp_close(fh);
-    if (sftp) libssh2_sftp_shutdown(sftp);
-    if (sess) { libssh2_session_disconnect(sess, "bye"); libssh2_session_free(sess); }
-    if (sock >= 0) close(sock);
-    libssh2_exit();
-    disk_logf("sftp-spike: teardown free=%u", (unsigned)esp_get_free_heap_size());
-    return (total > 0) ? (int)total : -1;
+long sftp_size(const char *file)
+{
+    char path[256];
+    LIBSSH2_SFTP_ATTRIBUTES at;
+    if (!s_sftp) return -1;
+    sftp_abspath(file, path, sizeof path);
+    if (libssh2_sftp_stat(s_sftp, path, &at) != 0) return -1;
+    return (at.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (long)at.filesize : -1;
+}
+
+int sftp_get(const char *file, sftp_sink_fn sink)
+{
+    char path[256], b[1024];
+    LIBSSH2_SFTP_HANDLE *fh;
+    ssize_t n;
+    if (!s_sftp) return -1;
+    sftp_abspath(file, path, sizeof path);
+    fh = libssh2_sftp_open(s_sftp, path, LIBSSH2_FXF_READ, 0);
+    if (!fh) return -1;
+    while ((n = libssh2_sftp_read(fh, b, sizeof b)) > 0)
+        if (sink) sink((const unsigned char *)b, (size_t)n);
+    libssh2_sftp_close(fh);
+    return (n < 0) ? -1 : 0;
 }
