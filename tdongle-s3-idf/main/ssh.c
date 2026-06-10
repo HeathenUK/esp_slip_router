@@ -332,6 +332,28 @@ fail:
 
 int sftp_pwd(char *out, size_t n) { snprintf(out, n, "%s", s_sftp_cwd); return 0; }
 
+/**
+ * @brief Has the SFTP session hit a non-recoverable transport error?
+ * @return 1 if the last libssh2 error was fatal (cipher desync / socket loss) so
+ *         the REPL should tear down now rather than strand AT mode + httpd; 0 if
+ *         the session is still usable (a healthy session reports ERROR_NONE, and
+ *         an ordinary op failure like "no such file" is non-fatal). Sticky by
+ *         design -- these codes are never set spuriously and never recover.
+ */
+int sftp_fatal(void)
+{
+    if (!s_sftp_sess) return 1;
+    switch (libssh2_session_last_errno(s_sftp_sess)) {
+        case LIBSSH2_ERROR_DECRYPT:
+        case LIBSSH2_ERROR_SOCKET_SEND:
+        case LIBSSH2_ERROR_SOCKET_RECV:
+        case LIBSSH2_ERROR_SOCKET_DISCONNECT:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 int sftp_cd(const char *dir)
 {
     char want[256], canon[256];

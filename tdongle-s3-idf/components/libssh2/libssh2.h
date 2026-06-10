@@ -766,7 +766,15 @@ LIBSSH2_API int libssh2_poll(LIBSSH2_POLLFD *fds, unsigned int nfds,
 
 /* Channel API */
 #define LIBSSH2_CHANNEL_WINDOW_DEFAULT  (2*1024*1024)
-#define LIBSSH2_CHANNEL_PACKET_DEFAULT  32768
+/* EMBEDDED TUNING (T-Dongle S3, no PSRAM): upstream 32768. This is the max
+ * SSH_MSG_CHANNEL_DATA payload we ADVERTISE that a server may send in one packet.
+ * The receive path stages raw bytes through buf[PACKETBUFSIZE]=4096 (shrunk for
+ * heap); a single inbound SSH packet larger than that desyncs the cipher. Capping
+ * the advertised channel packet to 2048 forces servers to fragment large data
+ * (e.g. SFTP directory listings, file bodies, shell output) into pieces the 4 KB
+ * staging buffer carries cleanly. Reassembly of the SFTP-level message happens
+ * above the channel, so listings/transfers of any size still work. Costs no heap. */
+#define LIBSSH2_CHANNEL_PACKET_DEFAULT  2048
 #define LIBSSH2_CHANNEL_MINADJUST       1024
 
 /* Extended Data Handling */

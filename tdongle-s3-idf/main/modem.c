@@ -164,6 +164,7 @@ extern void ssh_close(void);
  * it for ftpget). */
 extern int  sftp_open(const char *user, const char *pass, const char *host, uint16_t port);
 extern int  sftp_pwd(char *out, size_t n);
+extern int  sftp_fatal(void);   /* 1 if the SFTP session hit a fatal transport error */
 extern int  sftp_cd(const char *dir);
 extern int  sftp_ls(const char *arg, void (*sink)(const unsigned char *, size_t));
 extern long sftp_size(const char *file);
@@ -2079,6 +2080,10 @@ static void cmd_sftp_impl(void) {
         } else {
             cdc_print("?Unknown (pwd/cd/cdup/ls/get/put/mkdir/rmdir/del/ren/bye)\r\n");
         }
+        /* A fatal transport error (cipher desync / dropped socket) makes every
+         * further op fail; tear down now instead of stranding AT mode + httpd
+         * until the user happens to type bye. */
+        if (sftp_fatal()) { cdc_print("\r\nSFTP session lost -- NO CARRIER\r\n"); break; }
         ftp_prompt();
     }
 
