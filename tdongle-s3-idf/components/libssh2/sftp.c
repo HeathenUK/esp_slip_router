@@ -796,17 +796,18 @@ static LIBSSH2_SFTP *sftp_init(LIBSSH2_SESSION *session)
 
     if(session->sftpInit_state == libssh2_NB_state_created) {
         /* EMBEDDED TUNING (T-Dongle S3, no-PSRAM): open the SFTP channel with a
-         * SMALL receive window (8 KB) instead of the 2 MB default. The window is
-         * how much the server may send before blocking for a WINDOW_ADJUST; with
-         * 2 MB the server floods an entire directory listing / file response into
-         * libssh2's channel buffer before we consume it, so the transient heap is
-         * the whole response (defeating the streaming readdir and OOMing on large
-         * dirs). 8 KB flow-controls the server to a few packets in flight; the
-         * streaming reader pulls + replenishes the window as it parses. */
+         * SMALL receive window + packet (4 KB / 2 KB) instead of libssh2's
+         * defaults (2 MB / 32 KB). The window is how much the server may send
+         * before blocking for a WINDOW_ADJUST; with 2 MB the server floods an
+         * entire directory listing / file response into libssh2's channel buffer
+         * before we consume it, so the transient heap is the whole response
+         * (defeating the streaming readdir and OOMing on large dirs). 4 KB
+         * flow-controls the server to a few packets in flight; the streaming
+         * reader pulls + replenishes the window as it parses. (Mirrors the values
+         * the AT$SSH relay opens its channel with in main/ssh.c.) */
         session->sftpInit_channel =
             _libssh2_channel_open(session, "session", sizeof("session") - 1,
-                                  4096,
-                                  LIBSSH2_CHANNEL_PACKET_DEFAULT, NULL, 0);
+                                  4096 /*window*/, 2048 /*packet*/, NULL, 0);
         if(!session->sftpInit_channel) {
             if(libssh2_session_last_errno(session) == LIBSSH2_ERROR_EAGAIN) {
                 _libssh2_error(session, LIBSSH2_ERROR_EAGAIN,

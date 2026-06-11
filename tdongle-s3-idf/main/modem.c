@@ -2013,7 +2013,7 @@ static void cmd_sftp_impl(void) {
 
     /* Always quiesce (SSH session -- see cmd_ssh_impl). */
     app_secure_quiesce(true);
-    relay_dlbuf_reclaim();   /* free the 4 KB download buffer for libssh2's listing alloc */
+    relay_dlbuf_reclaim();   /* free the 4 KB download buffer (unused in-session) for heap headroom */
     disk_logf("sftp: post-quiesce free=%u contig=%u",
               (unsigned)esp_get_free_heap_size(),
               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
