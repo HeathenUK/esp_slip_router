@@ -270,13 +270,12 @@ static void sftp_abspath(const char *p, char *out, size_t n)
 
 void sftp_quit(void)
 {
-    /* The session may be dead (a heap-starved big readdir, a dropped WiFi link).
-     * In blocking mode libssh2_sftp_shutdown / session_disconnect try to SEND a
-     * graceful close and would block ~15 s each (SO_SNDTIMEO) on a socket that
-     * will never drain -- the worker then never clears s_at_busy and the device
-     * looks wedged. Flip libssh2 non-blocking first so those sends return EAGAIN
-     * immediately; we free + close regardless (the peer times the link out). */
-    if (s_sftp_sess) libssh2_session_set_blocking(s_sftp_sess, 0);
+    /* Stay BLOCKING here: libssh2_sftp_shutdown -> _libssh2_channel_free and
+     * session_disconnect must run to completion to actually FREE the channel +
+     * SFTP structs. (A non-blocking teardown returns EAGAIN and leaks them, which
+     * degrades the heap a couple KB per session.) A dead socket bounds each send
+     * at SO_SNDTIMEO; recovery during any slow teardown is covered by the
+     * AT$RESET/AT$OTASTART busy-guard bypass, so we don't risk a leak to save it. */
     if (s_sftp)      { libssh2_sftp_shutdown(s_sftp); s_sftp = NULL; }
     if (s_sftp_sess) { libssh2_session_disconnect(s_sftp_sess, "bye");
                        libssh2_session_free(s_sftp_sess); s_sftp_sess = NULL; }
@@ -317,6 +316,12 @@ int sftp_open(const char *user, const char *pass, const char *host, uint16_t por
     freeaddrinfo(res); res = NULL;
     { int yes = 1; setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes); }
     s_sftp_sock = sock;
+
+    /* Bound EVERY blocking libssh2 op (read/readdir/teardown). Blocking mode uses
+     * select(), which ignores SO_SNDTIMEO -- without this, an op on a dead socket
+     * (WiFi dropped mid-session) blocks the worker forever, so s_at_busy never
+     * clears and the device looks wedged. 10 s is generous for a live link. */
+    libssh2_session_set_timeout(s_sftp_sess, 10000);
 
     if (libssh2_session_handshake(s_sftp_sess, sock)) { disk_logf("sftp: handshake FAIL"); goto fail; }
     if (libssh2_userauth_password(s_sftp_sess, user, pass)) { disk_logf("sftp: AUTH FAILED %s", user); goto fail; }

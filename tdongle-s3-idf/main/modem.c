@@ -388,6 +388,24 @@ static StreamBufferHandle_t s_to_cdc = NULL;
  * the USB OUT EP all the way to the host. */
 static StreamBufferHandle_t s_to_tcp = NULL;
 
+/**
+ * @brief Reclaim the download StreamBuffer for the duration of a secure session.
+ *
+ * During an SFTP/SSH session the relay is not running (s_online stays false, the
+ * CDC pump task is parked, and SFTP get writes via cdc_write directly), so the
+ * DATA_STREAM_BYTES download buffer is dead weight. Freeing it returns those
+ * bytes to the heap for libssh2's one-shot directory-listing allocation, which
+ * otherwise can't find a big enough block on the no-PSRAM heap. Restored on
+ * teardown. The upload buffer (s_to_tcp) is left intact -- the put path uses it.
+ */
+static bool s_dlbuf_reclaimed = false;
+static void relay_dlbuf_reclaim(void) {
+    if (s_to_cdc && !s_online) { vStreamBufferDelete(s_to_cdc); s_to_cdc = NULL; s_dlbuf_reclaimed = true; }
+}
+static void relay_dlbuf_restore(void) {
+    if (s_dlbuf_reclaimed) { s_to_cdc = xStreamBufferCreate(DATA_STREAM_BYTES, 1); s_dlbuf_reclaimed = false; }
+}
+
 /* +++ escape sequence detector. Hayes rule: 1 s of guard, then exactly
  * three '+' within 1 s, then 1 s of guard with no other data. */
 #define GUARD_US 1000000
@@ -1995,12 +2013,13 @@ static void cmd_sftp_impl(void) {
 
     /* Always quiesce (SSH session -- see cmd_ssh_impl). */
     app_secure_quiesce(true);
+    relay_dlbuf_reclaim();   /* free the 4 KB download buffer for libssh2's listing alloc */
     disk_logf("sftp: post-quiesce free=%u contig=%u",
               (unsigned)esp_get_free_heap_size(),
               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     if (sftp_open(s_ssh_user, s_ssh_pass, s_ssh_host, s_ssh_port) != 0) {
-        app_secure_quiesce(false); r_nocarrier(); return;
+        relay_dlbuf_restore(); app_secure_quiesce(false); r_nocarrier(); return;
     }
     if (!s_ftp_q) s_ftp_q = xQueueCreate(4, FTP_LINE_MAX);
     s_ftp_line_len = 0;
@@ -2089,6 +2108,7 @@ static void cmd_sftp_impl(void) {
 
     s_ftp_active = false;
     sftp_quit();
+    relay_dlbuf_restore();
     app_secure_quiesce(false);
     s_peer[0] = 0;
     r_nocarrier();
