@@ -60,6 +60,7 @@
 #include "disk.h"   /* disk_logf */
 #include "slip.h"
 #include "kbd.h"
+#include "usb.h"    /* usb_net_enabled -- AT$USBNET query */
 
 #define TAG "modem"
 
@@ -2602,6 +2603,37 @@ static void handle_dollar(char *s) {
         int n = kbd_type(val, (int)strlen(val));
         if (n < 0) { r_error(); return; }
         r_ok();
+    } else if (!strcmp(key, "USBNET")) {
+        /* AT$USBNET=1|0 -- choose the USB composite for the NEXT boot:
+         * 1 = NET (CDC + MSC + CDC-ECM network adapter, no HID keyboard),
+         * 0 = normal (CDC + MSC + HID). NVS-persisted; applied by usb.c at
+         * enumeration time because the DWC2 core only has 5 IN-endpoint
+         * FIFOs -- ECM and HID can't coexist. Bare AT$USBNET queries both
+         * the saved flag and what this boot is actually running. */
+        if (val && eq) {
+            if (val[0] != '0' && val[0] != '1') { r_error(); return; }
+            nvs_handle_t h;
+            if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) { r_error(); return; }
+            esp_err_t we = nvs_set_u8(h, "usbnet", (uint8_t)(val[0] - '0'));
+            if (we == ESP_OK) we = nvs_commit(h);
+            nvs_close(h);
+            if (we != ESP_OK) { r_error(); return; }
+            cdc_print(val[0] == '1'
+                      ? "\r\nUSBNET=1 saved -- AT$RESET to reboot into NET mode (ECM, no HID)\r\n"
+                      : "\r\nUSBNET=0 saved -- AT$RESET to reboot into normal mode (HID, no ECM)\r\n");
+            r_ok();
+        } else {
+            nvs_handle_t h; uint8_t v = 0;
+            if (nvs_open("slip-router", NVS_READONLY, &h) == ESP_OK) {
+                nvs_get_u8(h, "usbnet", &v);
+                nvs_close(h);
+            }
+            char o[96];
+            snprintf(o, sizeof o, "\r\nUSBNET=%u (this boot: %s)\r\n",
+                     (unsigned)v, usb_net_enabled() ? "NET/ECM" : "normal/HID");
+            cdc_print(o);
+            r_ok();
+        }
     } else if (!strcmp(key, "LECHO")) {
         /* AT$LECHO=AUTO|ON|OFF -- override the data-mode local-echo
          * policy. AUTO is the negotiated rule with the password-safety
@@ -2834,6 +2866,7 @@ static void handle_dollar(char *s) {
             "AT$SCAN            list visible networks\r\n"
             "AT$NETIF           dump netif state\r\n"
             "AT$TYPE=<str>      send keystrokes via HID keyboard (DSL)\r\n"
+            "AT$USBNET=1|0      next-boot USB mode: ECM network adapter vs HID\r\n"
             "AT$LECHO=mode     data-mode local echo (AUTO/ON/OFF)\r\n"
             "AT$NAWS=cols,rows  declare terminal size for telnet NAWS\r\n"
             "AT$TTYPE=name      declare terminal type for telnet TTYPE\r\n"

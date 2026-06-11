@@ -86,6 +86,14 @@ CONFIG_TINYUSB_CDC_RX_BUFSIZE=2048
 # Costs 2 KB of BSS over the prior 2048 setting.
 CONFIG_TINYUSB_CDC_TX_BUFSIZE=4096
 CONFIG_TINYUSB_HID_COUNT=1
+# CDC-ECM network device class (the "WiFi for DOS" bridge -- see
+# ECM-BRIDGE-PLAN-2026-06-10.md). Compiles TinyUSB's ecm_rndis driver;
+# whether the ECM function actually enumerates is a RUNTIME choice
+# (NVS "usbnet", AT$USBNET=1) because the DWC2 core only has 5 IN-EP
+# FIFOs: NET mode swaps the HID keyboard's IN endpoint for ECM data
+# (and runs without the ECM notification endpoint -- see usb.c).
+# RNDIS is never declared in our descriptors; only the ECM half runs.
+CONFIG_TINYUSB_NET_MODE_ECM_RNDIS=y
 
 # Pin TinyUSB to CPU1. WiFi/lwIP/HTTPD/main all live on CPU0 by IDF
 # default; pinning TinyUSB to the other core means it doesn't compete

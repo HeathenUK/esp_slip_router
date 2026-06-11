@@ -50,6 +50,7 @@
 #include "disk.h"
 #include "fat.h"
 #include "slip.h"
+#include "ecm.h"
 #include "dns_forwarder.h"
 #include "kbd.h"
 #include "display.h"
@@ -1196,6 +1197,16 @@ void app_main(void) {
         esp_err_t e = usb_start();
         if (e != ESP_OK)
             disk_logf("usb_start at boot failed: %s", esp_err_to_name(e));
+    }
+
+    /* CDC-ECM bridge (NET mode only -- AT$USBNET=1 + reboot): lwIP netif
+     * + NAPT + DHCP server + DNS forwarder on 192.168.241.1/24. After
+     * usb_start (which reads the mode flag + primes the MAC string) and
+     * after wifi_start (STA netif must exist for NAPT to route through). */
+    if (usb_net_enabled()) {
+        esp_err_t e = ecm_start();
+        if (e != ESP_OK)
+            disk_logf("ecm_start failed: %s", esp_err_to_name(e));
     }
 
     /* Status LCD (0.96" ST7735). Brought up last so the state accessors

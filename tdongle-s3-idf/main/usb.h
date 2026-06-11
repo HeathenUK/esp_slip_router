@@ -1,5 +1,6 @@
 #pragma once
 #include "esp_err.h"
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -9,6 +10,10 @@ extern "C" {
  * stdout to the CDC interface. Call once after networking is up so
  * HTTP-based diagnostics survive even if anything here fails. */
 esp_err_t usb_start(void);
+
+/* True when this boot enumerated the NET composite (CDC + MSC + ECM,
+ * no HID) -- NVS "usbnet", toggled by AT$USBNET=1|0 + reboot. */
+bool usb_net_enabled(void);
 
 /* Soft USB re-enumeration: drop the D+ pullup (tud_disconnect), hold
  * long enough that the host fully tears down its device state, then

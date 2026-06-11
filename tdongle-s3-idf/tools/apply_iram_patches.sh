@@ -111,6 +111,30 @@ if [[ -f "${MSC_C}" ]]; then
   fi
 fi
 
+# --- Patch 4: ecm_rndis_device.c -- guard netd_report against a missing
+# notification endpoint. Our ECM descriptor deliberately omits the notif
+# endpoint (the ESP32-S3 DWC2 core has only 5 IN-endpoint TX FIFOs incl
+# EP0, all spoken for: CDC notif + CDC data + MSC + ECM data). The driver
+# parses it as optional, but netd_report() would then claim/xfer on
+# endpoint 0 (ep_notif == 0 -> the CONTROL endpoint) the first time the
+# host sends SET_ETHERNET_PACKET_FILTER -- corrupting EP0 mid-enumeration.
+NET_C="${PROJECT_DIR}/managed_components/espressif__tinyusb/src/class/net/ecm_rndis_device.c"
+if [[ -f "${NET_C}" ]]; then
+  if grep -q 'PATCHED: tolerate descriptor without notification EP' "${NET_C}"; then
+    echo "apply_iram_patches: ecm_rndis_device.c already patched"
+  else
+    if ! grep -q '^void netd_report(uint8_t \*buf, uint16_t len) {' "${NET_C}"; then
+      echo "ERROR: ecm_rndis_device.c doesn't have the expected netd_report signature. Upstream changed."
+      exit 1
+    fi
+    sed -i.bak 's#^void netd_report(uint8_t \*buf, uint16_t len) {#void netd_report(uint8_t *buf, uint16_t len) {\
+  if (0 == _netd_itf.ep_notif) { return; } /* PATCHED: tolerate descriptor without notification EP */#' "${NET_C}"
+    rm -f "${NET_C}.bak"
+    echo "apply_iram_patches: ecm_rndis_device.c patched (netd_report tolerates missing notif EP)"
+    patched=1
+  fi
+fi
+
 if [[ ${patched} -eq 0 ]]; then
   echo "apply_iram_patches: nothing to do"
 fi

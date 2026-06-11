@@ -14,6 +14,8 @@ idf_component_register(
         "modem.c"
         "fat.c"
         "slip.c"
+        "ecm.c"
+        "dhserver.c"
         "dns_forwarder.c"
         "kbd.c"
         "display.c"

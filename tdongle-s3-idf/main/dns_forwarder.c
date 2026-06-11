@@ -78,7 +78,9 @@ static void send_err_response(int sock, uint8_t *rbuf, size_t qlen_in_rbuf,
 }
 
 static void dns_task(void *arg) {
-    (void)arg;
+    /* Bind IP (host order) arrives as the task arg -- one forwarder
+     * instance per netif IP (SLIP 192.168.240.1, ECM 192.168.241.1). */
+    uint32_t bind_ip = (uint32_t)(uintptr_t)arg;
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
@@ -90,8 +92,7 @@ static void dns_task(void *arg) {
     struct sockaddr_in addr = { 0 };
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons(53);
-    /* 192.168.240.1 -- the SLIP netif's IP. */
-    addr.sin_addr.s_addr = htonl((192U << 24) | (168U << 16) | (240U << 8) | 1U);
+    addr.sin_addr.s_addr = htonl(bind_ip);
     if (bind(sock, (struct sockaddr *)&addr, sizeof addr) < 0) {
         disk_logf("dns_fwd: bind() failed errno=%d", errno);
         close(sock);
@@ -99,7 +100,9 @@ static void dns_task(void *arg) {
         return;
     }
 
-    disk_logf("dns_fwd: listening on 192.168.240.1:53");
+    disk_logf("dns_fwd: listening on %u.%u.%u.%u:53",
+              (unsigned)(bind_ip >> 24) & 0xFF, (unsigned)(bind_ip >> 16) & 0xFF,
+              (unsigned)(bind_ip >> 8) & 0xFF,  (unsigned)bind_ip & 0xFF);
 
     static uint8_t qbuf[512];
     static uint8_t rbuf[512];
@@ -183,5 +186,11 @@ static void dns_task(void *arg) {
 }
 
 void dns_forwarder_init(void) {
-    xTaskCreatePinnedToCore(dns_task, "dns_fwd", 3072, NULL, 5, NULL, 0);  /* SRAM: ~1.9K used (was 4096) */
+    /* 192.168.240.1 -- the SLIP netif's IP (the original single instance). */
+    dns_forwarder_init_ip((192U << 24) | (168U << 16) | (240U << 8) | 1U);
+}
+
+void dns_forwarder_init_ip(uint32_t ip_hostorder) {
+    xTaskCreatePinnedToCore(dns_task, "dns_fwd", 3072,
+                            (void *)(uintptr_t)ip_hostorder, 5, NULL, 0);  /* SRAM: ~1.9K used (was 4096) */
 }

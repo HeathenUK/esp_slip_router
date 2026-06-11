@@ -27,9 +27,13 @@
 #include "tusb_cdc_acm.h"
 #include "tusb_console.h"
 #include "class/hid/hid_device.h"
+#include "class/net/net_device.h"   /* CFG_TUD_NET_* + tud_network_mac_address */
+
+#include "nvs.h"
 
 #include "disk.h"
 #include "modem.h"
+#include "ecm.h"
 
 #include "hal/usb_serial_jtag_ll.h"
 #include "hal/usb_wrap_ll.h"
@@ -42,8 +46,11 @@
 #define TAG "usb"
 
 /* Device descriptor -- composite (IAD-style) class, custom PID, default
- * VID picked up from Kconfig (Espressif's 0x303A). */
-static const tusb_desc_device_t s_dev_desc = {
+ * VID picked up from Kconfig (Espressif's 0x303A). Non-const: NET mode
+ * (AT$USBNET=1) swaps idProduct to 0x4024 so hosts that cache device
+ * configs by VID/PID (macOS, Windows) never reuse the HID-shaped config
+ * for the ECM-shaped one. */
+static tusb_desc_device_t s_dev_desc = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = 0x0200,
@@ -102,17 +109,99 @@ static const uint8_t s_cfg_desc[] = {
                        sizeof(s_hid_report_desc), EPNUM_HID_IN, 8, 10),
 };
 
+/* ===== NET mode (AT$USBNET=1): CDC + MSC + ECM, no HID ==================
+ *
+ * The S3's DWC2 core has only 5 IN-endpoint TX FIFOs (EP0 included) and the
+ * normal composite uses all of them, so the ECM data-IN endpoint takes the
+ * HID keyboard's slot -- the two functions are a boot-time either/or.
+ *
+ * The ECM function also runs WITHOUT its notification endpoint (that would
+ * be IN #6): TinyUSB's driver parses it as optional, the CHUSB host plan
+ * explicitly tolerates its absence, and Linux's cdc_ether assumes link-up
+ * without a status endpoint. apply_iram_patches.sh guards netd_report()
+ * against the missing endpoint. Descriptor below is TUD_CDC_ECM_DESCRIPTOR
+ * (usbd.h) minus the 7-byte notification endpoint.
+ *
+ * Whole config blob stays well under the CH375 host's 512-byte parse buffer.
+ */
+enum {
+    ITF_NET_CDC = 0,
+    ITF_NET_CDC_DATA,
+    ITF_NET_MSC,
+    ITF_NET_ECM,
+    ITF_NET_ECM_DATA,
+    ITF_NET_TOTAL,
+};
+
+#define EPNUM_ECM_OUT  0x04   /* HID's endpoint number, reused for ECM data */
+#define EPNUM_ECM_IN   0x84
+
+#define ECM_NONOTIF_DESC_LEN (8+9+5+5+13+9+9+7+7)   /* 72: ECM template minus notif EP */
+
+/* CDC-ECM function, notification endpoint omitted (see block comment).
+ * Layout per TUD_CDC_ECM_DESCRIPTOR (TinyUSB usbd.h, MIT):
+ * IAD, comm interface (02h/06h), Header + Union + Ethernet Networking
+ * functional descriptors, data interface alt0 (no EPs) + alt1 (bulk pair). */
+#define ECM_NONOTIF_DESCRIPTOR(_itfnum, _desc_stridx, _mac_stridx, _epout, _epin, _epsize, _maxsegmentsize) \
+  /* Interface Association */\
+  8, TUSB_DESC_INTERFACE_ASSOCIATION, _itfnum, 2, TUSB_CLASS_CDC, CDC_COMM_SUBCLASS_ETHERNET_CONTROL_MODEL, 0, 0,\
+  /* CDC Control Interface */\
+  9, TUSB_DESC_INTERFACE, _itfnum, 0, 0, TUSB_CLASS_CDC, CDC_COMM_SUBCLASS_ETHERNET_CONTROL_MODEL, 0, _desc_stridx,\
+  /* CDC-ECM Header */\
+  5, TUSB_DESC_CS_INTERFACE, CDC_FUNC_DESC_HEADER, U16_TO_U8S_LE(0x0120),\
+  /* CDC-ECM Union */\
+  5, TUSB_DESC_CS_INTERFACE, CDC_FUNC_DESC_UNION, _itfnum, (uint8_t)((_itfnum) + 1),\
+  /* CDC-ECM Functional Descriptor */\
+  13, TUSB_DESC_CS_INTERFACE, CDC_FUNC_DESC_ETHERNET_NETWORKING, _mac_stridx, 0, 0, 0, 0, U16_TO_U8S_LE(_maxsegmentsize), U16_TO_U8S_LE(0), 0,\
+  /* CDC Data Interface (alt 0: inactive, no endpoints) */\
+  9, TUSB_DESC_INTERFACE, (uint8_t)((_itfnum)+1), 0, 0, TUSB_CLASS_CDC_DATA, 0, 0, 0,\
+  /* CDC Data Interface (alt 1: active) */\
+  9, TUSB_DESC_INTERFACE, (uint8_t)((_itfnum)+1), 1, 2, TUSB_CLASS_CDC_DATA, 0, 0, 0,\
+  /* Endpoint In */\
+  7, TUSB_DESC_ENDPOINT, _epin, TUSB_XFER_BULK, U16_TO_U8S_LE(_epsize), 0,\
+  /* Endpoint Out */\
+  7, TUSB_DESC_ENDPOINT, _epout, TUSB_XFER_BULK, U16_TO_U8S_LE(_epsize), 0
+
+#define CFG_TOTAL_LEN_NET (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN + ECM_NONOTIF_DESC_LEN)
+
+static const uint8_t s_cfg_desc_net[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NET_TOTAL, 0, CFG_TOTAL_LEN_NET,
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+
+    TUD_CDC_DESCRIPTOR(ITF_NET_CDC, 4, EPNUM_CDC_NOTIF, 8,
+                       EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
+
+    TUD_MSC_DESCRIPTOR(ITF_NET_MSC, 5, EPNUM_MSC_OUT, EPNUM_MSC_IN, 64),
+
+    ECM_NONOTIF_DESCRIPTOR(ITF_NET_ECM, 6, 7 /* iMACAddress string */,
+                           EPNUM_ECM_OUT, EPNUM_ECM_IN,
+                           CFG_TUD_NET_ENDPOINT_SIZE, CFG_TUD_NET_MTU),
+};
+
+/* Boot-time mode flag, read once from NVS ("slip-router"/"usbnet"). */
+static bool s_net_mode = false;
+bool usb_net_enabled(void) { return s_net_mode; }
+
 /* String descriptors. Serial is derived from the WiFi-station MAC on
- * the fly in usb_start() so each dongle reports a stable unique id. */
+ * the fly in usb_start() so each dongle reports a stable unique id.
+ *
+ * esp_tinyusb caps the table at 8 entries (USB_STRING_DESCRIPTOR_ARRAY_SIZE
+ * -- exceeding it fails tinyusb_driver_install with ESP_ERR_NOT_SUPPORTED),
+ * and HID/ECM never coexist, so NET mode REUSES slot 6 for the ECM interface
+ * name and adds the iMACAddress at slot 7: exactly 12 hex digits the host
+ * parses into the 6-byte MAC its network adapter will use (the esp_tinyusb
+ * wrapper converts the ASCII to the UTF-16LE the spec wants). */
 static char        s_serial_str[13]; /* 12 hex chars + NUL */
-static const char *s_strings[] = {
+static char        s_mac_str[13];    /* 12 hex chars + NUL (iMACAddress) */
+static const char *s_strings[8] = {
     (const char[]){0x09, 0x04}, /* 0: en-US */
     "DOSongle",                 /* 1: manufacturer */
     "DOSongle T-Dongle S3",     /* 2: product */
     s_serial_str,               /* 3: serial -- filled at runtime */
     "DOSongle CDC",             /* 4: CDC interface */
     "DOSongle Disk",            /* 5: MSC interface */
-    "DOSongle Keyboard",        /* 6: HID interface */
+    "DOSongle Keyboard",        /* 6: HID itf; NET mode: "DOSongle Net" */
+    NULL,                       /* 7: NET mode only: iMACAddress */
 };
 
 /* ---- HID callbacks (TinyUSB asks us for these, even if we never
@@ -187,6 +276,29 @@ esp_err_t usb_start(void) {
     snprintf(s_serial_str, sizeof(s_serial_str), "%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+    /* NET mode (AT$USBNET=1, NVS-persisted): swap the HID keyboard for the
+     * CDC-ECM function -- the DWC2 only has 5 IN-EP FIFOs, so the two are a
+     * boot-time either/or (see the s_cfg_desc_net block comment). */
+    {
+        nvs_handle_t h;
+        uint8_t v = 0;
+        if (nvs_open("slip-router", NVS_READONLY, &h) == ESP_OK) {
+            nvs_get_u8(h, "usbnet", &v);
+            nvs_close(h);
+        }
+        s_net_mode = (v == 1);
+    }
+    if (s_net_mode) {
+        ecm_mac_init();    /* host reads the MAC during enumeration */
+        snprintf(s_mac_str, sizeof(s_mac_str), "%02X%02X%02X%02X%02X%02X",
+                 tud_network_mac_address[0], tud_network_mac_address[1],
+                 tud_network_mac_address[2], tud_network_mac_address[3],
+                 tud_network_mac_address[4], tud_network_mac_address[5]);
+        s_strings[6] = "DOSongle Net";   /* HID is absent; slot 6 = ECM itf */
+        s_strings[7] = s_mac_str;        /* iMACAddress */
+        s_dev_desc.idProduct = 0x4024;   /* distinct cached-config identity */
+    }
+
     esp_err_t err = disk_init();
     if (err != ESP_OK) return err;
 
@@ -195,9 +307,11 @@ esp_err_t usb_start(void) {
     const tinyusb_config_t cfg = {
         .device_descriptor        = &s_dev_desc,
         .string_descriptor        = s_strings,
-        .string_descriptor_count  = (int)(sizeof(s_strings) / sizeof(s_strings[0])),
+        /* esp_tinyusb hard-caps this at 8; normal mode passes 7 (slot 7 is
+         * NULL outside NET mode). */
+        .string_descriptor_count  = s_net_mode ? 8 : 7,
         .external_phy             = false,
-        .configuration_descriptor = s_cfg_desc,
+        .configuration_descriptor = s_net_mode ? s_cfg_desc_net : s_cfg_desc,
     };
     err = tinyusb_driver_install(&cfg);
     if (err != ESP_OK) {
@@ -228,7 +342,8 @@ esp_err_t usb_start(void) {
         return err;
     }
 
-    ESP_LOGI(TAG, "composite USB up: MSC + HID + CDC, serial=%s", s_serial_str);
+    ESP_LOGI(TAG, "composite USB up: MSC + %s + CDC, serial=%s",
+             s_net_mode ? "ECM" : "HID", s_serial_str);
     return ESP_OK;
 }
 
