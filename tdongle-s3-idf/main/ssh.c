@@ -387,12 +387,24 @@ int sftp_cd(const char *dir)
     return 0;
 }
 
+/** @brief Per-entry callback for the streaming readdir: format one "type size
+ *  name" line and hand it to the sink (passed as @p ctx). */
+static void sftp_ls_emit(void *ctx, const char *name, LIBSSH2_SFTP_ATTRIBUTES *at)
+{
+    sftp_sink_fn sink = (sftp_sink_fn)ctx;
+    char line[320];
+    char type = (at->flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+                LIBSSH2_SFTP_S_ISDIR(at->permissions) ? 'd' : '-';
+    unsigned long sz = (at->flags & LIBSSH2_SFTP_ATTR_SIZE) ? (unsigned long)at->filesize : 0UL;
+    int len = snprintf(line, sizeof line, "%c %10lu  %s\r\n", type, sz, name);
+    if (sink) sink((const unsigned char *)line, (size_t)len);
+}
+
 int sftp_ls(const char *arg, sftp_sink_fn sink)
 {
-    char path[256], line[320], name[256];
+    char path[256];
     LIBSSH2_SFTP_HANDLE *d;
-    LIBSSH2_SFTP_ATTRIBUTES at;
-    int n;
+    int rc;
     if (!s_sftp) return -1;
     sftp_abspath(arg, path, sizeof path);
     d = libssh2_sftp_opendir(s_sftp, path);
@@ -404,27 +416,17 @@ int sftp_ls(const char *arg, sftp_sink_fn sink)
                   emsg ? emsg : "?");
         return -1;
     }
-    for (;;) {
-        char type; unsigned long sz; int len;
-        n = libssh2_sftp_readdir(d, name, sizeof name - 1, &at);
-        if (n == 0) break;                       /* end of directory */
-        if (n < 0) {                             /* error -- was silently swallowed */
-            char *emsg = NULL;
-            int serr = libssh2_session_last_error(s_sftp_sess, &emsg, NULL, 0);
-            disk_logf("sftp: readdir FAIL n=%d libssh2=%d contig=%u free=%u msg=%s", n,
-                      serr, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                      (unsigned)esp_get_free_heap_size(), emsg ? emsg : "?");
-            libssh2_sftp_closedir(d);
-            return -1;
-        }
-        type = (at.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-               LIBSSH2_SFTP_S_ISDIR(at.permissions) ? 'd' : '-';
-        sz = (at.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (unsigned long)at.filesize : 0UL;
-        name[n] = 0;
-        len = snprintf(line, sizeof line, "%c %10lu  %s\r\n", type, sz, name);
-        if (sink) sink((const unsigned char *)line, (size_t)len);
-    }
+    /* Streaming readdir: O(one entry) memory, so the listing size is no longer
+     * bounded by the heap -- lists directories of any size (see sftp.c). */
+    rc = libssh2_sftp_readdir_stream(d, sftp_ls_emit, (void *)sink);
     libssh2_sftp_closedir(d);
+    if (rc < 0) {
+        char *emsg = NULL;
+        int serr = libssh2_session_last_error(s_sftp_sess, &emsg, NULL, 0);
+        disk_logf("sftp: readdir_stream FAIL rc=%d libssh2=%d free=%u msg=%s", rc,
+                  serr, (unsigned)esp_get_free_heap_size(), emsg ? emsg : "?");
+        return -1;
+    }
     return 0;
 }
 

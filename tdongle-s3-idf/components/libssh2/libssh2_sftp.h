@@ -250,6 +250,20 @@ LIBSSH2_API int libssh2_sftp_readdir_ex(LIBSSH2_SFTP_HANDLE *handle, \
     libssh2_sftp_readdir_ex((handle), (buffer), (buffer_maxlen), NULL, 0, \
                             (attrs))
 
+/* T-Dongle S3 (no-PSRAM) addition -- NOT upstream libssh2.
+ * Streaming readdir: parses each FXP_NAME batch off the channel entry-by-entry
+ * into a small fixed buffer, invoking @cb per entry, so memory use is O(one
+ * entry) instead of one contiguous alloc for the whole batch (which fails on
+ * the tiny internal heap for large directories). Lists the WHOLE directory
+ * (loops batches until EOF). Blocking sessions only; must be the sole channel
+ * reader while it runs. @return 0 on success, negative LIBSSH2_ERROR_* on
+ * failure. See ssh.c sftp_ls(). */
+typedef void (*libssh2_sftp_entry_cb)(void *ctx, const char *name,
+                                      LIBSSH2_SFTP_ATTRIBUTES *attrs);
+LIBSSH2_API int
+libssh2_sftp_readdir_stream(LIBSSH2_SFTP_HANDLE *handle,
+                            libssh2_sftp_entry_cb cb, void *ctx);
+
 LIBSSH2_API ssize_t libssh2_sftp_write(LIBSSH2_SFTP_HANDLE *handle,
                                        const char *buffer, size_t count);
 LIBSSH2_API int libssh2_sftp_fsync(LIBSSH2_SFTP_HANDLE *handle);

@@ -1977,6 +1977,224 @@ libssh2_sftp_readdir_ex(LIBSSH2_SFTP_HANDLE *hnd, char *buffer,
     return rc;
 }
 
+/* ===========================================================================
+ * Streaming readdir (T-Dongle S3, no-PSRAM addition -- NOT upstream libssh2)
+ *
+ * libssh2_sftp_readdir buffers a whole FXP_NAME batch in one contiguous alloc
+ * (sftp_packet_read -> partial_len), which fails on the tiny internal heap for
+ * large directories. This variant speaks the SFTP wire protocol directly on
+ * the channel and parses each batch entry-by-entry into a small fixed buffer,
+ * calling a callback per entry -- memory use is O(one entry), independent of
+ * batch or directory size. It loops batches until the server returns
+ * FXP_STATUS(EOF), so it lists the entire directory.
+ *
+ * It reads the channel directly, so it must be the SOLE reader while running
+ * (true in the dongle's synchronous SFTP REPL: one op at a time, and opendir
+ * leaves no buffered packets). Blocking mode only -- session_set_timeout bounds
+ * each read so a dead link can't hang it.
+ * ======================================================================== */
+
+/* Ensure `need` bytes are available at buf[*pos], compacting consumed bytes to
+ * the front and refilling from the channel WITHOUT reading past the current
+ * SFTP message (*msg_left bytes remain in it). */
+static int srd_ensure(LIBSSH2_CHANNEL *ch, unsigned char *buf, size_t bufsz,
+                      size_t *have, size_t *pos, size_t *msg_left, size_t need)
+{
+    if(need > bufsz)
+        return LIBSSH2_ERROR_BUFFER_TOO_SMALL;
+    if(*pos + need <= *have)
+        return 0;
+    if(*pos) {
+        memmove(buf, buf + *pos, *have - *pos);
+        *have -= *pos;
+        *pos = 0;
+    }
+    while(*have < need) {
+        ssize_t r;
+        size_t want = bufsz - *have;
+        if(want > *msg_left)
+            want = *msg_left;
+        if(!want)
+            return LIBSSH2_ERROR_SFTP_PROTOCOL;   /* message ended mid-field */
+        r = _libssh2_channel_read(ch, 0, (char *)buf + *have, want);
+        if(r == LIBSSH2_ERROR_EAGAIN)
+            continue;
+        if(r < 0)
+            return (int)r;
+        if(r == 0)
+            return LIBSSH2_ERROR_SOCKET_RECV;
+        *have += (size_t)r;
+        *msg_left -= (size_t)r;
+    }
+    return 0;
+}
+
+/* Discard `n` bytes of the current message (buffered first, then channel). */
+static int srd_skip(LIBSSH2_CHANNEL *ch, unsigned char *buf, size_t bufsz,
+                    size_t *have, size_t *pos, size_t *msg_left, size_t n)
+{
+    while(n) {
+        size_t avail = *have - *pos, take;
+        if(!avail) {
+            ssize_t r;
+            size_t want = bufsz;
+            if(want > *msg_left)
+                want = *msg_left;
+            if(!want)
+                return LIBSSH2_ERROR_SFTP_PROTOCOL;
+            r = _libssh2_channel_read(ch, 0, (char *)buf, want);
+            if(r == LIBSSH2_ERROR_EAGAIN)
+                continue;
+            if(r < 0)
+                return (int)r;
+            if(r == 0)
+                return LIBSSH2_ERROR_SOCKET_RECV;
+            *have = (size_t)r;
+            *pos = 0;
+            *msg_left -= (size_t)r;
+            avail = (size_t)r;
+        }
+        take = avail < n ? avail : n;
+        *pos += take;
+        n -= take;
+    }
+    return 0;
+}
+
+LIBSSH2_API int
+libssh2_sftp_readdir_stream(LIBSSH2_SFTP_HANDLE *handle,
+                            libssh2_sftp_entry_cb cb, void *ctx)
+{
+    LIBSSH2_SFTP    *sftp;
+    LIBSSH2_CHANNEL *channel;
+    LIBSSH2_SESSION *session;
+    unsigned char    buf[2048];
+    char             name[512];
+    int rc;
+
+    if(!handle || handle->handle_type != LIBSSH2_SFTP_HANDLE_DIR)
+        return LIBSSH2_ERROR_BAD_USE;
+    sftp    = handle->sftp;
+    channel = sftp->channel;
+    session = channel->session;
+
+    for(;;) {                               /* one iteration per FXP_NAME batch */
+        unsigned char lenbuf[4], *s, *req;
+        size_t   have = 0, pos = 0, msg_left, got = 0;
+        uint32_t plen, msglen, count, i;
+        unsigned char type;
+        ssize_t  wr, r;
+
+        /* ---- send FXP_READDIR(handle) ---- */
+        plen = (uint32_t)handle->handle_len + 13;
+        req = LIBSSH2_ALLOC(session, plen);
+        if(!req)
+            return LIBSSH2_ERROR_ALLOC;
+        s = req;
+        _libssh2_store_u32(&s, plen - 4);
+        *(s++) = SSH_FXP_READDIR;
+        _libssh2_store_u32(&s, sftp->request_id++);
+        _libssh2_store_str(&s, handle->handle, handle->handle_len);
+        wr = _libssh2_channel_write(channel, 0, req, plen);
+        LIBSSH2_FREE(session, req);
+        if(wr != (ssize_t)plen)
+            return LIBSSH2_ERROR_SOCKET_SEND;
+
+        /* ---- read the 4-byte SFTP message length ---- */
+        while(got < 4) {
+            r = _libssh2_channel_read(channel, 0, (char *)lenbuf + got, 4 - got);
+            if(r == LIBSSH2_ERROR_EAGAIN)
+                continue;
+            if(r < 0)
+                return (int)r;
+            if(r == 0)
+                return LIBSSH2_ERROR_SOCKET_RECV;
+            got += (size_t)r;
+        }
+        msglen = _libssh2_ntohu32(lenbuf);
+        if(msglen < 5)
+            return LIBSSH2_ERROR_SFTP_PROTOCOL;
+        msg_left = msglen;
+
+        /* ---- type(1) + request_id(4) + count(4) ---- */
+        rc = srd_ensure(channel, buf, sizeof buf, &have, &pos, &msg_left, 9);
+        if(rc)
+            return rc;
+        type = buf[pos];
+        if(type == SSH_FXP_STATUS) {
+            uint32_t st = _libssh2_ntohu32(buf + pos + 5);
+            pos += 9;
+            srd_skip(channel, buf, sizeof buf, &have, &pos, &msg_left, msg_left);
+            if(st == LIBSSH2_FX_EOF)
+                return 0;                   /* whole directory listed */
+            return _libssh2_error(session, LIBSSH2_ERROR_SFTP_PROTOCOL,
+                                  "FXP_READDIR returned error status");
+        }
+        if(type != SSH_FXP_NAME)
+            return LIBSSH2_ERROR_SFTP_PROTOCOL;
+        count = _libssh2_ntohu32(buf + pos + 5);
+        pos += 9;
+
+        /* ---- stream `count` entries: filename, longname (skipped), attrs ---- */
+        for(i = 0; i < count; i++) {
+            uint32_t fn_len, ln_len, flags;
+            size_t   alen;
+            int      attr_len;
+            LIBSSH2_SFTP_ATTRIBUTES attrs;
+
+            rc = srd_ensure(channel, buf, sizeof buf, &have, &pos, &msg_left, 4);
+            if(rc) return rc;
+            fn_len = _libssh2_ntohu32(buf + pos);
+            pos += 4;
+            if(fn_len >= sizeof name)
+                return LIBSSH2_ERROR_BUFFER_TOO_SMALL;
+            rc = srd_ensure(channel, buf, sizeof buf, &have, &pos, &msg_left,
+                            fn_len);
+            if(rc) return rc;
+            memcpy(name, buf + pos, fn_len);
+            name[fn_len] = '\0';
+            pos += fn_len;
+
+            /* longname is not used by the dongle -- skip it (can be long) */
+            rc = srd_ensure(channel, buf, sizeof buf, &have, &pos, &msg_left, 4);
+            if(rc) return rc;
+            ln_len = _libssh2_ntohu32(buf + pos);
+            pos += 4;
+            rc = srd_skip(channel, buf, sizeof buf, &have, &pos, &msg_left,
+                          ln_len);
+            if(rc) return rc;
+
+            /* attrs: read flags, derive the exact byte length, then parse */
+            rc = srd_ensure(channel, buf, sizeof buf, &have, &pos, &msg_left, 4);
+            if(rc) return rc;
+            flags = _libssh2_ntohu32(buf + pos);
+            if(flags & LIBSSH2_SFTP_ATTR_EXTENDED)
+                return LIBSSH2_ERROR_SFTP_PROTOCOL;   /* not seen in listings */
+            alen = 4
+                 + ((flags & LIBSSH2_SFTP_ATTR_SIZE)        ? 8 : 0)
+                 + ((flags & LIBSSH2_SFTP_ATTR_UIDGID)      ? 8 : 0)
+                 + ((flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) ? 4 : 0)
+                 + ((flags & LIBSSH2_SFTP_ATTR_ACMODTIME)   ? 8 : 0);
+            rc = srd_ensure(channel, buf, sizeof buf, &have, &pos, &msg_left,
+                            alen);
+            if(rc) return rc;
+            memset(&attrs, 0, sizeof attrs);
+            attr_len = sftp_bin2attr(&attrs, buf + pos, alen);
+            if(attr_len < 0)
+                return LIBSSH2_ERROR_SFTP_PROTOCOL;
+            pos += (size_t)attr_len;
+
+            if(cb)
+                cb(ctx, name, &attrs);
+        }
+
+        /* defensive: drain any bytes left in this message to keep the channel
+           framed for the next FXP_READDIR / the closedir that follows. */
+        if(msg_left || pos < have)
+            srd_skip(channel, buf, sizeof buf, &have, &pos, &msg_left, msg_left);
+    }
+}
+
 /*
  * sftp_write
  *
