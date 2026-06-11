@@ -2831,6 +2831,18 @@ static void exec(char *line) {
     if (!p) return;                 /* non-AT line: silent */
     if (!*p) { r_ok(); return; }    /* bare AT */
 
+    /* Recovery/diagnostic commands must work EVEN while a dial/session worker
+     * is busy or wedged -- otherwise a stuck session (e.g. an SFTP readdir that
+     * exhausted heap) strands the device with no way back short of a physical
+     * unplug. strip_at() has uppercased the command name, so compare uppercase.
+     * AT$RESET reboots, AT$OTASTART takes the CDC OTA path, AT$LOG is read-only. */
+    if (*p == '$' && (!strncmp(p + 1, "RESET", 5) ||
+                      !strncmp(p + 1, "OTASTART", 8) ||
+                      !strncmp(p + 1, "LOG", 3))) {
+        handle_dollar(p + 1);   /* handle_dollar wants the name WITHOUT the '$' */
+        return;
+    }
+
     /* Dial worker in flight: reject other commands rather than let
      * them race against cmd_dial_impl's s_sock / s_online / s_peer
      * writes. Matches today's effective behaviour where the TinyUSB

@@ -270,6 +270,13 @@ static void sftp_abspath(const char *p, char *out, size_t n)
 
 void sftp_quit(void)
 {
+    /* The session may be dead (a heap-starved big readdir, a dropped WiFi link).
+     * In blocking mode libssh2_sftp_shutdown / session_disconnect try to SEND a
+     * graceful close and would block ~15 s each (SO_SNDTIMEO) on a socket that
+     * will never drain -- the worker then never clears s_at_busy and the device
+     * looks wedged. Flip libssh2 non-blocking first so those sends return EAGAIN
+     * immediately; we free + close regardless (the peer times the link out). */
+    if (s_sftp_sess) libssh2_session_set_blocking(s_sftp_sess, 0);
     if (s_sftp)      { libssh2_sftp_shutdown(s_sftp); s_sftp = NULL; }
     if (s_sftp_sess) { libssh2_session_disconnect(s_sftp_sess, "bye");
                        libssh2_session_free(s_sftp_sess); s_sftp_sess = NULL; }
@@ -316,6 +323,10 @@ int sftp_open(const char *user, const char *pass, const char *host, uint16_t por
     s_sftp = libssh2_sftp_init(s_sftp_sess);
     if (!s_sftp) { disk_logf("sftp: sftp_init FAIL"); goto fail; }
 
+    { const char *c = libssh2_session_methods(s_sftp_sess, LIBSSH2_METHOD_CRYPT_SC);
+      const char *m = libssh2_session_methods(s_sftp_sess, LIBSSH2_METHOD_MAC_SC);
+      disk_logf("sftp: negotiated crypt=%s mac=%s", c ? c : "?", m ? m : "?"); }
+
     /* Land in the login dir: realpath(".") -> absolute home. */
     { char home[256];
       int n = libssh2_sftp_realpath(s_sftp, ".", home, sizeof home - 1);
@@ -348,6 +359,7 @@ int sftp_fatal(void)
         case LIBSSH2_ERROR_SOCKET_SEND:
         case LIBSSH2_ERROR_SOCKET_RECV:
         case LIBSSH2_ERROR_SOCKET_DISCONNECT:
+        case LIBSSH2_ERROR_ALLOC:        /* readdir of a big dir ran the heap dry */
             return 1;
         default:
             return 0;
@@ -387,11 +399,22 @@ int sftp_ls(const char *arg, sftp_sink_fn sink)
                   emsg ? emsg : "?");
         return -1;
     }
-    while ((n = libssh2_sftp_readdir(d, name, sizeof name - 1, &at)) > 0) {
-        char type = (at.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-                    LIBSSH2_SFTP_S_ISDIR(at.permissions) ? 'd' : '-';
-        unsigned long sz = (at.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (unsigned long)at.filesize : 0UL;
-        int len;
+    for (;;) {
+        char type; unsigned long sz; int len;
+        n = libssh2_sftp_readdir(d, name, sizeof name - 1, &at);
+        if (n == 0) break;                       /* end of directory */
+        if (n < 0) {                             /* error -- was silently swallowed */
+            char *emsg = NULL;
+            int serr = libssh2_session_last_error(s_sftp_sess, &emsg, NULL, 0);
+            disk_logf("sftp: readdir FAIL n=%d libssh2=%d contig=%u free=%u msg=%s", n,
+                      serr, (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                      (unsigned)esp_get_free_heap_size(), emsg ? emsg : "?");
+            libssh2_sftp_closedir(d);
+            return -1;
+        }
+        type = (at.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+               LIBSSH2_SFTP_S_ISDIR(at.permissions) ? 'd' : '-';
+        sz = (at.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (unsigned long)at.filesize : 0UL;
         name[n] = 0;
         len = snprintf(line, sizeof line, "%c %10lu  %s\r\n", type, sz, name);
         if (sink) sink((const unsigned char *)line, (size_t)len);

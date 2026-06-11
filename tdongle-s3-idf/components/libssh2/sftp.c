@@ -363,9 +363,13 @@ sftp_packet_read(LIBSSH2_SFTP *sftp)
                            "Data begin - Packet Length: %lu",
                            sftp->partial_len);
             packet = LIBSSH2_ALLOC(session, sftp->partial_len);
-            if(!packet)
+            if(!packet) {
+                extern void disk_logf(const char *fmt, ...);
+                disk_logf("sftp_packet_read: ALLOC FAIL partial_len=%lu",
+                          sftp->partial_len);
                 return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
                                       "Unable to allocate SFTP packet");
+            }
             sftp->partial_size_len = 0;
             sftp->partial_received = 0; /* how much of the packet already
                                            received */
