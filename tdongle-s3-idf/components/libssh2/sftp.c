@@ -363,13 +363,9 @@ sftp_packet_read(LIBSSH2_SFTP *sftp)
                            "Data begin - Packet Length: %lu",
                            sftp->partial_len);
             packet = LIBSSH2_ALLOC(session, sftp->partial_len);
-            if(!packet) {
-                extern void disk_logf(const char *fmt, ...);
-                disk_logf("sftp_packet_read: ALLOC FAIL partial_len=%lu",
-                          sftp->partial_len);
+            if(!packet)
                 return _libssh2_error(session, LIBSSH2_ERROR_ALLOC,
                                       "Unable to allocate SFTP packet");
-            }
             sftp->partial_size_len = 0;
             sftp->partial_received = 0; /* how much of the packet already
                                            received */
@@ -799,9 +795,17 @@ static LIBSSH2_SFTP *sftp_init(LIBSSH2_SESSION *session)
     sftp_handle = session->sftpInit_sftp;
 
     if(session->sftpInit_state == libssh2_NB_state_created) {
+        /* EMBEDDED TUNING (T-Dongle S3, no-PSRAM): open the SFTP channel with a
+         * SMALL receive window (8 KB) instead of the 2 MB default. The window is
+         * how much the server may send before blocking for a WINDOW_ADJUST; with
+         * 2 MB the server floods an entire directory listing / file response into
+         * libssh2's channel buffer before we consume it, so the transient heap is
+         * the whole response (defeating the streaming readdir and OOMing on large
+         * dirs). 8 KB flow-controls the server to a few packets in flight; the
+         * streaming reader pulls + replenishes the window as it parses. */
         session->sftpInit_channel =
             _libssh2_channel_open(session, "session", sizeof("session") - 1,
-                                  LIBSSH2_CHANNEL_WINDOW_DEFAULT,
+                                  4096,
                                   LIBSSH2_CHANNEL_PACKET_DEFAULT, NULL, 0);
         if(!session->sftpInit_channel) {
             if(libssh2_session_last_errno(session) == LIBSSH2_ERROR_EAGAIN) {
