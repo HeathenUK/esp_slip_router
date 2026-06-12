@@ -314,15 +314,19 @@ esp_err_t usb_start(void) {
 
     /* NET modes (AT$USBNET, NVS-persisted): swap functions within the DWC2's
      * 5 IN-EP FIFO budget (see the descriptor block comments). Each shape
-     * gets its own PID so hosts never reuse a cached config across shapes. */
+     * gets its own PID so hosts never reuse a cached config across shapes.
+     * DEFAULT (NVS unset) is mode 1 -- the DOS deployment shape (Ethernet,
+     * no HID keyboard): the right out-of-box behavior on the Pocket386, and
+     * provably inert on a Mac (without the notif EP macOS never publishes
+     * the interface). AT$USBNET=0 restores the HID composite. */
     {
         nvs_handle_t h;
-        uint8_t v = 0;
+        uint8_t v = 1;
         if (nvs_open("slip-router", NVS_READONLY, &h) == ESP_OK) {
             nvs_get_u8(h, "usbnet", &v);
             nvs_close(h);
         }
-        s_usbnet_mode = (v <= 2) ? v : 0;
+        s_usbnet_mode = (v <= 2) ? v : 1;
     }
     if (s_usbnet_mode != 0) {
         ecm_mac_init();    /* host reads the MAC during enumeration */

@@ -2622,7 +2622,7 @@ static void handle_dollar(char *s) {
             cdc_print(m[val[0] - '0']);
             r_ok();
         } else {
-            nvs_handle_t h; uint8_t v = 0;
+            nvs_handle_t h; uint8_t v = 1;   /* unset NVS = the mode-1 default */
             if (nvs_open("slip-router", NVS_READONLY, &h) == ESP_OK) {
                 nvs_get_u8(h, "usbnet", &v);
                 nvs_close(h);
