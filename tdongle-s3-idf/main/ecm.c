@@ -51,6 +51,7 @@
 #include "dhserver.h"
 #include "dns_forwarder.h"
 #include "disk.h"    /* disk_logf */
+#include "modem.h"   /* modem_session_busy -- heap truce pacing */
 
 #define ECM_IP_A 192
 #define ECM_IP_B 168
@@ -162,6 +163,13 @@ static void ecm_tx_task(void *arg) {
     struct pbuf *p;
     for (;;) {
         if (xQueueReceive(s_txq, &p, portMAX_DELAY) != pdTRUE) continue;
+        /* Heap truce with the modem's secure sessions: a libssh2/TLS session
+         * spike plus full-rate bridging stacks to a ~zero heap floor (measured
+         * 2026-06-12: concurrent SFTP get + 449 KB/s bridge -> min_free 104 B).
+         * While a dial/session worker is active, pace the pump to ~60 KB/s --
+         * TCP self-paces to the slower link and in-flight pbufs shrink. The
+         * real DOS host never exceeds this during a session anyway. */
+        if (modem_session_busy()) vTaskDelay(pdMS_TO_TICKS(25));
         int waited = 0;
         while (!(tud_ready() && tud_network_can_xmit(p->tot_len))) {
             if (++waited > ECM_TX_DRAIN_MS) break;    /* host gone/stalled */
@@ -190,6 +198,14 @@ static void ecm_tx_task(void *arg) {
 static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
     (void)nif;
     if (!s_txq || !tud_ready()) return ERR_IF;  /* not enumerated / unplugged */
+    /* Heap truce, intake half: while a secure session runs, also cap the
+     * QUEUE to 2 frames -- each queued pbuf pins ~1.6 K of WiFi RX buffer,
+     * and 8 of them (~12 K) was most of the remaining gap to the floor
+     * (pacing alone: min_free 4.4 K; still under the 5 K guard). */
+    if (modem_session_busy() && uxQueueMessagesWaiting(s_txq) >= 2) {
+        s_tx_drops++;
+        return ERR_OK;                 /* drop early; TCP paces */
+    }
     pbuf_ref(p);
     if (xQueueSend(s_txq, &p, 0) != pdTRUE) {
         pbuf_free(p);                  /* queue full: genuine overload */

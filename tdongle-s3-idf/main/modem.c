@@ -3301,6 +3301,10 @@ bool modem_get_tput(uint32_t *rx, uint32_t *cdc, uint64_t *blk_us) {
     return s_online;
 }
 
+bool modem_session_busy(void) {
+    return s_at_busy;
+}
+
 esp_err_t modem_init(void) {
     modem_load_evn();      /* restore E/V/N from NVS (AT&W saved) */
     esp_err_t e = tinyusb_cdcacm_register_callback(

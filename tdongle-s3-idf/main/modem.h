@@ -35,6 +35,12 @@ bool modem_online_peer(const char **peer_out);
  * Any out-param may be NULL. Returns true if a call is currently online. */
 bool modem_get_tput(uint32_t *rx, uint32_t *cdc, uint64_t *blk_us);
 
+/* True while a dial/session worker owns the modem (ATD/SSH/SFTP/FTP/TLS --
+ * the s_at_busy window). The ECM bridge paces its TX pump during this so a
+ * crypto session's heap spike + full-rate bridging can't stack (measured
+ * 2026-06-12: concurrent SFTP get + 449 KB/s bridge -> min_free 104 BYTES). */
+bool modem_session_busy(void);
+
 #ifdef __cplusplus
 }
 #endif
