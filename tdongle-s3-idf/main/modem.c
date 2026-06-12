@@ -3302,7 +3302,15 @@ bool modem_get_tput(uint32_t *rx, uint32_t *cdc, uint64_t *blk_us) {
 }
 
 bool modem_session_busy(void) {
-    return s_at_busy;
+    /* Two windows need the bridge truce:
+     *  - s_at_busy: a dial/session worker is running (covers every handshake
+     *    spike, and the WHOLE session for FTP/SFTP whose workers loop);
+     *  - a secure transport online: the SSH/TLS workers exit at CONNECT (the
+     *    12 K stack reclaim), but the crypto session stays resident for the
+     *    relay's lifetime -- full-rate bridging on top of it re-opens the
+     *    near-OOM stack-up. Plain TCP relays (XPORT_TCP) carry no crypto
+     *    heap and don't quiesce; they run with the bridge at full rate. */
+    return s_at_busy || (s_online && s_xport_kind != XPORT_TCP);
 }
 
 esp_err_t modem_init(void) {
