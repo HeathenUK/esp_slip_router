@@ -2508,6 +2508,28 @@ static void handle_dollar(char *s) {
             (unsigned)ecm_stat_tx_drops(),   (unsigned)ecm_stat_rx_pbuf_fails());
         cdc_print(line);
         r_ok();
+    } else if (!strcmp(key, "NETTEST") && val && eq) {
+        /* AT$NETTEST=<size>[,count] -- emit raw Ethernet broadcast frames of
+         * an EXACT total size from the ECM bridge (NET modes only). For the
+         * CHUSB E0 chip test: size%64==0 (e.g. 1472) ends in a ZLP on the
+         * wire, the CH375's one true unknown. Ethertype 0x88B5; payload is a
+         * counting pattern the DOS side can integrity-check. */
+        char tmp[24];
+        strncpy(tmp, val, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
+        char *comma = strchr(tmp, ',');
+        long cnt = 1;
+        if (comma) { *comma = 0; cnt = atol(comma + 1); }
+        long sz = atol(tmp);
+        uint32_t drops = 0;
+        if (!usb_net_enabled() ||
+            ecm_test_emit((uint16_t)sz, (uint16_t)cnt, &drops) != 0) {
+            r_error(); return;
+        }
+        char o[80];
+        snprintf(o, sizeof o, "\r\nsent %ld x %ld bytes (zlp=%s drops=%u)\r\n",
+                 cnt, sz, (sz % 64 == 0) ? "yes" : "no", (unsigned)drops);
+        cdc_print(o);
+        r_ok();
     } else if (!strcmp(key, "DNS") && val && eq) {
         cmd_dns(val);
     } else if (!strcmp(key, "PING") && val && eq) {
@@ -2844,7 +2866,8 @@ static void handle_dollar(char *s) {
             "AT$SCAN            list visible networks\r\n"
             "AT$NETIF           dump netif state\r\n"
             "AT$TYPE=<str>      send keystrokes via HID keyboard (DSL)\r\n"
-            "AT$USBNET=1|0      next-boot USB mode: ECM network adapter vs HID\r\n"
+            "AT$USBNET=0|1|2    next-boot USB mode: HID / DOS-net / dev-net\r\n"
+            "AT$NETTEST=sz[,n]  emit n raw eth test frames of sz bytes (NET modes)\r\n"
             "AT$LECHO=mode     data-mode local echo (AUTO/ON/OFF)\r\n"
             "AT$NAWS=cols,rows  declare terminal size for telnet NAWS\r\n"
             "AT$TTYPE=name      declare terminal type for telnet TTYPE\r\n"

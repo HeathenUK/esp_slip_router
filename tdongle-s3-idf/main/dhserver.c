@@ -351,11 +351,22 @@ static void udp_recv_proc(void *arg, struct udp_pcb *upcb, struct pbuf *p, const
 			break;
 
 		case DHCP_REQUEST:
-			/* 1. find requested ipaddr in option list */
+			/* 1. find the requested ipaddr: option 50 for SELECTING /
+			 * INIT-REBOOT clients; RENEWING/REBINDING clients (RFC 2131
+			 * 4.3.2) put it in ciaddr and send NO option 50 -- upstream
+			 * dropped those on the floor, so leases could never renew
+			 * (mTCP's T1 renew got no ACK). LOCAL MOD: fall back to ciaddr. */
 			ptr = find_dhcp_option(dhcp_data.dp_options, sizeof(dhcp_data.dp_options), DHCP_IPADDRESS);
-			if (ptr == NULL) break;
-			if (ptr[1] != 4) break;
-			ptr += 2;
+			if (ptr != NULL)
+			{
+				if (ptr[1] != 4) break;
+				ptr += 2;
+			}
+			else
+			{
+				if (ip4_addr_isany_val(get_ip(dhcp_data.dp_ciaddr))) break;
+				ptr = dhcp_data.dp_ciaddr;
+			}
 
 			/* 2. does hw-address registered? */
 			entry = entry_by_mac(dhcp_data.dp_chaddr);

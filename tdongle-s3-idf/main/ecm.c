@@ -228,6 +228,27 @@ static err_t ecm_if_init(struct netif *nif) {
     return ERR_OK;
 }
 
+int ecm_test_emit(uint16_t size, uint16_t count, uint32_t *drops_out) {
+    if (!s_started || size < 14 || size > 1514 || count == 0 || count > 64)
+        return -1;
+    uint32_t drops0 = s_tx_drops;
+    for (uint16_t n = 0; n < count; n++) {
+        struct pbuf *p = pbuf_alloc(PBUF_RAW, size, PBUF_RAM);
+        if (!p) return -1;
+        uint8_t *d = (uint8_t *)p->payload;
+        memset(d, 0xFF, 6);                          /* dst: broadcast */
+        memcpy(d + 6, s_ecm_nif.hwaddr, 6);          /* src: bridge MAC */
+        d[12] = 0x88; d[13] = 0xB5;                  /* ethertype: IEEE local-experimental */
+        for (uint16_t i = 14; i < size; i++)         /* payload: counting pattern + frame idx */
+            d[i] = (uint8_t)(i + n);
+        ecm_linkoutput(&s_ecm_nif, p);               /* refs the pbuf like real traffic */
+        pbuf_free(p);
+        vTaskDelay(pdMS_TO_TICKS(5));                /* paced: a chip test, not a flood */
+    }
+    if (drops_out) *drops_out = s_tx_drops - drops0;
+    return 0;
+}
+
 /* ---- DHCP lease table: tiny -- one DOS host (plus slack for testing) ---- */
 static dhcp_entry_t s_dhcp_entries[] = {
     { {0}, { PP_HTONL(LWIP_MAKEU32(ECM_IP_A, ECM_IP_B, ECM_IP_C, 2)) }, 24 * 3600 },

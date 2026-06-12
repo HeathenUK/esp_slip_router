@@ -54,6 +54,21 @@ uint32_t ecm_stat_rx_bytes(void);
 /** @brief Bytes transmitted to the host (download direction). */
 uint32_t ecm_stat_tx_bytes(void);
 
+/**
+ * @brief Emit raw Ethernet broadcast test frames of an EXACT size (AT$NETTEST).
+ *
+ * For the CHUSB-side E0 chip test: frames whose total size is an exact
+ * multiple of 64 end in a ZLP on the wire -- the CH375's behavior there is
+ * the host plan's "one true unknown". dst FF:..:FF, src = bridge MAC,
+ * ethertype 0x88B5 (IEEE local-experimental), payload = counting pattern
+ * offset by the frame index (integrity-checkable on the DOS side).
+ * @param size  Total frame length, 14..1514 (e.g. 1472 = 23*64 -> ZLP).
+ * @param count Frames to send (1..64), paced 5 ms apart.
+ * @param drops_out Optional: TX drops incurred during the burst.
+ * @return 0 on success, -1 on bad args / bridge not started / no memory.
+ */
+int ecm_test_emit(uint16_t size, uint16_t count, uint32_t *drops_out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -38,6 +38,9 @@
  *  - dropped upstream's udp_init() call in dhserv_init: IDF's tcpip task
  *    already ran lwip_init(), and re-running udp_init would reset the
  *    ephemeral local-port counter under live sockets.
+ *  - DHCP_REQUEST: RENEWING/REBINDING clients carry the address in ciaddr
+ *    with no option 50 (RFC 2131 4.3.2); upstream ignored them, so leases
+ *    could never renew. We fall back to ciaddr.
  */
 #ifndef DHSERVER_H
 #define DHSERVER_H
