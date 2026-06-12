@@ -58,3 +58,22 @@ idf_build_set_property(COMPILE_DEFINITIONS "-DPBUF_POOL_SIZE=32" APPEND)
 # as Kconfig in esp_tinyusb 1.4.5; the override is safe because the
 # TinyUSB CDC header uses #ifndef before its default.
 idf_build_set_property(COMPILE_DEFINITIONS "-DCFG_TUD_CDC_EP_BUFSIZE=512" APPEND)
+
+# DWC2 buffer-DMA (2026-06-12). The default slave/PIO mode has a fatal
+# TXFE-refill race under sustained ECM TX (~1 in 800 frames at 416 KB/s):
+# the IN endpoint ends up armed (EPENA=1, PKTCNT remaining), FIFO empty,
+# ITTXFE+NAK latched, DAINT clear -- NAKing forever (tinyusb #1618 matches).
+# Buffer DMA hands whole transfers to the core (no per-packet refill) and
+# fixed it completely: 10 MB through the bridge at 406 KB/s, no wedge.
+#
+# HISTORY/CAVEAT: DMA was briefly convicted of breaking MSC -- that turned
+# out to be confounded: macOS had begun mount-blocking the dev-disk after a
+# day of re-enumeration churn (a known macOS behavior on this project), and
+# MSC "failed" identically on PIO and in every mode. The IOKit chain stays
+# fully attached and reads are served; only the volume mount is withheld
+# host-side. MSC-under-DMA still deserves a clean-day verification (or the
+# authoritative consumer: CHUSB on the DOS host). If genuine DMA-mode bugs
+# do surface, tinyusb master (post-0.19) carries DMA fixes that aren't in
+# any registry release and can't be cherry-picked (core API drift) -- the
+# path then is vendoring the whole tree.
+idf_build_set_property(COMPILE_DEFINITIONS "-DCFG_TUD_DWC2_DMA_ENABLE=1" APPEND)

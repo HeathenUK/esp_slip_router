@@ -41,9 +41,12 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include "tusb.h"
 #include "class/net/net_device.h"
+#include "device/usbd_pvt.h"   /* usbd_defer_func -- TX serialization */
 
 #include "dhserver.h"
 #include "dns_forwarder.h"
@@ -53,12 +56,19 @@
 #define ECM_IP_B 168
 #define ECM_IP_C 241
 
-/* How long ecm_linkoutput will wait for the previous USB IN transfer to
- * drain before dropping the frame. A full-speed host (Mac/Linux) drains a
- * 1514-byte frame in ~1.3 ms of bus time; the CH375 host bursts ~24
- * transactions per frame and may take several ms between polls. Bounded
- * so a dead/slow host can never stall the tcpip thread for long. */
-#define ECM_TX_WAIT_MS 10
+/* TX pump: lwIP's linkoutput must NEVER block the tcpip thread (measured
+ * 2026-06-12: a bounded in-line wait throttled the bridge to ~9 KB/s --
+ * every TCP window burst overran the one-in-flight USB frame, the drops put
+ * TCP into RTO crawl, and the stalled tcpip thread backed WiFi RX up until
+ * min_free grazed 3.6 K). Instead linkoutput enqueues a pbuf reference and
+ * returns immediately; a small dedicated task absorbs the USB drain latency.
+ * Queue depth bounds pinned pbufs (WiFi RX pbufs are ~1.6 K each, and the
+ * dynamic pool is capped at 12, so 8 here can never pin more than the pool
+ * allows); overflow drops at the queue -- cheap, and TCP paces to the link. */
+#define ECM_TXQ_DEPTH        8
+/* Per-frame drain bound inside the pump: a dead/unplugged host must not
+ * wedge the pump holding a pbuf forever. */
+#define ECM_TX_DRAIN_MS      200
 
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
@@ -66,6 +76,7 @@ uint8_t tud_network_mac_address[6];
 
 static struct netif s_ecm_nif;
 static bool         s_started = false;
+static QueueHandle_t s_txq    = NULL;
 
 static volatile uint32_t s_tx_drops      = 0;
 static volatile uint32_t s_rx_pbuf_fails = 0;
@@ -127,25 +138,63 @@ uint16_t tud_network_xmit_cb(uint8_t *dst, void *ref, uint16_t arg) {
 void tud_network_init_cb(void) {
 }
 
-/* ---- lwIP netif glue (tcpip thread, CPU0) ---- */
+/* ---- lwIP netif glue ---- */
 
-/** @brief linkoutput: hand one frame to the USB driver, bounded wait. */
-static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
-    (void)nif;
-    if (!tud_ready()) return ERR_IF;   /* not enumerated / cable pulled */
+/* The actual usbd_edpt_xfer submission MUST run in the USB task: calling
+ * tud_network_xmit from another task races the dcd event processing on the
+ * same endpoint (the ECM driver doesn't claim like CDC does) -- measured
+ * 2026-06-12 as an IN endpoint stuck busy=1 forever after a few thousand
+ * frames at 416 KB/s. usbd_defer_func serializes us into the USB task.
+ * Handoff is race-free: can_xmit is SET only by the USB task (completion)
+ * and CLEARED only by our own xmit, so once the pump observes it true it
+ * stays true until the deferred call consumes it. */
+static SemaphoreHandle_t s_tx_done = NULL;
 
-    for (int waited = 0; ; waited++) {
-        if (tud_network_can_xmit(p->tot_len)) {
-            tud_network_xmit(p, 0);    /* driver serializes via xmit_cb NOW --
-                                          pbuf is not referenced after return */
+static void ecm_xmit_in_usbtask(void *param) {
+    tud_network_xmit((struct pbuf *)param, 0);  /* serializes via xmit_cb NOW */
+    xSemaphoreGive(s_tx_done);
+}
+
+/** @brief TX pump task: drain the queue into the USB driver, absorbing the
+ *  one-frame-in-flight USB latency that linkoutput must not block on. */
+static void ecm_tx_task(void *arg) {
+    (void)arg;
+    struct pbuf *p;
+    for (;;) {
+        if (xQueueReceive(s_txq, &p, portMAX_DELAY) != pdTRUE) continue;
+        int waited = 0;
+        while (!(tud_ready() && tud_network_can_xmit(p->tot_len))) {
+            if (++waited > ECM_TX_DRAIN_MS) break;    /* host gone/stalled */
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        if (waited <= ECM_TX_DRAIN_MS) {
+            usbd_defer_func(ecm_xmit_in_usbtask, p, false);
+            if (xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                /* Deferred call hasn't run (USB task starved/dying): do NOT
+                 * free the pbuf it still references -- deliberate counted
+                 * leak in preference to a use-after-free. */
+                s_tx_drops++;
+                continue;
+            }
             s_tx_frames++;
             s_tx_bytes += p->tot_len;
-            return ERR_OK;
+        } else {
+            s_tx_drops++;
         }
-        if (waited >= ECM_TX_WAIT_MS) break;
-        vTaskDelay(pdMS_TO_TICKS(1));  /* host hasn't drained the last frame */
+        pbuf_free(p);                  /* drop the reference linkoutput took */
     }
-    s_tx_drops++;                      /* drop, never wedge the tcpip thread */
+}
+
+/** @brief linkoutput (tcpip thread): enqueue a reference and return -- the
+ *  pump owns the USB latency. Overflow drops here, without blocking lwIP. */
+static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
+    (void)nif;
+    if (!s_txq || !tud_ready()) return ERR_IF;  /* not enumerated / unplugged */
+    pbuf_ref(p);
+    if (xQueueSend(s_txq, &p, 0) != pdTRUE) {
+        pbuf_free(p);                  /* queue full: genuine overload */
+        s_tx_drops++;
+    }
     return ERR_OK;
 }
 
@@ -182,6 +231,17 @@ static dhcp_config_t s_dhcp_config = {
 
 esp_err_t ecm_start(void) {
     if (s_started) return ESP_ERR_INVALID_STATE;
+
+    /* TX pump before the netif goes up. */
+    s_txq = xQueueCreate(ECM_TXQ_DEPTH, sizeof(struct pbuf *));
+    if (!s_txq) return ESP_ERR_NO_MEM;
+    s_tx_done = xSemaphoreCreateBinary();
+    if (!s_tx_done) { vQueueDelete(s_txq); s_txq = NULL; return ESP_ERR_NO_MEM; }
+    if (xTaskCreatePinnedToCore(ecm_tx_task, "ecm_tx", 2560, NULL, 17,
+                                NULL, 1) != pdPASS) {
+        vQueueDelete(s_txq); s_txq = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 
     ip4_addr_t ip, nm, gw;
     IP4_ADDR(&ip, ECM_IP_A, ECM_IP_B, ECM_IP_C, 1);
