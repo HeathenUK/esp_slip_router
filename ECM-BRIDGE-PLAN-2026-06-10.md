@@ -30,6 +30,47 @@ class + INT 2Fh frame API only) and `~/FOSSLIP/ECM-TRANSPORT-PLAN-2026-06-11.md`
 This doc is written to be self-contained for an agent working ONLY in this
 repo — host-side context is summarized where it constrains firmware choices.
 
+## STATUS (2026-06-12, through commit f427a28): P1 + P2 DONE — as-built deltas
+
+P1 passed in full against macOS (enumeration, AppleUSBECM bind, DHCP lease,
+ping 1.5 ms, DNS through the bridge, TCP through NAPT). P2: **488 KB/s
+(~3.9 Mbit) sustained**, 10 MB clean, min_free ~19 K. SLIP is retired.
+Where reality diverged from the design below (the below is kept for context):
+
+- **Endpoints/modes**: the S3's DWC2 has only **5 IN-endpoint FIFOs incl
+  EP0** (silicon), and the old composite used all 5 — so ECM and HID (and
+  the ECM notif EP vs MSC) are a boot-time trade, `AT$USBNET=`:
+  - 0 normal: CDC+MSC+HID, PID 0x4023 (the CH375-hardened blob, unchanged)
+  - **1 DOS net: CDC+MSC+ECM with NO notification EP, PID 0x4025** — the
+    CHUSB target. ITF 0/1 CDC, 2 MSC, 3 ECM comm (02h/06h, bNumEndpoints=0),
+    4 ECM data alt0/alt1; data EPs **0x04 OUT / 0x84 IN**, 64-byte max;
+    wMaxSegmentSize 1514; iMACAddress = string index 7. Config blob 170 B.
+  - 2 dev net: CDC+ECM with notif EP (0x83), no MSC, PID 0x4024 — exists
+    because **macOS requires the notif EP** to publish the interface.
+- **Engine**: DWC2 buffer-DMA (`CFG_TUD_DWC2_DMA_ENABLE=1`) — PIO mode has
+  a fatal TXFE-refill race under sustained TX (endpoint NAKs forever).
+- **TX path**: linkoutput never blocks lwIP (pbuf-ref queue + pump task);
+  the xmit is marshalled into the USB task (`usbd_defer_func`).
+- **Heap truce**: while a CDC secure session (SSH/SFTP/FTP/TLS, dial OR
+  relay phase) is active, the bridge paces to ~60 KB/s + queue cap 2.
+  Measured necessity: full-rate bridge + SFTP get = min_free 104 BYTES;
+  with truce ~4.7 K (worst case w/ Mac-size TCP windows; mTCP's smaller
+  windows are lighter). Plain TCP relays run at full rate.
+- **DHCP/DNS**: vendored TinyUSB dhserver (answers ONLY the ECM netif;
+  renew-via-ciaddr fixed) + the existing dns_forwarder on 192.168.241.1.
+  Lease 192.168.241.2+, router+DNS = .1. (Item 4's CDC-FIFO shrink was NOT
+  done — CDC OTA throughput still wants them.)
+- **Tools**: `AT$NETTEST=<size>[,count]` emits exact-size raw eth broadcast
+  frames (0x88B5, counting payload, drop-reporting) — for CHUSB E0's ZLP
+  chip test (size%64==0 → wire ZLP). **OTA-over-ECM works**: `ota-http.sh
+  <bin> 192.168.241.1`, ~30 s end-to-end.
+- **Parked**: MSC clean-day verification (macOS mount-blocks after heavy
+  re-enumeration — host sulking, not firmware; ioreg chain + reads healthy);
+  TinyUSB-master vendoring if genuine DMA bugs surface (snapshot in
+  tdongle-s3-idf/vendor/dwc2-master/).
+
+P3 (mTCP DHCP/FTP on the Pocket386) now waits on the CHUSB side (E0→E2).
+
 ## Goal
 
 Replace (or sit alongside) the SLIP-over-CDC-ACM transport with a USB
