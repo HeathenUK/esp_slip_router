@@ -58,7 +58,7 @@
 #include "freertos/queue.h"
 
 #include "disk.h"   /* disk_logf */
-#include "slip.h"
+#include "ecm.h"    /* ecm_stat_* -- AT$STATS */
 #include "kbd.h"
 #include "usb.h"    /* usb_net_enabled -- AT$USBNET query */
 
@@ -2492,49 +2492,22 @@ static void handle_dollar(char *s) {
             snprintf(b, sizeof b, "\r\nnoconn\r\n");
         cdc_print(b); r_ok();
     } else if (!strcmp(key, "STATS")) {
-        if (val && eq) {
-            /* AT$STATS=0 -- zero the SLIP counters. The harness
-             * brackets each test with a clear-and-run-and-read so
-             * before/after deltas isolate the test's own traffic. */
-            if (!strcmp(val, "0")) {
-                /* slip.c uses volatile uint32_ts; race-free single-
-                 * store overwrite is fine. */
-                slip_stats_clear();
-                r_ok();
-            } else {
-                r_error();
-            }
-        } else {
-            char line[160];
-            snprintf(line, sizeof line,
-                "\r\n"
-                "slip.pkts_to_host    %u\r\n"
-                "slip.pkts_from_host  %u\r\n"
-                "slip.bytes_to_host   %u\r\n"
-                "slip.bytes_from_host %u\r\n",
-                (unsigned)slip_stat_pkts_to_host(),
-                (unsigned)slip_stat_pkts_from_host(),
-                (unsigned)slip_stat_bytes_to_host(),
-                (unsigned)slip_stat_bytes_from_host());
-            cdc_print(line);
-            r_ok();
-        }
-    } else if (!strcmp(key, "MODE")) {
-        if (val && eq) {
-            LinkMode want = (LinkMode)-1;
-            if      (!strcmp(val, "SLIP"))  want = MODE_SLIP;
-            else if (!strcmp(val, "MODEM")) want = MODE_MODEM;
-            if (want == (LinkMode)-1) { r_error(); return; }
-            /* Reply BEFORE flipping mode, so the OK lands while the
-             * AT parser still owns the CDC stream. Once SLIP is up
-             * any further bytes from the host are interpreted as
-             * SLIP frames. */
-            r_ok();
-            slip_set_mode(want);
-        } else {
-            cdc_print(slip_get_mode() == MODE_SLIP ? "\r\nSLIP\r\n" : "\r\nMODEM\r\n");
-            r_ok();
-        }
+        /* AT$STATS -- ECM bridge counters (frames/bytes each way + drops).
+         * Replaced the SLIP counters when the SLIP transport retired. */
+        char line[200];
+        snprintf(line, sizeof line,
+            "\r\n"
+            "ecm.rx_frames  %u\r\n"
+            "ecm.tx_frames  %u\r\n"
+            "ecm.rx_bytes   %u\r\n"
+            "ecm.tx_bytes   %u\r\n"
+            "ecm.tx_drops   %u\r\n"
+            "ecm.rx_nopbuf  %u\r\n",
+            (unsigned)ecm_stat_rx_frames(),  (unsigned)ecm_stat_tx_frames(),
+            (unsigned)ecm_stat_rx_bytes(),   (unsigned)ecm_stat_tx_bytes(),
+            (unsigned)ecm_stat_tx_drops(),   (unsigned)ecm_stat_rx_pbuf_fails());
+        cdc_print(line);
+        r_ok();
     } else if (!strcmp(key, "DNS") && val && eq) {
         cmd_dns(val);
     } else if (!strcmp(key, "PING") && val && eq) {
@@ -2968,9 +2941,9 @@ static void exec(char *line) {
                 char b[160];
                 snprintf(b, sizeof b,
                          "\r\nATE%d  ATV%d  ATQ%d  ATN%d\r\n"
-                         "mode:  %s\r\n",
+                         "usbnet: %u\r\n",
                          s_echo?1:0, s_verbose?1:0, s_quiet?1:0, s_telnet?1:0,
-                         slip_get_mode() == MODE_SLIP ? "SLIP" : "MODEM");
+                         (unsigned)usb_net_mode());
                 cdc_print(b);
                 r_ok();
             } else if (c == 'W') {
@@ -3237,13 +3210,6 @@ static void on_cdc_rx(int itf, cdcacm_event_t *event) {
             memmove(buf, buf + consumed, got - consumed);
             got -= consumed;
         }
-    }
-
-    /* SLIP mode: bytes are SLIP-framed IP packets. Feed them to the
-     * de-framer; nothing else touches them. */
-    if (slip_get_mode() == MODE_SLIP) {
-        slip_feed(buf, got);
-        return;
     }
 
     /* AT$FTP session: a command interpreter, not a relay (s_online stays false).

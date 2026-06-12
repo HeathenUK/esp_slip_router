@@ -185,11 +185,6 @@ static void dns_task(void *arg) {
     }
 }
 
-void dns_forwarder_init(void) {
-    /* 192.168.240.1 -- the SLIP netif's IP (the original single instance). */
-    dns_forwarder_init_ip((192U << 24) | (168U << 16) | (240U << 8) | 1U);
-}
-
 void dns_forwarder_init_ip(uint32_t ip_hostorder) {
     xTaskCreatePinnedToCore(dns_task, "dns_fwd", 3072,
                             (void *)(uintptr_t)ip_hostorder, 5, NULL, 0);  /* SRAM: ~1.9K used (was 4096) */

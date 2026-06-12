@@ -32,7 +32,8 @@
 #include "esp_netif.h"
 #include "tusb.h"
 
-#include "slip.h"
+#include "usb.h"
+#include "ecm.h"
 #include "modem.h"
 #include "font8x16.h"
 
@@ -259,17 +260,17 @@ static void display_task(void *arg) {
         bool wifi_up = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
         bool have_ip = sta_ip_str(ip, sizeof ip);
 
-        if (slip_get_mode() == MODE_SLIP) {
-            /* throughput deltas over the elapsed interval */
+        if (usb_net_enabled()) {
+            /* ECM bridge: throughput deltas over the elapsed interval */
             int64_t now = esp_timer_get_time();
-            uint32_t dl = slip_stat_bytes_to_host();    /* net -> host (download) */
-            uint32_t ul = slip_stat_bytes_from_host();  /* host -> net (upload) */
+            uint32_t dl = ecm_stat_tx_bytes();   /* net -> host (download) */
+            uint32_t ul = ecm_stat_rx_bytes();   /* host -> net (upload) */
             int64_t dt_us = now - prev_us;
             uint32_t dl_bps = (dt_us > 0) ? (uint32_t)(((uint64_t)(dl - prev_dl) * 1000000) / dt_us) : 0;
             uint32_t ul_bps = (dt_us > 0) ? (uint32_t)(((uint64_t)(ul - prev_ul) * 1000000) / dt_us) : 0;
             prev_dl = dl; prev_ul = ul; prev_us = now;
 
-            draw_row(0, "SLIP Router", C_CYAN);
+            draw_row(0, usb_net_mode() == 1 ? "ECM Bridge" : "ECM Bridge dev", C_CYAN);
             draw_row(1, wifi_up ? "WiFi: up" : "WiFi: ...", wifi_up ? C_GREEN : C_YELLOW);
             draw_row(2, have_ip ? ip : "no ip", C_WHITE);
             rate_short(dl_bps, r1, sizeof r1);

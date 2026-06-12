@@ -13,7 +13,6 @@ idf_component_register(
         "disk.c"
         "modem.c"
         "fat.c"
-        "slip.c"
         "ecm.c"
         "dhserver.c"
         "dns_forwarder.c"

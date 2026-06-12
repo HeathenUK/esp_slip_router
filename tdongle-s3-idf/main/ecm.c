@@ -71,11 +71,15 @@ static volatile uint32_t s_tx_drops      = 0;
 static volatile uint32_t s_rx_pbuf_fails = 0;
 static volatile uint32_t s_rx_frames     = 0;
 static volatile uint32_t s_tx_frames     = 0;
+static volatile uint32_t s_rx_bytes      = 0;
+static volatile uint32_t s_tx_bytes      = 0;
 
 uint32_t ecm_stat_tx_drops(void)      { return s_tx_drops; }
 uint32_t ecm_stat_rx_pbuf_fails(void) { return s_rx_pbuf_fails; }
 uint32_t ecm_stat_rx_frames(void)     { return s_rx_frames; }
 uint32_t ecm_stat_tx_frames(void)     { return s_tx_frames; }
+uint32_t ecm_stat_rx_bytes(void)      { return s_rx_bytes; }
+uint32_t ecm_stat_tx_bytes(void)      { return s_tx_bytes; }
 
 void ecm_mac_init(void) {
     /* Locally-administered variant of the STA MAC: same OUI-ish bytes so
@@ -105,6 +109,7 @@ bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
         pbuf_free(p);          /* mbox full -> drop, TCP retransmits */
     } else {
         s_rx_frames++;
+        s_rx_bytes += size;
     }
     tud_network_recv_renew();  /* re-arm for the next frame */
     return true;
@@ -134,6 +139,7 @@ static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
             tud_network_xmit(p, 0);    /* driver serializes via xmit_cb NOW --
                                           pbuf is not referenced after return */
             s_tx_frames++;
+            s_tx_bytes += p->tot_len;
             return ERR_OK;
         }
         if (waited >= ECM_TX_WAIT_MS) break;

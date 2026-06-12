@@ -49,9 +49,7 @@
 #include "usb.h"
 #include "disk.h"
 #include "fat.h"
-#include "slip.h"
 #include "ecm.h"
-#include "dns_forwarder.h"
 #include "kbd.h"
 #include "display.h"
 #include "modem.h"
@@ -697,57 +695,28 @@ static esp_err_t h_format(httpd_req_t *req) {
                      "formatted: clean FAT12 superfloppy, all files wiped\n");
 }
 
-/* GET /slip-stats -- SLIP path counters as JSON. Pollable over WiFi
- * while a SLIP test is running on DOS; diff two snapshots to derive
- * the live byte/packet rate. pbuf_fails > 0 is a smoking gun (lwIP
- * pool exhausted by burst RX); tx_truncs > 0 means an IP packet
- * exceeded our SLIP TX buffer. */
-static esp_err_t h_slip_stats(httpd_req_t *req) {
+/* GET /ecm-stats -- ECM bridge counters as JSON. Pollable over WiFi
+ * while a transfer runs on the USB host; diff two snapshots to derive
+ * the live byte/frame rate. rx_nopbuf > 0 means the lwIP pool was
+ * exhausted by burst RX; tx_drops > 0 means the host wasn't draining
+ * (slow CH375 poll or unplugged mid-flow). */
+static esp_err_t h_ecm_stats(httpd_req_t *req) {
     char buf[256];
     int n = snprintf(buf, sizeof buf,
-        "{\"mode\":\"%s\""
-        ",\"pkts_to_host\":%u,\"pkts_from_host\":%u"
-        ",\"bytes_to_host\":%u,\"bytes_from_host\":%u"
-        ",\"pbuf_alloc_fails\":%u,\"tx_truncs\":%u}\n",
-        slip_get_mode() == MODE_SLIP ? "SLIP" : "MODEM",
-        (unsigned)slip_stat_pkts_to_host(),
-        (unsigned)slip_stat_pkts_from_host(),
-        (unsigned)slip_stat_bytes_to_host(),
-        (unsigned)slip_stat_bytes_from_host(),
-        (unsigned)slip_stat_pbuf_fails(),
-        (unsigned)slip_stat_tx_truncs());
+        "{\"usbnet\":%u"
+        ",\"rx_frames\":%u,\"tx_frames\":%u"
+        ",\"rx_bytes\":%u,\"tx_bytes\":%u"
+        ",\"tx_drops\":%u,\"rx_nopbuf\":%u}\n",
+        (unsigned)usb_net_mode(),
+        (unsigned)ecm_stat_rx_frames(),
+        (unsigned)ecm_stat_tx_frames(),
+        (unsigned)ecm_stat_rx_bytes(),
+        (unsigned)ecm_stat_tx_bytes(),
+        (unsigned)ecm_stat_tx_drops(),
+        (unsigned)ecm_stat_rx_pbuf_fails());
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, buf, (n > 0 && (size_t)n < sizeof buf) ? n : 0);
     return ESP_OK;
-}
-
-/* POST /mode?to=SLIP|MODEM -- runtime mode switch from the WiFi
- * side. Always available (independent of CDC) so a stuck SLIP mode
- * with no DOS-side recovery can be unstuck via curl. Persisted to
- * NVS by slip_set_mode. */
-static esp_err_t h_mode(httpd_req_t *req) {
-    char qbuf[64];
-    char to[16] = {0};
-    int qlen = httpd_req_get_url_query_len(req);
-    if (qlen > 0 && (size_t)qlen < sizeof qbuf) {
-        if (httpd_req_get_url_query_str(req, qbuf, sizeof qbuf) == ESP_OK)
-            httpd_query_key_value(qbuf, "to", to, sizeof to);
-    }
-    if (!to[0]) {
-        return send_text(req, "200 OK", "text/plain",
-                         slip_get_mode() == MODE_SLIP ? "SLIP\n" : "MODEM\n");
-    }
-    LinkMode want = (LinkMode)-1;
-    if      (!strcasecmp(to, "SLIP"))  want = MODE_SLIP;
-    else if (!strcasecmp(to, "MODEM")) want = MODE_MODEM;
-    else
-        return send_text(req, "400 Bad Request", "text/plain", "to=SLIP|MODEM\n");
-
-    if (slip_set_mode(want) != ESP_OK)
-        return send_text(req, "500 Internal Server Error", "text/plain", "set_mode failed\n");
-
-    return send_text(req, "200 OK", "text/plain",
-                     want == MODE_SLIP ? "SLIP\n" : "MODEM\n");
 }
 
 /* /usb-stats: per-callback counters + last MSC op + write-back cache
@@ -863,9 +832,7 @@ static void httpd_start_once(void) {
         { .uri = "/fs/*",      .method = HTTP_GET,    .handler = h_fs_get,    .user_ctx = NULL },
         { .uri = "/fs/*",      .method = HTTP_PUT,    .handler = h_fs_put,    .user_ctx = NULL },
         { .uri = "/fs/*",      .method = HTTP_DELETE, .handler = h_fs_delete, .user_ctx = NULL },
-        { .uri = "/mode",      .method = HTTP_POST,   .handler = h_mode,      .user_ctx = NULL },
-        { .uri = "/mode",      .method = HTTP_GET,    .handler = h_mode,      .user_ctx = NULL },
-        { .uri = "/slip-stats",.method = HTTP_GET,    .handler = h_slip_stats,.user_ctx = NULL },
+        { .uri = "/ecm-stats", .method = HTTP_GET,    .handler = h_ecm_stats, .user_ctx = NULL },
         { .uri = "/partitions",.method = HTTP_GET,    .handler = h_partitions,.user_ctx = NULL },
         { .uri = "/type",      .method = HTTP_POST,   .handler = h_type,      .user_ctx = NULL },
         { .uri = "/eject",     .method = HTTP_POST,   .handler = h_eject,     .user_ctx = NULL },
@@ -1174,20 +1141,6 @@ void app_main(void) {
     }
 
     wifi_start();
-
-    /* SLIP netif + NAPT come up here. The netif is admin-down by
-     * default; entering SLIP mode (HTTP /mode, AT$MODE=, magic frame)
-     * flips it up. Needs to be called after wifi_start so the STA
-     * netif exists for NAPT to route through. */
-    {
-        esp_err_t e = slip_init();
-        if (e != ESP_OK)
-            disk_logf("slip_init failed: %s", esp_err_to_name(e));
-    }
-
-    /* DNS forwarder on the SLIP netif IP. Bypasses NAPT for DNS so
-     * mTCP queries don't depend on the UDP NAT mapping surviving. */
-    dns_forwarder_init();
 
     /* USB up at boot. Phase 1a deferred this behind POST /usb-start
      * as a safety scaffold while the JTAG -> OTG PHY-mux switch and

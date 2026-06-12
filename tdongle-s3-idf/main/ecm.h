@@ -49,6 +49,10 @@ uint32_t ecm_stat_rx_pbuf_fails(void);
 uint32_t ecm_stat_rx_frames(void);
 /** @brief Frames transmitted to the host. */
 uint32_t ecm_stat_tx_frames(void);
+/** @brief Bytes received from the host (upload direction). */
+uint32_t ecm_stat_rx_bytes(void);
+/** @brief Bytes transmitted to the host (download direction). */
+uint32_t ecm_stat_tx_bytes(void);
 
 #ifdef __cplusplus
 }
