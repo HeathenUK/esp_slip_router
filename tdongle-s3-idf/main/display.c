@@ -256,12 +256,31 @@ static void display_task(void *arg) {
     int64_t prev_us = esp_timer_get_time();
 
     for (;;) {
+        /* ONE screen: the CDC modem exists in every mode and the ECM bridge
+         * is just an additional fact about this boot -- no more SLIP-era
+         * either/or. Rows: mode+CDC / WiFi / IP / modem state / bridge rate. */
         wifi_ap_record_t ap;
         bool wifi_up = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
         bool have_ip = sta_ip_str(ip, sizeof ip);
+        bool cdc_up  = tud_cdc_n_connected(0);
+        const char *peer = NULL;
+        bool online = modem_online_peer(&peer);
+
+        const char *mode = (usb_net_mode() == 1) ? "NET" :
+                           (usb_net_mode() == 2) ? "DEV" : "HID";
+        snprintf(buf, sizeof buf, "DOSongle %s %s", mode, cdc_up ? "H+" : "H?");
+        draw_row(0, buf, cdc_up ? C_MAGENTA : C_RED);
+        draw_row(1, wifi_up ? "WiFi: up" : "WiFi: ...", wifi_up ? C_GREEN : C_YELLOW);
+        draw_row(2, have_ip ? ip : "no ip", C_WHITE);
+
+        if (online && peer && peer[0]) {
+            draw_row(3, peer, C_GREEN);
+        } else {
+            draw_row(3, "command mode", C_GREY);
+        }
 
         if (usb_net_enabled()) {
-            /* ECM bridge: throughput deltas over the elapsed interval */
+            /* bridge throughput deltas over the elapsed interval */
             int64_t now = esp_timer_get_time();
             uint32_t dl = ecm_stat_tx_bytes();   /* net -> host (download) */
             uint32_t ul = ecm_stat_rx_bytes();   /* host -> net (upload) */
@@ -269,32 +288,12 @@ static void display_task(void *arg) {
             uint32_t dl_bps = (dt_us > 0) ? (uint32_t)(((uint64_t)(dl - prev_dl) * 1000000) / dt_us) : 0;
             uint32_t ul_bps = (dt_us > 0) ? (uint32_t)(((uint64_t)(ul - prev_ul) * 1000000) / dt_us) : 0;
             prev_dl = dl; prev_ul = ul; prev_us = now;
-
-            draw_row(0, usb_net_mode() == 1 ? "ECM Bridge" : "ECM Bridge dev", C_CYAN);
-            draw_row(1, wifi_up ? "WiFi: up" : "WiFi: ...", wifi_up ? C_GREEN : C_YELLOW);
-            draw_row(2, have_ip ? ip : "no ip", C_WHITE);
             rate_short(dl_bps, r1, sizeof r1);
             rate_short(ul_bps, r2, sizeof r2);
             snprintf(buf, sizeof buf, "D%s U%s", r1, r2);
-            draw_row(3, buf, C_GREEN);
-            draw_row(4, usb_net_mode() == 1 ? "hold BTN: HID mode"
-                                            : "hold BTN: DOS net", C_GREY);
+            draw_row(4, buf, C_GREEN);
         } else {
-            bool cdc_up = tud_cdc_n_connected(0);
-            const char *peer = NULL;
-            bool online = modem_online_peer(&peer);
-
-            draw_row(0, cdc_up ? "Modem HID H+" : "Modem HID H?",
-                     cdc_up ? C_MAGENTA : C_RED);
-            draw_row(1, wifi_up ? "WiFi: up" : "WiFi: ...", wifi_up ? C_GREEN : C_YELLOW);
-            draw_row(2, have_ip ? ip : "no ip", C_WHITE);
-            if (online && peer && peer[0]) {
-                draw_row(3, "online", C_GREEN);
-                draw_row(4, peer, C_WHITE);
-            } else {
-                draw_row(3, "command mode", C_GREY);
-                draw_row(4, "ATDT host:port", C_GREY);
-            }
+            draw_row(4, "hold BTN: net mode", C_GREY);
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
