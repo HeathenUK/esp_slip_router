@@ -1,5 +1,29 @@
 # DOSONGLE CDC-ECM bridge — plan, 2026-06-10
 
+## ⚠ BINDING CONSTRAINT — never take the Mac offline (added 2026-06-12)
+
+The Mac is the development host AND the machine the agent runs on. Any step
+that pushes it offline severs the operator mid-task (incidents 2026-06-11/12:
+(a) disabling WiFi to test NAPT wedged the network stack — restart required;
+(b) merely plugging the dongle in NET mode hijacked routing via our DHCP
+router/DNS options + the user's VPN — repeatedly).
+
+Rules, in force for ALL work under this plan:
+- NEVER change the Mac's interfaces/routes/services/WiFi/DNS to test the
+  bridge. Read-only inspection (ifconfig, ioreg, ping, dig) is fine.
+- Treat DEVICE-side choices as host-affecting: DHCP option contents, new
+  interfaces enumerating, descriptor/PID changes. Ask "can this take the Mac
+  or its VPN offline?" BEFORE flashing/plugging; if yes or unsure, stop and
+  clear it with the user.
+- Standing safe config: the Mac's "DOSongle T-Dongle S3" network service is
+  MANUAL IP 192.168.241.2/24, NO router, IPv6 OFF. This must survive; a new
+  PID/descriptor shape creates a NEW macOS service that defaults back to DHCP
+  — re-apply the manual config immediately after any shape change, BEFORE
+  leaving the dongle plugged in.
+- Default-route/NAPT-uplink testing happens on the DOS host, or via a scoped
+  user-run `sudo route add -host <single-IP> 192.168.241.1` — never by
+  re-routing the Mac.
+
 Device half of the "WiFi for DOS" design. The host half lives in `~/CH375/ECM-CLASS-PLAN-2026-06-11.md` (CHUSB: ECM
 class + INT 2Fh frame API only) and `~/FOSSLIP/ECM-TRANSPORT-PLAN-2026-06-11.md`
 (the packet driver, dual SLIP/ECM). Nothing in THIS doc changes.

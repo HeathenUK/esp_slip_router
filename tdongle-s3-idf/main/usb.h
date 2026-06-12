@@ -11,8 +11,14 @@ extern "C" {
  * HTTP-based diagnostics survive even if anything here fails. */
 esp_err_t usb_start(void);
 
-/* True when this boot enumerated the NET composite (CDC + MSC + ECM,
- * no HID) -- NVS "usbnet", toggled by AT$USBNET=1|0 + reboot. */
+/* USB composite mode for this boot (NVS "usbnet", AT$USBNET=n + reboot):
+ *   0 = normal:  CDC + MSC + HID keyboard
+ *   1 = DOS net: CDC + MSC + ECM without notification EP (CHUSB tolerates;
+ *                macOS will NOT publish the interface in this mode)
+ *   2 = dev net: CDC + ECM with notification EP, no MSC (what macOS needs)
+ * The DWC2's 5 IN-endpoint FIFO budget forces the either/or. */
+uint8_t usb_net_mode(void);
+/* True when this boot has the ECM function (mode 1 or 2). */
 bool usb_net_enabled(void);
 
 /* Soft USB re-enumeration: drop the D+ pullup (tud_disconnect), hold

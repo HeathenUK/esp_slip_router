@@ -2604,23 +2604,27 @@ static void handle_dollar(char *s) {
         if (n < 0) { r_error(); return; }
         r_ok();
     } else if (!strcmp(key, "USBNET")) {
-        /* AT$USBNET=1|0 -- choose the USB composite for the NEXT boot:
-         * 1 = NET (CDC + MSC + CDC-ECM network adapter, no HID keyboard),
-         * 0 = normal (CDC + MSC + HID). NVS-persisted; applied by usb.c at
-         * enumeration time because the DWC2 core only has 5 IN-endpoint
-         * FIFOs -- ECM and HID can't coexist. Bare AT$USBNET queries both
-         * the saved flag and what this boot is actually running. */
+        /* AT$USBNET=0|1|2 -- choose the USB composite for the NEXT boot:
+         *   0 = normal  (CDC + MSC + HID keyboard)
+         *   1 = DOS net (CDC + MSC + ECM without notif EP -- CHUSB target)
+         *   2 = dev net (CDC + ECM with notif EP, no MSC -- what macOS needs)
+         * NVS-persisted; applied by usb.c at enumeration time because the
+         * DWC2 core only has 5 IN-endpoint FIFOs -- the functions can't all
+         * coexist. Bare AT$USBNET queries saved flag + the running mode. */
         if (val && eq) {
-            if (val[0] != '0' && val[0] != '1') { r_error(); return; }
+            if (val[0] < '0' || val[0] > '2' || val[1]) { r_error(); return; }
             nvs_handle_t h;
             if (nvs_open("slip-router", NVS_READWRITE, &h) != ESP_OK) { r_error(); return; }
             esp_err_t we = nvs_set_u8(h, "usbnet", (uint8_t)(val[0] - '0'));
             if (we == ESP_OK) we = nvs_commit(h);
             nvs_close(h);
             if (we != ESP_OK) { r_error(); return; }
-            cdc_print(val[0] == '1'
-                      ? "\r\nUSBNET=1 saved -- AT$RESET to reboot into NET mode (ECM, no HID)\r\n"
-                      : "\r\nUSBNET=0 saved -- AT$RESET to reboot into normal mode (HID, no ECM)\r\n");
+            static const char *m[] = {
+                "\r\nUSBNET=0 saved -- AT$RESET for normal mode (CDC+MSC+HID)\r\n",
+                "\r\nUSBNET=1 saved -- AT$RESET for DOS net (CDC+MSC+ECM, no notif EP)\r\n",
+                "\r\nUSBNET=2 saved -- AT$RESET for dev net (CDC+ECM+notif, no MSC)\r\n",
+            };
+            cdc_print(m[val[0] - '0']);
             r_ok();
         } else {
             nvs_handle_t h; uint8_t v = 0;
@@ -2628,9 +2632,10 @@ static void handle_dollar(char *s) {
                 nvs_get_u8(h, "usbnet", &v);
                 nvs_close(h);
             }
+            static const char *names[] = { "normal/HID", "DOS net (MSC+ECM)", "dev net (ECM+notif)" };
             char o[96];
             snprintf(o, sizeof o, "\r\nUSBNET=%u (this boot: %s)\r\n",
-                     (unsigned)v, usb_net_enabled() ? "NET/ECM" : "normal/HID");
+                     (unsigned)v, names[usb_net_mode() <= 2 ? usb_net_mode() : 0]);
             cdc_print(o);
             r_ok();
         }

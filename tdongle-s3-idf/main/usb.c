@@ -162,10 +162,15 @@ enum {
   /* Endpoint Out */\
   7, TUSB_DESC_ENDPOINT, _epout, TUSB_XFER_BULK, U16_TO_U8S_LE(_epsize), 0
 
-#define CFG_TOTAL_LEN_NET (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN + ECM_NONOTIF_DESC_LEN)
+/* Mode 1, "DOS": CDC + MSC + ECM-without-notif (PID 0x4024). CHUSB's plan
+ * explicitly tolerates a missing notification endpoint and Linux's cdc_ether
+ * assumes link-up without one, so the real target keeps MSC. macOS will NOT
+ * publish the interface in this mode (measured 2026-06-11: AppleUserECMData
+ * attaches but never registers an interface without the notif EP). */
+#define CFG_TOTAL_LEN_NET_DOS (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_MSC_DESC_LEN + ECM_NONOTIF_DESC_LEN)
 
-static const uint8_t s_cfg_desc_net[] = {
-    TUD_CONFIG_DESCRIPTOR(1, ITF_NET_TOTAL, 0, CFG_TOTAL_LEN_NET,
+static const uint8_t s_cfg_desc_net_dos[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NET_TOTAL, 0, CFG_TOTAL_LEN_NET_DOS,
                           TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
 
     TUD_CDC_DESCRIPTOR(ITF_NET_CDC, 4, EPNUM_CDC_NOTIF, 8,
@@ -178,9 +183,40 @@ static const uint8_t s_cfg_desc_net[] = {
                            CFG_TUD_NET_ENDPOINT_SIZE, CFG_TUD_NET_MTU),
 };
 
-/* Boot-time mode flag, read once from NVS ("slip-router"/"usbnet"). */
-static bool s_net_mode = false;
-bool usb_net_enabled(void) { return s_net_mode; }
+/* Mode 2, "dev": CDC + ECM-with-notif, no MSC (PID 0x4025). macOS requires
+ * the notification endpoint before AppleUserECMData publishes an Ethernet
+ * interface (proven 2026-06-11: this shape -> en8 + DHCP lease + active);
+ * affording it means giving up MSC's IN endpoint for the boot. Used for
+ * Mac/Linux-side validation and bridge development. */
+enum {
+    ITF_DEV_CDC = 0,
+    ITF_DEV_CDC_DATA,
+    ITF_DEV_ECM,
+    ITF_DEV_ECM_DATA,
+    ITF_DEV_TOTAL,
+};
+#define EPNUM_ECM_NOTIF 0x83   /* MSC's IN slot, reused in dev mode */
+
+#define CFG_TOTAL_LEN_NET_DEV (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_CDC_ECM_DESC_LEN)
+
+static const uint8_t s_cfg_desc_net_dev[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_DEV_TOTAL, 0, CFG_TOTAL_LEN_NET_DEV,
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+
+    TUD_CDC_DESCRIPTOR(ITF_DEV_CDC, 4, EPNUM_CDC_NOTIF, 8,
+                       EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
+
+    TUD_CDC_ECM_DESCRIPTOR(ITF_DEV_ECM, 6, 7 /* iMACAddress string */,
+                           EPNUM_ECM_NOTIF, 64,
+                           EPNUM_ECM_OUT, EPNUM_ECM_IN,
+                           CFG_TUD_NET_ENDPOINT_SIZE, CFG_TUD_NET_MTU),
+};
+
+/* Boot-time mode (NVS "slip-router"/"usbnet"): 0 = normal (HID),
+ * 1 = DOS net (MSC + ECM no-notif), 2 = dev net (ECM + notif, no MSC). */
+static uint8_t s_usbnet_mode = 0;
+uint8_t usb_net_mode(void)    { return s_usbnet_mode; }
+bool    usb_net_enabled(void) { return s_usbnet_mode != 0; }
 
 /* String descriptors. Serial is derived from the WiFi-station MAC on
  * the fly in usb_start() so each dongle reports a stable unique id.
@@ -276,9 +312,9 @@ esp_err_t usb_start(void) {
     snprintf(s_serial_str, sizeof(s_serial_str), "%02X%02X%02X%02X%02X%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    /* NET mode (AT$USBNET=1, NVS-persisted): swap the HID keyboard for the
-     * CDC-ECM function -- the DWC2 only has 5 IN-EP FIFOs, so the two are a
-     * boot-time either/or (see the s_cfg_desc_net block comment). */
+    /* NET modes (AT$USBNET, NVS-persisted): swap functions within the DWC2's
+     * 5 IN-EP FIFO budget (see the descriptor block comments). Each shape
+     * gets its own PID so hosts never reuse a cached config across shapes. */
     {
         nvs_handle_t h;
         uint8_t v = 0;
@@ -286,9 +322,9 @@ esp_err_t usb_start(void) {
             nvs_get_u8(h, "usbnet", &v);
             nvs_close(h);
         }
-        s_net_mode = (v == 1);
+        s_usbnet_mode = (v <= 2) ? v : 0;
     }
-    if (s_net_mode) {
+    if (s_usbnet_mode != 0) {
         ecm_mac_init();    /* host reads the MAC during enumeration */
         snprintf(s_mac_str, sizeof(s_mac_str), "%02X%02X%02X%02X%02X%02X",
                  tud_network_mac_address[0], tud_network_mac_address[1],
@@ -296,7 +332,13 @@ esp_err_t usb_start(void) {
                  tud_network_mac_address[4], tud_network_mac_address[5]);
         s_strings[6] = "DOSongle Net";   /* HID is absent; slot 6 = ECM itf */
         s_strings[7] = s_mac_str;        /* iMACAddress */
-        s_dev_desc.idProduct = 0x4024;   /* distinct cached-config identity */
+        /* PID per shape (hosts cache configs by VID/PID). Mode 2 keeps 0x4024:
+         * that's the identity the Mac's hardened "DOSongle T-Dongle S3"
+         * network service (manual IP, NO router, v6 off) is bound to -- a new
+         * PID would mint a fresh macOS service defaulting to DHCP and re-open
+         * the route-hijack hole. Mode 1 is Mac-inert anyway (without the notif
+         * EP macOS never publishes the interface), so it takes the new PID. */
+        s_dev_desc.idProduct = (s_usbnet_mode == 1) ? 0x4025 : 0x4024;
     }
 
     esp_err_t err = disk_init();
@@ -308,10 +350,12 @@ esp_err_t usb_start(void) {
         .device_descriptor        = &s_dev_desc,
         .string_descriptor        = s_strings,
         /* esp_tinyusb hard-caps this at 8; normal mode passes 7 (slot 7 is
-         * NULL outside NET mode). */
-        .string_descriptor_count  = s_net_mode ? 8 : 7,
+         * NULL outside NET modes). */
+        .string_descriptor_count  = s_usbnet_mode ? 8 : 7,
         .external_phy             = false,
-        .configuration_descriptor = s_net_mode ? s_cfg_desc_net : s_cfg_desc,
+        .configuration_descriptor = (s_usbnet_mode == 1) ? s_cfg_desc_net_dos :
+                                    (s_usbnet_mode == 2) ? s_cfg_desc_net_dev :
+                                                           s_cfg_desc,
     };
     err = tinyusb_driver_install(&cfg);
     if (err != ESP_OK) {
@@ -342,8 +386,10 @@ esp_err_t usb_start(void) {
         return err;
     }
 
-    ESP_LOGI(TAG, "composite USB up: MSC + %s + CDC, serial=%s",
-             s_net_mode ? "ECM" : "HID", s_serial_str);
+    ESP_LOGI(TAG, "composite USB up: CDC + %s, serial=%s",
+             (s_usbnet_mode == 1) ? "MSC + ECM(no-notif)" :
+             (s_usbnet_mode == 2) ? "ECM(notif)"          : "MSC + HID",
+             s_serial_str);
     return ESP_OK;
 }
 
