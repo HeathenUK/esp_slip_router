@@ -2867,6 +2867,7 @@ static void handle_dollar(char *s) {
             "AT$NETIF           dump netif state\r\n"
             "AT$TYPE=<str>      send keystrokes via HID keyboard (DSL)\r\n"
             "AT$USBNET=0|1|2    next-boot USB mode: HID / DOS-net / dev-net\r\n"
+            "                   (hold BOOT btn ~2s = toggle 0<->1 + reboot)\r\n"
             "AT$NETTEST=sz[,n]  emit n raw eth test frames of sz bytes (NET modes)\r\n"
             "AT$LECHO=mode     data-mode local echo (AUTO/ON/OFF)\r\n"
             "AT$NAWS=cols,rows  declare terminal size for telnet NAWS\r\n"

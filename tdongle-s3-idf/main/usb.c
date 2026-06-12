@@ -22,6 +22,8 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_partition.h"
+#include "esp_system.h"        /* esp_restart -- BOOT-button mode toggle */
+#include "driver/gpio.h"
 
 #include "tinyusb.h"
 #include "tusb_cdc_acm.h"
@@ -270,6 +272,55 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
  * just calls disk_init() here; the SCSI plumbing wires itself up at
  * link time. */
 
+/* ---- BOOT-button mode toggle ----
+ *
+ * Successor to the old SLIP-mode long-press (retired with slip.c): holding
+ * the BOOT button (GPIO0, active-low, ~2 s) toggles AT$USBNET between 1
+ * (DOS net: Ethernet, no HID) and 0 (HID composite) and reboots to apply --
+ * a no-terminal-needed escape hatch on the DOS machine itself. From dev
+ * mode 2 a hold lands on 1 (the toggle targets the two deployment modes). */
+#define BTN_PIN     GPIO_NUM_0
+#define BTN_HOLD_MS 2000
+
+static void usb_btn_task(void *arg) {
+    (void)arg;
+    gpio_config_t bcfg = {
+        .pin_bit_mask  = (1ULL << BTN_PIN),
+        .mode          = GPIO_MODE_INPUT,
+        .pull_up_en    = GPIO_PULLUP_ENABLE,
+        .pull_down_en  = GPIO_PULLDOWN_DISABLE,
+        .intr_type     = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&bcfg);
+    uint32_t held_ms = 0;
+    bool     fired   = false;
+    for (;;) {
+        if (gpio_get_level(BTN_PIN) == 0) {          /* pressed */
+            held_ms += 50;
+            if (!fired && held_ms >= BTN_HOLD_MS) {
+                fired = true;
+                uint8_t next = (s_usbnet_mode == 1) ? 0 : 1;
+                nvs_handle_t h;
+                if (nvs_open("slip-router", NVS_READWRITE, &h) == ESP_OK) {
+                    esp_err_t we = nvs_set_u8(h, "usbnet", next);
+                    if (we == ESP_OK) we = nvs_commit(h);
+                    nvs_close(h);
+                    if (we == ESP_OK) {
+                        disk_logf("btn: usbnet %u -> %u, rebooting",
+                                  (unsigned)s_usbnet_mode, (unsigned)next);
+                        vTaskDelay(pdMS_TO_TICKS(150));  /* let the log land */
+                        esp_restart();
+                    }
+                }
+            }
+        } else {
+            held_ms = 0;
+            fired   = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 /* ---- public entry point ---- */
 
 /* Switch the USB phy from USB-Serial-JTAG to USB-OTG. ESP-IDF's
@@ -389,6 +440,9 @@ esp_err_t usb_start(void) {
         ESP_LOGE(TAG, "modem_init: %s", esp_err_to_name(err));
         return err;
     }
+
+    /* BOOT-button USBNET toggle (works in every mode; see usb_btn_task). */
+    xTaskCreate(usb_btn_task, "usb_btn", 2048, NULL, 3, NULL);
 
     ESP_LOGI(TAG, "composite USB up: CDC + %s, serial=%s",
              (s_usbnet_mode == 1) ? "MSC + ECM(no-notif)" :

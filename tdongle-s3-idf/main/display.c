@@ -277,13 +277,14 @@ static void display_task(void *arg) {
             rate_short(ul_bps, r2, sizeof r2);
             snprintf(buf, sizeof buf, "D%s U%s", r1, r2);
             draw_row(3, buf, C_GREEN);
-            draw_row(4, "", C_GREY);
+            draw_row(4, usb_net_mode() == 1 ? "hold BTN: HID mode"
+                                            : "hold BTN: DOS net", C_GREY);
         } else {
             bool cdc_up = tud_cdc_n_connected(0);
             const char *peer = NULL;
             bool online = modem_online_peer(&peer);
 
-            draw_row(0, cdc_up ? "WiFi Modem H+" : "WiFi Modem H?",
+            draw_row(0, cdc_up ? "Modem HID H+" : "Modem HID H?",
                      cdc_up ? C_MAGENTA : C_RED);
             draw_row(1, wifi_up ? "WiFi: up" : "WiFi: ...", wifi_up ? C_GREEN : C_YELLOW);
             draw_row(2, have_ip ? ip : "no ip", C_WHITE);
