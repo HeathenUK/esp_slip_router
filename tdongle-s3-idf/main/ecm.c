@@ -109,6 +109,14 @@ extern volatile uint32_t g_napt_used;
  * (dest+dport). dm>0 at a freeze => entry survives but mport no longer matches
  * (identity changed); dm=0 => mapping fully gone. */
 extern volatile uint32_t g_napt_nm_destmatch;
+/* Ground-truth snapshot at the last reverse no-match (see ip4_napt.c): the
+ * failing inbound tuple + the first live entry + the REAL walked count. Logged
+ * as a [ecm] nm line whenever nm moves, so the freeze shows exactly what is /
+ * isn't in the table. Addrs network-order u32; ports host-order. */
+extern volatile uint32_t g_napt_nm_src, g_napt_nm_sport, g_napt_nm_mwant;
+extern volatile uint32_t g_napt_nm_total;
+extern volatile uint32_t g_napt_nm_e0dst, g_napt_nm_e0dport, g_napt_nm_e0mport,
+                         g_napt_nm_e0proto;
 
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
@@ -308,6 +316,21 @@ static void ecm_hb_cb(void *arg) {
                   (int)tud_network_can_xmit(64), (unsigned)dr,
                   (unsigned)ev, (unsigned)nm, (unsigned)rp, (unsigned)rh,
                   (unsigned)used, (unsigned)dm, (unsigned)esp_get_free_heap_size());
+    }
+    if (nm != l_nm) {
+        /* Ground truth at the black-hole: the failing inbound tuple, the real
+         * table count, and the first live entry. dm=0 + e0 unrelated => the
+         * download mapping is genuinely gone; tot != u => the gauge lies. */
+        uint32_t s = g_napt_nm_src, e = g_napt_nm_e0dst;
+        disk_logf("[ecm] nm %u.%u.%u.%u:%u mw=%u tot=%u u=%u e0=%u.%u.%u.%u:%u/m%u p%u",
+                  (unsigned)(s & 0xff), (unsigned)((s >> 8) & 0xff),
+                  (unsigned)((s >> 16) & 0xff), (unsigned)((s >> 24) & 0xff),
+                  (unsigned)g_napt_nm_sport, (unsigned)g_napt_nm_mwant,
+                  (unsigned)g_napt_nm_total, (unsigned)used,
+                  (unsigned)(e & 0xff), (unsigned)((e >> 8) & 0xff),
+                  (unsigned)((e >> 16) & 0xff), (unsigned)((e >> 24) & 0xff),
+                  (unsigned)g_napt_nm_e0dport, (unsigned)g_napt_nm_e0mport,
+                  (unsigned)g_napt_nm_e0proto);
     }
     l_rx = rx; l_tx = tx; l_dr = dr; l_ev = ev; l_nm = nm; l_rp = rp;
     was_active = moved;
