@@ -63,12 +63,22 @@
  * 2026-06-12: a bounded in-line wait throttled the bridge to ~9 KB/s --
  * every TCP window burst overran the one-in-flight USB frame, the drops put
  * TCP into RTO crawl, and the stalled tcpip thread backed WiFi RX up until
- * min_free grazed 3.6 K). Instead linkoutput enqueues a pbuf reference and
- * returns immediately; a small dedicated task absorbs the USB drain latency.
- * Queue depth bounds pinned pbufs (WiFi RX pbufs are ~1.6 K each, and the
- * dynamic pool is capped at 12, so 8 here can never pin more than the pool
- * allows); overflow drops at the queue -- cheap, and TCP paces to the link. */
-#define ECM_TXQ_DEPTH        8
+ * min_free grazed 3.6 K). Instead linkoutput COPIES the frame into a heap
+ * (PBUF_RAM) pbuf and enqueues that, returning immediately; a small dedicated
+ * task absorbs the USB drain latency.
+ *
+ * Why copy rather than ref the WiFi-RX pbuf (the pre-2026-06-13 design): a
+ * single CH375 download burst is a whole TCP window (~16 KB / MSS 536 ~= 30
+ * segments) arriving at WiFi rate into a host that drains at ~100 KB/s. An
+ * 8-deep ref-queue overflowed every burst (measured peak overrun ~17 frames),
+ * dropping ~2% of frames -- and with mTCP's tiny window each drop tripped a
+ * full RTO, collapsing throughput to ~22 KB/s. The ref-queue couldn't simply
+ * be deepened because each queued ref PINS a WiFi-RX-pool pbuf and that pool is
+ * hard-capped at 12. Copying to PBUF_RAM frees the RX pbuf at once (relieving
+ * the pool that dipped min_free to ~12 K) and lets the queue be deep enough to
+ * swallow a full burst from general heap. 24 * ~600 B ~= 14 K transient max,
+ * freed as the pump drains. */
+#define ECM_TXQ_DEPTH        24
 /* Per-frame drain bound inside the pump: a dead/unplugged host must not
  * wedge the pump holding a pbuf forever. */
 #define ECM_TX_DRAIN_MS      200
@@ -306,26 +316,36 @@ static void ecm_hb_cb(void *arg) {
     was_active = moved;
 }
 
-/** @brief linkoutput (tcpip thread): enqueue a reference and return -- the
- *  pump owns the USB latency. Overflow drops here, without blocking lwIP. */
+/** @brief linkoutput (tcpip thread): COPY the frame into a heap pbuf, enqueue
+ *  that, and return -- the pump owns the USB latency. Copying (vs ref'ing the
+ *  WiFi-RX pbuf) frees the RX pool immediately and lets the queue be deep enough
+ *  to absorb a TCP window-burst. Overflow/OOM drops here, without blocking lwIP. */
 static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
     (void)nif;
     if (!s_txq || !tud_ready()) return ERR_IF;  /* not enumerated / unplugged */
-    /* Heap truce, intake half: while a secure session runs, also cap the
-     * QUEUE to 2 frames -- each queued pbuf pins ~1.6 K of WiFi RX buffer,
-     * and 8 of them (~12 K) was most of the remaining gap to the floor
-     * (pacing alone: min_free 4.4 K; still under the 5 K guard). */
+    /* Heap truce, intake half: while a secure session runs, cap the QUEUE to a
+     * couple of frames so the bridge can't stack heap on top of a crypto
+     * session's near-OOM spike (see modem_session_busy / the heap-truce notes). */
     if (modem_session_busy() && uxQueueMessagesWaiting(s_txq) >= 2) {
         s_tx_drops++;
         s_tx_drops_q++;
         return ERR_OK;                 /* drop early; TCP paces */
     }
-    pbuf_ref(p);
-    if (xQueueSend(s_txq, &p, 0) != pdTRUE) {
-        pbuf_free(p);                  /* queue full: genuine overload */
+    /* Own a private heap copy; lwIP frees the original (WiFi-RX) pbuf as soon as
+     * we return, so the RX pool is never pinned by the TX queue. */
+    struct pbuf *q = pbuf_alloc(PBUF_RAW, p->tot_len, PBUF_RAM);
+    if (!q || pbuf_copy(q, p) != ERR_OK) {
+        if (q) pbuf_free(q);
         s_tx_drops++;
-        s_tx_drops_q++;                /* burst outran the 8-deep queue */
-        if (++s_drop_run > s_drop_run_max) s_drop_run_max = s_drop_run; /* size the ring from this */
+        s_tx_drops_q++;                /* heap tight: drop, TCP retransmits */
+        if (++s_drop_run > s_drop_run_max) s_drop_run_max = s_drop_run;
+        return ERR_OK;
+    }
+    if (xQueueSend(s_txq, &q, 0) != pdTRUE) {
+        pbuf_free(q);                  /* queue full even at the deeper depth */
+        s_tx_drops++;
+        s_tx_drops_q++;
+        if (++s_drop_run > s_drop_run_max) s_drop_run_max = s_drop_run;
     } else {
         s_drop_run = 0;                /* a frame got in -> the burst eased */
         UBaseType_t d = uxQueueMessagesWaiting(s_txq);
