@@ -45,6 +45,8 @@ esp_err_t ecm_start(void);
 uint32_t ecm_stat_tx_drops(void);
 /** @brief RX frames dropped for want of a pbuf. */
 uint32_t ecm_stat_rx_pbuf_fails(void);
+/** @brief RX frames dropped because the tcpip mailbox was full (uplink/ACK loss). */
+uint32_t ecm_stat_rx_mbox_drops(void);
 /** @brief Frames received from the host (delivered into lwIP). */
 uint32_t ecm_stat_rx_frames(void);
 /** @brief Frames transmitted to the host. */

@@ -2502,10 +2502,12 @@ static void handle_dollar(char *s) {
             "ecm.rx_bytes   %u\r\n"
             "ecm.tx_bytes   %u\r\n"
             "ecm.tx_drops   %u\r\n"
-            "ecm.rx_nopbuf  %u\r\n",
+            "ecm.rx_nopbuf  %u\r\n"
+            "ecm.rx_mboxdrop %u\r\n",
             (unsigned)ecm_stat_rx_frames(),  (unsigned)ecm_stat_tx_frames(),
             (unsigned)ecm_stat_rx_bytes(),   (unsigned)ecm_stat_tx_bytes(),
-            (unsigned)ecm_stat_tx_drops(),   (unsigned)ecm_stat_rx_pbuf_fails());
+            (unsigned)ecm_stat_tx_drops(),   (unsigned)ecm_stat_rx_pbuf_fails(),
+            (unsigned)ecm_stat_rx_mbox_drops());
         cdc_print(line);
         r_ok();
     } else if (!strcmp(key, "NETTEST") && val && eq) {

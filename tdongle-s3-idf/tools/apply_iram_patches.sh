@@ -135,6 +135,53 @@ if [[ -f "${NET_C}" ]]; then
   fi
 fi
 
+# --- Patch 5: ecm_rndis_device.c / net_device.h -- expose the IN-endpoint TX
+# state (can_xmit is private) so the bridge can detect a wedged TX path on
+# /disk-log, and add a gated recovery that unsticks can_xmit ONLY when the IN
+# endpoint is genuinely idle (a lost completion), never while a transfer is in
+# flight. Keyed on the function name so it's idempotent over a manual edit.
+NET_H="${PROJECT_DIR}/managed_components/espressif__tinyusb/src/class/net/net_device.h"
+if [[ -f "${NET_C}" ]]; then
+  if grep -q 'tud_network_xmit_recover' "${NET_C}"; then
+    echo "apply_iram_patches: ecm_rndis_device.c TX-recovery already present"
+  else
+    if ! grep -qE '^bool tud_network_can_xmit\(' "${NET_C}"; then
+      echo "ERROR: ecm_rndis_device.c lacks tud_network_can_xmit -- upstream changed."
+      exit 1
+    fi
+    cat >> "${NET_C}" <<'EOF'
+
+/* PATCHED: bridge TX-stall diagnostics + recovery (project addition, see main/ecm.c) */
+uint8_t tud_network_ep_in(void)      { return _netd_itf.ep_in; }
+uint8_t tud_network_data_alt(void)   { return _netd_itf.itf_data_alt; }
+bool    tud_network_ep_in_busy(void) { return _netd_itf.ep_in ? usbd_edpt_busy(0, _netd_itf.ep_in) : false; }
+bool    tud_network_xmit_recover(void) {
+  if (!can_xmit && _netd_itf.ep_in && !usbd_edpt_busy(0, _netd_itf.ep_in)) { can_xmit = true; return true; }
+  return false;
+}
+EOF
+    echo "apply_iram_patches: ecm_rndis_device.c patched (TX-stall diagnostics + recovery)"
+    patched=1
+  fi
+fi
+if [[ -f "${NET_H}" ]]; then
+  if grep -q 'tud_network_xmit_recover' "${NET_H}"; then
+    echo "apply_iram_patches: net_device.h TX-recovery decls already present"
+  else
+    sed -i.bak '/void tud_network_xmit(void \*ref, uint16_t arg);/a\
+\
+/* PATCHED: bridge TX-stall diagnostics + recovery (see main/ecm.c) */\
+uint8_t tud_network_ep_in(void);\
+uint8_t tud_network_data_alt(void);\
+bool    tud_network_ep_in_busy(void);\
+bool    tud_network_xmit_recover(void);
+' "${NET_H}"
+    rm -f "${NET_H}.bak"
+    echo "apply_iram_patches: net_device.h patched (TX-recovery decls)"
+    patched=1
+  fi
+fi
+
 if [[ ${patched} -eq 0 ]]; then
   echo "apply_iram_patches: nothing to do"
 fi

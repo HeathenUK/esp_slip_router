@@ -96,6 +96,7 @@ static volatile bool     s_flood_active  = false;
 
 static volatile uint32_t s_tx_drops      = 0;
 static volatile uint32_t s_rx_pbuf_fails = 0;
+static volatile uint32_t s_rx_mbox_drops = 0;   /* host->stack drops: tcpip mbox full */
 static volatile uint32_t s_rx_frames     = 0;
 static volatile uint32_t s_tx_frames     = 0;
 static volatile uint32_t s_rx_bytes      = 0;
@@ -103,6 +104,7 @@ static volatile uint32_t s_tx_bytes      = 0;
 
 uint32_t ecm_stat_tx_drops(void)      { return s_tx_drops; }
 uint32_t ecm_stat_rx_pbuf_fails(void) { return s_rx_pbuf_fails; }
+uint32_t ecm_stat_rx_mbox_drops(void) { return s_rx_mbox_drops; }
 uint32_t ecm_stat_rx_frames(void)     { return s_rx_frames; }
 uint32_t ecm_stat_tx_frames(void)     { return s_tx_frames; }
 uint32_t ecm_stat_rx_bytes(void)      { return s_rx_bytes; }
@@ -134,6 +136,7 @@ bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
      * ethernet_input on the tcpip thread (netif has NETIF_FLAG_ETHARP). */
     if (s_ecm_nif.input(p, &s_ecm_nif) != ERR_OK) {
         pbuf_free(p);          /* mbox full -> drop, TCP retransmits */
+        s_rx_mbox_drops++;     /* uplink/ACK loss suspect for the freeze */
     } else {
         s_rx_frames++;
         s_rx_bytes += size;
@@ -227,14 +230,21 @@ static void ecm_tx_task(void *arg) {
         if (++s_stuck_run == ECM_STUCK_FRAMES ||
             (s_stuck_run > ECM_STUCK_FRAMES &&
              (s_stuck_run - ECM_STUCK_FRAMES) % ECM_STUCK_HEARTBEAT == 0)) {
-            disk_logf("[ecm] TX STALL run=%u rdy=%d cx=%d tx=%u drop=%u qd=%u "
-                      "heap=%u min=%u",
+            /* Try to unstick: only acts if the IN endpoint is idle (a lost
+             * completion left can_xmit false with nothing in flight). alt=0/ep=00
+             * means the host has the data interface INACTIVE -- not recoverable
+             * here, the frames are correctly dropped. busy=1 means a transfer is
+             * genuinely outstanding (host not draining) -- normal backpressure. */
+            bool rec = tud_network_xmit_recover();
+            disk_logf("[ecm] TX STALL run=%u rdy=%d cx=%d alt=%d ep=%02x busy=%d "
+                      "rec=%d tx=%u drop=%u qd=%u heap=%u",
                       (unsigned)s_stuck_run, (int)tud_ready(),
-                      (int)tud_network_can_xmit(64),
-                      (unsigned)s_tx_frames, (unsigned)s_tx_drops,
+                      (int)tud_network_can_xmit(64), (int)tud_network_data_alt(),
+                      tud_network_ep_in(), (int)tud_network_ep_in_busy(),
+                      (int)rec, (unsigned)s_tx_frames, (unsigned)s_tx_drops,
                       (unsigned)uxQueueMessagesWaiting(s_txq),
-                      (unsigned)esp_get_free_heap_size(),
-                      (unsigned)esp_get_minimum_free_heap_size());
+                      (unsigned)esp_get_free_heap_size());
+            if (rec) s_stuck_run = 0;       /* recovered: re-arm the detector */
         }
     }
 }
@@ -255,14 +265,22 @@ static void ecm_hb_cb(void *arg) {
     static bool was_active = false;
     uint32_t rx = s_rx_frames, tx = s_tx_frames;
     uint32_t rxd = rx - l_rx, txd = tx - l_tx;
-    UBaseType_t qd = s_txq ? uxQueueMessagesWaiting(s_txq) : 0;
-    bool active = rxd || txd || qd;
+    /* "Active" = real PROGRESS in either direction, NOT mere queue occupancy --
+     * otherwise a TX wedge (qd pinned full) would log every second forever and
+     * scroll the pre-freeze trend out of the 24-line ring. While wedged the
+     * dedicated TX STALL line carries the detail; the heartbeat goes quiet
+     * after one trailing "IDLE" snapshot that captures the freeze edge:
+     *   A (TX wedge):  IDLE with qd=8 cx=0, then TX STALL busy=.. follows.
+     *   B (uplink):    IDLE with qd=0 cx=1 and BOTH rx+tx flat, rxdr climbing. */
+    bool active = rxd || txd;
     if (active || was_active) {
-        disk_logf("[ecm] hb rx=%u+%u tx=%u+%u qd=%u cx=%d drop=%u heap=%u min=%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=%u rxdr=%u heap=%u",
+                  active ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
-                  (unsigned)qd, (int)tud_network_can_xmit(64),
-                  (unsigned)s_tx_drops, (unsigned)esp_get_free_heap_size(),
-                  (unsigned)esp_get_minimum_free_heap_size());
+                  (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
+                  (int)tud_network_can_xmit(64), (unsigned)s_tx_drops,
+                  (unsigned)(s_rx_pbuf_fails + s_rx_mbox_drops),
+                  (unsigned)esp_get_free_heap_size());
     }
     l_rx = rx; l_tx = tx; was_active = active;
 }
