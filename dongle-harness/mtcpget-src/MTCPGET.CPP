@@ -334,11 +334,6 @@ int main( int argc, char *argv[] )
 
     OutFile = fopen( OutFilename, "wb" );
     if ( !OutFile ) { printf( "MTCPGET: cannot open %s\n", OutFilename ); cleanup( 1 ); }
-    /* Big fully-buffered file buffer: turns the per-chunk disk traffic into one
-     * large, efficient flush per 8 KB instead of ~16 tiny default-buffer writes,
-     * which shrinks the window where the stack goes dark during disk I/O. */
-    static char s_fileBuf[8192];
-    setvbuf( OutFile, s_fileBuf, _IOFBF, sizeof s_fileBuf );
 
     clockTicks_t bodyStart = TIMER_GET_CURRENT( );
     clockTicks_t lastTick  = bodyStart;
@@ -353,22 +348,9 @@ int main( int argc, char *argv[] )
             if ( haveLength && (uint32_t)avail > contentLength - got ) {
                 avail = (uint16_t)( contentLength - got );
             }
-            /* Write in small pieces and pump the stack between each, so ACKs
-             * keep flowing and the receiver keeps draining DURING the disk
-             * write. A real NIC's hardware buffer does this for free; the dongle
-             * has no RX buffer, so if we stop ACKing here its tiny TX queue
-             * overflows, full-size frames drop, and the path MSS collapses to
-             * 512 (measured: -o NUL 97 KB/s vs -o CF 12.9 KB/s). */
-            uint16_t w = 0;
-            while ( w < avail ) {
-                uint16_t chunk = (uint16_t)( avail - w );
-                if ( chunk > 512U ) chunk = 512U;
-                if ( fwrite( inBuf + inBufStart + w, 1, chunk, OutFile ) != chunk ) {
-                    printf( "MTCPGET: file write fail\n" );
-                    cleanup( 1 );
-                }
-                w = (uint16_t)( w + chunk );
-                pumpMtcp( );   /* keep the net serviced through the write */
+            if ( fwrite( inBuf + inBufStart, 1, avail, OutFile ) != avail ) {
+                printf( "MTCPGET: file write fail\n" );
+                cleanup( 1 );
             }
             inBufStart = (uint16_t)( inBufStart + avail );
             got += avail;
