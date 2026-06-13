@@ -293,14 +293,15 @@ static void ecm_hb_cb(void *arg) {
     bool moved = data || (ev != l_ev) || (nm != l_nm) || (dr != l_dr);
     bool active = data;            /* the IDLE tag tracks DATA, not counters */
     if (moved || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=q%u/p%u rxdr=%u burst=hwm%u/run%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=q%u/p%u heap=%u/%u napt=e%u/nm%u",
                   active ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
                   (int)tud_network_can_xmit(64),
                   (unsigned)s_tx_drops_q, (unsigned)s_tx_drops_pump,
-                  (unsigned)(s_rx_pbuf_fails + s_rx_mbox_drops),
-                  (unsigned)s_q_hwm, (unsigned)s_drop_run_max);
+                  (unsigned)esp_get_free_heap_size(),
+                  (unsigned)esp_get_minimum_free_heap_size(),
+                  (unsigned)ev, (unsigned)nm);
     }
     l_rx = rx; l_tx = tx; l_ev = ev; l_nm = nm; l_dr = dr;
     was_active = moved;
