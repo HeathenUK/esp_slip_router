@@ -151,33 +151,28 @@ if [[ -f "${NET_C}" ]]; then
     fi
     cat >> "${NET_C}" <<'EOF'
 
-/* PATCHED: bridge TX-stall diagnostics + recovery (project addition, see main/ecm.c) */
-uint8_t tud_network_ep_in(void)      { return _netd_itf.ep_in; }
-uint8_t tud_network_data_alt(void)   { return _netd_itf.itf_data_alt; }
-bool    tud_network_ep_in_busy(void) { return _netd_itf.ep_in ? usbd_edpt_busy(0, _netd_itf.ep_in) : false; }
-bool    tud_network_xmit_recover(void) {
+/* PATCHED: unstick a lost-completion TX wedge -- can_xmit stuck false with the
+ * IN endpoint actually idle. Only acts when idle (never forces a live xfer). */
+bool tud_network_xmit_recover(void) {
   if (!can_xmit && _netd_itf.ep_in && !usbd_edpt_busy(0, _netd_itf.ep_in)) { can_xmit = true; return true; }
   return false;
 }
 EOF
-    echo "apply_iram_patches: ecm_rndis_device.c patched (TX-stall diagnostics + recovery)"
+    echo "apply_iram_patches: ecm_rndis_device.c patched (TX lost-completion recovery)"
     patched=1
   fi
 fi
 if [[ -f "${NET_H}" ]]; then
   if grep -q 'tud_network_xmit_recover' "${NET_H}"; then
-    echo "apply_iram_patches: net_device.h TX-recovery decls already present"
+    echo "apply_iram_patches: net_device.h TX-recovery decl already present"
   else
     sed -i.bak '/void tud_network_xmit(void \*ref, uint16_t arg);/a\
 \
-/* PATCHED: bridge TX-stall diagnostics + recovery (see main/ecm.c) */\
-uint8_t tud_network_ep_in(void);\
-uint8_t tud_network_data_alt(void);\
-bool    tud_network_ep_in_busy(void);\
+/* PATCHED: unstick a lost-completion TX wedge (see main/ecm.c) */\
 bool    tud_network_xmit_recover(void);
 ' "${NET_H}"
     rm -f "${NET_H}.bak"
-    echo "apply_iram_patches: net_device.h patched (TX-recovery decls)"
+    echo "apply_iram_patches: net_device.h patched (TX-recovery decl)"
     patched=1
   fi
 fi

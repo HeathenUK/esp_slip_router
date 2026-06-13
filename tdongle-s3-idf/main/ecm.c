@@ -91,13 +91,6 @@ static bool         s_started = false;
 static QueueHandle_t s_txq    = NULL;
 static esp_timer_handle_t s_hb_timer = NULL;   /* 1 Hz bridge heartbeat */
 
-/* NAPT-layer diagnostics (patched into IDF lwip ip4_napt.c): TCP mappings
- * garbage-collected, and inbound TCP packets dropped for want of a mapping
- * (black-holed server replies after an eviction). These sit UPSTREAM of every
- * ecm.c counter -- the missing-link for the "both directions flat" freeze. */
-extern volatile uint32_t g_napt_tcp_evict;
-extern volatile uint32_t g_napt_recv_nomatch;
-
 static volatile uint32_t s_dbg_drain_ms  = 0;   /* debug: simulate a slow host */
 static volatile bool     s_flood_active  = false;
 
@@ -106,9 +99,6 @@ static volatile uint32_t s_rx_pbuf_fails = 0;
 static volatile uint32_t s_rx_mbox_drops = 0;   /* host->stack drops: tcpip mbox full */
 static volatile uint32_t s_tx_drops_q    = 0;   /* TX dropped at linkoutput: queue full / session cap */
 static volatile uint32_t s_tx_drops_pump = 0;   /* TX dropped in pump: host didn't drain in ECM_TX_DRAIN_MS */
-static volatile UBaseType_t s_q_hwm      = 0;   /* TX queue high-water occupancy (will peg at depth) */
-static volatile uint32_t s_drop_run      = 0;   /* current run of consecutive overflow drops */
-static volatile uint32_t s_drop_run_max  = 0;   /* worst burst overrun: slots needed BEYOND the queue */
 static volatile uint32_t s_rx_frames     = 0;
 static volatile uint32_t s_tx_frames     = 0;
 static volatile uint32_t s_rx_bytes      = 0;
@@ -245,18 +235,16 @@ static void ecm_tx_task(void *arg) {
         if (++s_stuck_run == ECM_STUCK_FRAMES ||
             (s_stuck_run > ECM_STUCK_FRAMES &&
              (s_stuck_run - ECM_STUCK_FRAMES) % ECM_STUCK_HEARTBEAT == 0)) {
-            /* Try to unstick: only acts if the IN endpoint is idle (a lost
-             * completion left can_xmit false with nothing in flight). alt=0/ep=00
-             * means the host has the data interface INACTIVE -- not recoverable
-             * here, the frames are correctly dropped. busy=1 means a transfer is
-             * genuinely outstanding (host not draining) -- normal backpressure. */
+            /* A long unbroken drop-run is a lost IN completion: can_xmit stuck
+             * false with nothing in flight. tud_network_xmit_recover() unsticks
+             * it ONLY when the endpoint is genuinely idle (never forces a live
+             * transfer). rdy=0 = host unplugged; cx=0 with rec=0 = host simply
+             * not draining (normal backpressure). */
             bool rec = tud_network_xmit_recover();
-            disk_logf("[ecm] TX STALL run=%u rdy=%d cx=%d alt=%d ep=%02x busy=%d "
-                      "rec=%d tx=%u drop=%u qd=%u heap=%u",
+            disk_logf("[ecm] TX STALL run=%u rdy=%d cx=%d rec=%d drop=%u qd=%u heap=%u",
                       (unsigned)s_stuck_run, (int)tud_ready(),
-                      (int)tud_network_can_xmit(64), (int)tud_network_data_alt(),
-                      tud_network_ep_in(), (int)tud_network_ep_in_busy(),
-                      (int)rec, (unsigned)s_tx_frames, (unsigned)s_tx_drops,
+                      (int)tud_network_can_xmit(64), (int)rec,
+                      (unsigned)s_tx_drops,
                       (unsigned)uxQueueMessagesWaiting(s_txq),
                       (unsigned)esp_get_free_heap_size());
             if (rec) s_stuck_run = 0;       /* recovered: re-arm the detector */
@@ -265,45 +253,28 @@ static void ecm_tx_task(void *arg) {
 }
 
 /** @brief 1 Hz bridge heartbeat -> /disk-log. The pump's TX-STALL line only
- *  fires when the device HAS frames it cannot send (topology A: the ECM-TX
- *  can_xmit-stuck wedge). The other freeze topology -- the host->server uplink
- *  (TCP ACKs) failing so the server stops sending -- leaves the pump idle on an
- *  empty queue and is invisible to it. This samples BOTH directions so a stall
- *  shows WHICH leg stopped: at the freeze the last line reads either
- *  qd=8,cx=0 (A: device wedged with frames waiting) or qd=0,cx=1 with tx AND rx
- *  flat (B: device fed everything, nothing more arrived to forward). Logs only
- *  while traffic moves, plus one trailing snapshot when it stops, so the
- *  24-line ring isn't flooded at idle. */
+ *  the throughput-measurement tool: tx delta = frames/s delivered to the host.
+ *  Logs only while traffic moves (or a drop counter ticks), plus one trailing
+ *  IDLE snapshot, so the 24-line ring isn't flooded at idle. */
 static void ecm_hb_cb(void *arg) {
     (void)arg;
-    static uint32_t l_rx = 0, l_tx = 0, l_ev = 0, l_nm = 0, l_dr = 0;
+    static uint32_t l_rx = 0, l_tx = 0, l_dr = 0;
     static bool was_active = false;
     uint32_t rx = s_rx_frames, tx = s_tx_frames;
     uint32_t rxd = rx - l_rx, txd = tx - l_tx;
-    uint32_t ev = g_napt_tcp_evict, nm = g_napt_recv_nomatch;
-    uint32_t dr = s_tx_drops_q + s_tx_drops_pump;
-    /* Fire on DATA progress OR on a NAPT/drop counter moving. Progress alone
-     * would silence the heartbeat exactly during a freeze -- but a NAPT
-     * eviction (ev++) and the black-holed server retransmits that follow (nm++)
-     * happen DURING that silence, and they are the whole point. So a freeze
-     * that NAPT is killing logs "IDLE ... napt=e1/nm<climbing>" every second
-     * (cumulative, so e1 shows in every retained line); a TRUE upstream
-     * silence (nothing arriving) logs one IDLE snapshot then goes quiet. */
+    uint32_t dr = s_tx_drops;
     bool data = rxd || txd;
-    bool moved = data || (ev != l_ev) || (nm != l_nm) || (dr != l_dr);
-    bool active = data;            /* the IDLE tag tracks DATA, not counters */
+    bool moved = data || (dr != l_dr);
     if (moved || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=q%u/p%u heap=%u/%u napt=e%u/nm%u",
-                  active ? "" : " IDLE",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=%u heap=%u/%u",
+                  data ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
-                  (int)tud_network_can_xmit(64),
-                  (unsigned)s_tx_drops_q, (unsigned)s_tx_drops_pump,
+                  (int)tud_network_can_xmit(64), (unsigned)s_tx_drops,
                   (unsigned)esp_get_free_heap_size(),
-                  (unsigned)esp_get_minimum_free_heap_size(),
-                  (unsigned)ev, (unsigned)nm);
+                  (unsigned)esp_get_minimum_free_heap_size());
     }
-    l_rx = rx; l_tx = tx; l_ev = ev; l_nm = nm; l_dr = dr;
+    l_rx = rx; l_tx = tx; l_dr = dr;
     was_active = moved;
 }
 
@@ -323,14 +294,9 @@ static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
     }
     pbuf_ref(p);
     if (xQueueSend(s_txq, &p, 0) != pdTRUE) {
-        pbuf_free(p);                  /* queue full: genuine overload */
+        pbuf_free(p);                  /* queue full: genuine overload, TCP paces */
         s_tx_drops++;
-        s_tx_drops_q++;                /* burst outran the 8-deep queue */
-        if (++s_drop_run > s_drop_run_max) s_drop_run_max = s_drop_run; /* size the ring from this */
-    } else {
-        s_drop_run = 0;                /* a frame got in -> the burst eased */
-        UBaseType_t d = uxQueueMessagesWaiting(s_txq);
-        if (d > s_q_hwm) s_q_hwm = d;
+        s_tx_drops_q++;
     }
     return ERR_OK;
 }
