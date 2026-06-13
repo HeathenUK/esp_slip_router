@@ -105,6 +105,10 @@ extern volatile uint32_t g_napt_tcp_evict;
 extern volatile uint32_t g_napt_repoint;
 extern volatile uint32_t g_napt_repoint_hot;
 extern volatile uint32_t g_napt_used;
+/* At the last reverse no-match: live TCP entries still pointing at that server
+ * (dest+dport). dm>0 at a freeze => entry survives but mport no longer matches
+ * (identity changed); dm=0 => mapping fully gone. */
+extern volatile uint32_t g_napt_nm_destmatch;
 
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
@@ -289,6 +293,7 @@ static void ecm_hb_cb(void *arg) {
     uint32_t dr = s_tx_drops;
     uint32_t ev = g_napt_tcp_evict, nm = g_napt_recv_nomatch;
     uint32_t rp = g_napt_repoint, rh = g_napt_repoint_hot, used = g_napt_used;
+    uint32_t dm = g_napt_nm_destmatch;
     bool data = rxd || txd;
     /* Fire the line on ANY movement -- a NAPT eviction, a reverse no-match, or a
      * repoint (the freeze trigger) -- so a hard-freeze (tx flat) still produces
@@ -296,13 +301,13 @@ static void ecm_hb_cb(void *arg) {
     bool moved = data || (dr != l_dr) || (ev != l_ev) || (nm != l_nm) ||
                  (rp != l_rp);
     if (moved || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d dr=%u nap=e%u/n%u/r%u/rh%u u%u h=%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d dr=%u nap=e%u/n%u/r%u/rh%u u%u dm%u h=%u",
                   data ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
                   (int)tud_network_can_xmit(64), (unsigned)dr,
                   (unsigned)ev, (unsigned)nm, (unsigned)rp, (unsigned)rh,
-                  (unsigned)used, (unsigned)esp_get_free_heap_size());
+                  (unsigned)used, (unsigned)dm, (unsigned)esp_get_free_heap_size());
     }
     l_rx = rx; l_tx = tx; l_dr = dr; l_ev = ev; l_nm = nm; l_rp = rp;
     was_active = moved;
