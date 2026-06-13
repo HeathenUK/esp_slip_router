@@ -173,95 +173,62 @@ void tud_network_init_cb(void) {
 
 /* ---- lwIP netif glue ---- */
 
-/* The actual usbd_edpt_xfer submission MUST run in the USB task: calling
- * tud_network_xmit from another task races the dcd event processing on the
- * same endpoint (the ECM driver doesn't claim like CDC does) -- measured
- * 2026-06-12 as an IN endpoint stuck busy=1 forever after a few thousand
- * frames at 416 KB/s. usbd_defer_func serializes us into the USB task.
- * Handoff is race-free: can_xmit is SET only by the USB task (completion)
- * and CLEARED only by our own xmit, so once the pump observes it true it
- * stays true until the deferred call consumes it. */
-static SemaphoreHandle_t s_tx_done = NULL;
+/* ---- Submit-from-completion TX engine (zero-gap streaming) ----
+ *
+ * usbd_edpt_xfer MUST run in the USB task: submitting from another task races
+ * dcd event processing on the IN endpoint (measured 2026-06-12 as a stuck
+ * busy=1). The race-free place to submit is the IN-completion callback itself
+ * (tud_network_tx_complete_cb, invoked from netd_xfer_cb in the USB task): the
+ * instant frame N drains we submit frame N+1, so the bulk-IN is never empty
+ * when the CH375 host polls back-to-back. That is the throughput fix -- the old
+ * pump task added a completion -> task-wakeup(1ms) -> defer round-trip between
+ * frames, and the host's RX poll fell into that gap and drained ~1 frame per
+ * poll instead of a batch (see memory ecm-throughput-bottleneck-is-frame-cadence).
+ *
+ * One frame is in flight at a time (DWC2/ECM allow only one IN xfer); s_inflight
+ * owns it until its completion frees it. linkoutput only PRIMES the chain when
+ * it is idle; completions sustain it. The 1 Hz heartbeat watchdog re-primes /
+ * recovers the rare lost completion. */
+static struct pbuf *s_inflight = NULL;   /* frame on ep_in (USB-task owned) */
 
-static void ecm_xmit_in_usbtask(void *param) {
-    struct pbuf *p = (struct pbuf *)param;
-    tud_network_xmit(p, 0);  /* serializes via xmit_cb NOW */
-    pbuf_free(p);            /* the deferred call OWNS this reference and frees
-                              * it -- never the pump. This is what makes a stale
-                              * give (from a previously timed-out submission)
-                              * harmless: the pump can wake early but it never
-                              * frees a pbuf the USB task still holds. */
-    xSemaphoreGive(s_tx_done);
+/** @brief Submit the next queued frame IFF the IN endpoint is idle. MUST run in
+ *  the USB task (completion context, or via usbd_defer_func from linkoutput).
+ *  The can_xmit gate makes it idempotent: concurrent callers never double-submit. */
+static void ecm_submit_next(void) {
+    if (!tud_ready() || !tud_network_can_xmit(1)) return;  /* down or in flight */
+    struct pbuf *p;
+    if (xQueueReceive(s_txq, &p, 0) != pdTRUE) return;     /* nothing to send */
+    s_inflight = p;
+    s_tx_frames++;
+    s_tx_bytes += p->tot_len;
+    tud_network_xmit(p, 0);            /* serializes via xmit_cb; can_xmit -> false */
 }
 
-/** @brief TX pump task: drain the queue into the USB driver, absorbing the
- *  one-frame-in-flight USB latency that linkoutput must not block on. */
-static void ecm_tx_task(void *arg) {
+/** @brief IN-completion hook (USB task): the in-flight frame fully drained --
+ *  free it and submit the next with ZERO gap so the host's next poll finds data. */
+void tud_network_tx_complete_cb(void) {
+    if (s_inflight) { pbuf_free(s_inflight); s_inflight = NULL; }
+    ecm_submit_next();
+}
+
+/** @brief Prime the chain from the USB task (deferred by linkoutput when idle). */
+static void ecm_prime_in_usbtask(void *arg) {
     (void)arg;
-    struct pbuf *p;
-    uint32_t s_stuck_run = 0;          /* consecutive full-drain timeouts */
-    for (;;) {
-        if (xQueueReceive(s_txq, &p, portMAX_DELAY) != pdTRUE) continue;
-        /* Heap truce with the modem's secure sessions: a libssh2/TLS session
-         * spike plus full-rate bridging stacks to a ~zero heap floor (measured
-         * 2026-06-12: concurrent SFTP get + 449 KB/s bridge -> min_free 104 B).
-         * While a dial/session worker is active, pace the pump to ~60 KB/s --
-         * TCP self-paces to the slower link and in-flight pbufs shrink. The
-         * real DOS host never exceeds this during a session anyway. */
-        if (modem_session_busy()) vTaskDelay(pdMS_TO_TICKS(25));
-        /* Debug knob (AT$NETSLOW): delay each frame to mimic a slow-draining
-         * host (the CH375's ~100 KB/s poll) so the DOS wedge can be recreated
-         * on a fast host. 0 = off (the normal path). */
-        if (s_dbg_drain_ms) vTaskDelay(pdMS_TO_TICKS(s_dbg_drain_ms));
-        int waited = 0;
-        while (!(tud_ready() && tud_network_can_xmit(p->tot_len))) {
-            if (++waited > ECM_TX_DRAIN_MS) break;    /* host gone/stalled */
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-        if (waited <= ECM_TX_DRAIN_MS) {
-            s_stuck_run = 0;               /* the endpoint drained: not wedged */
-            s_tx_frames++;
-            s_tx_bytes += p->tot_len;
-            /* Hand the pbuf to the USB task, which owns and frees it. The pump
-             * must NOT free it (use-after-free), nor treat the semaphore as
-             * tracking THIS frame -- a give left from a prior timed-out submit
-             * can wake us early, but since the deferred call owns every pbuf an
-             * early wake only loosens serialization (the can_xmit gate above
-             * re-tightens it next iteration), it never corrupts memory. */
-            usbd_defer_func(ecm_xmit_in_usbtask, p, false);
-            xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(1000));
-            continue;                      /* p is owned by the deferred call */
-        }
-        /* Full ECM_TX_DRAIN_MS timeout: the host drained NO frame in that long. */
-        s_tx_drops++;
-        s_tx_drops_pump++;             /* host poll-gap exceeded the drain bound */
-        pbuf_free(p);                  /* never deferred -- pump still owns it */
-        /* A long unbroken run of these is the can_xmit-stuck wedge: a lost IN
-         * completion or a failed usbd_edpt_xfer leaves can_xmit false with
-         * nothing actually in flight, and the pump has no way out. Surface it on
-         * /disk-log (readable over WiFi while DOS owns CDC) at onset, then
-         * heartbeat so its (non-)recovery is visible too. rdy/cx distinguish an
-         * unplugged host (rdy=0) from a stuck endpoint (rdy=1,cx=0). */
-        if (++s_stuck_run == ECM_STUCK_FRAMES ||
-            (s_stuck_run > ECM_STUCK_FRAMES &&
-             (s_stuck_run - ECM_STUCK_FRAMES) % ECM_STUCK_HEARTBEAT == 0)) {
-            /* Try to unstick: only acts if the IN endpoint is idle (a lost
-             * completion left can_xmit false with nothing in flight). alt=0/ep=00
-             * means the host has the data interface INACTIVE -- not recoverable
-             * here, the frames are correctly dropped. busy=1 means a transfer is
-             * genuinely outstanding (host not draining) -- normal backpressure. */
-            bool rec = tud_network_xmit_recover();
-            disk_logf("[ecm] TX STALL run=%u rdy=%d cx=%d alt=%d ep=%02x busy=%d "
-                      "rec=%d tx=%u drop=%u qd=%u heap=%u",
-                      (unsigned)s_stuck_run, (int)tud_ready(),
-                      (int)tud_network_can_xmit(64), (int)tud_network_data_alt(),
-                      tud_network_ep_in(), (int)tud_network_ep_in_busy(),
-                      (int)rec, (unsigned)s_tx_frames, (unsigned)s_tx_drops,
-                      (unsigned)uxQueueMessagesWaiting(s_txq),
-                      (unsigned)esp_get_free_heap_size());
-            if (rec) s_stuck_run = 0;       /* recovered: re-arm the detector */
-        }
-    }
+    ecm_submit_next();
+}
+
+/** @brief TX watchdog (called from the 1 Hz heartbeat): the completion chain
+ *  sustains itself in normal streaming, so this only fires on the rare lost IN
+ *  completion (the old permanent-wedge bug) or a missed prime -- unstick an idle
+ *  endpoint and re-prime. */
+static void ecm_tx_watchdog(void) {
+    if (uxQueueMessagesWaiting(s_txq) == 0 && !s_inflight) return;  /* nothing pending */
+    bool rec = tud_network_xmit_recover();      /* idle-but-stuck -> can_xmit=true */
+    if (tud_ready() && tud_network_can_xmit(1))
+        usbd_defer_func(ecm_prime_in_usbtask, NULL, false);
+    if (rec)
+        disk_logf("[ecm] TX recover: lost completion unstuck (qd=%u ep=%02x)",
+                  (unsigned)uxQueueMessagesWaiting(s_txq), tud_network_ep_in());
 }
 
 /** @brief 1 Hz bridge heartbeat -> /disk-log. The pump's TX-STALL line only
@@ -276,6 +243,7 @@ static void ecm_tx_task(void *arg) {
  *  24-line ring isn't flooded at idle. */
 static void ecm_hb_cb(void *arg) {
     (void)arg;
+    ecm_tx_watchdog();             /* re-prime / recover a stalled TX chain */
     static uint32_t l_rx = 0, l_tx = 0, l_ev = 0, l_nm = 0, l_dr = 0;
     static bool was_active = false;
     uint32_t rx = s_rx_frames, tx = s_tx_frames;
@@ -325,12 +293,17 @@ static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
     if (xQueueSend(s_txq, &p, 0) != pdTRUE) {
         pbuf_free(p);                  /* queue full: genuine overload */
         s_tx_drops++;
-        s_tx_drops_q++;                /* burst outran the 8-deep queue */
-        if (++s_drop_run > s_drop_run_max) s_drop_run_max = s_drop_run; /* size the ring from this */
+        s_tx_drops_q++;                /* burst outran the queue */
+        if (++s_drop_run > s_drop_run_max) s_drop_run_max = s_drop_run;
     } else {
-        s_drop_run = 0;                /* a frame got in -> the burst eased */
+        s_drop_run = 0;
         UBaseType_t d = uxQueueMessagesWaiting(s_txq);
         if (d > s_q_hwm) s_q_hwm = d;
+        /* Prime the chain if the endpoint is idle (the submit itself MUST run in
+         * the USB task). When a frame is already in flight, can_xmit is false and
+         * its completion will pick this one up -- no prime, no gap. */
+        if (tud_network_can_xmit(1))
+            usbd_defer_func(ecm_prime_in_usbtask, NULL, false);
     }
     return ERR_OK;
 }
@@ -437,16 +410,11 @@ static dhcp_config_t s_dhcp_config = {
 esp_err_t ecm_start(void) {
     if (s_started) return ESP_ERR_INVALID_STATE;
 
-    /* TX pump before the netif goes up. */
+    /* TX backlog queue before the netif goes up. No pump task: frames are
+     * submitted from the IN-completion hook (zero-gap) and primed by linkoutput
+     * when idle -- see the submit-from-completion engine above. */
     s_txq = xQueueCreate(ECM_TXQ_DEPTH, sizeof(struct pbuf *));
     if (!s_txq) return ESP_ERR_NO_MEM;
-    s_tx_done = xSemaphoreCreateBinary();
-    if (!s_tx_done) { vQueueDelete(s_txq); s_txq = NULL; return ESP_ERR_NO_MEM; }
-    if (xTaskCreatePinnedToCore(ecm_tx_task, "ecm_tx", 2560, NULL, 17,
-                                NULL, 1) != pdPASS) {
-        vQueueDelete(s_txq); s_txq = NULL;
-        return ESP_ERR_NO_MEM;
-    }
 
     ip4_addr_t ip, nm, gw;
     IP4_ADDR(&ip, ECM_IP_A, ECM_IP_B, ECM_IP_C, 1);
