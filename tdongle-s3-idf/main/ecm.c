@@ -65,10 +65,15 @@
  * TCP into RTO crawl, and the stalled tcpip thread backed WiFi RX up until
  * min_free grazed 3.6 K). Instead linkoutput enqueues a pbuf reference and
  * returns immediately; a small dedicated task absorbs the USB drain latency.
- * Queue depth bounds pinned pbufs (WiFi RX pbufs are ~1.6 K each, and the
- * dynamic pool is capped at 12, so 8 here can never pin more than the pool
- * allows); overflow drops at the queue -- cheap, and TCP paces to the link. */
-#define ECM_TXQ_DEPTH        8
+ * Queue depth bounds pinned pbufs (WiFi RX pbufs are ~1.6 K each, dynamic pool
+ * capped at 12). 8->11: a DOS app blocked writing to disk stops draining, so a
+ * whole TCP window-burst lands on this queue at once; 8 overran every burst,
+ * dropping full-size frames (-> macOS black-hole-collapses MSS to 512). 11
+ * leaves one RX buffer free while holding ~40 % more of the burst; the pinning
+ * is transient (the pump empties it in ms). Overflow still drops at the queue --
+ * cheap, and TCP paces. Watch min_free: if the deeper pin starves WiFi RX,
+ * drop back. */
+#define ECM_TXQ_DEPTH        11
 /* Per-frame drain bound inside the pump: a dead/unplugged host must not
  * wedge the pump holding a pbuf forever. */
 #define ECM_TX_DRAIN_MS      200
