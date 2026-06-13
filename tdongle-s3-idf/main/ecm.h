@@ -47,6 +47,10 @@ uint32_t ecm_stat_tx_drops(void);
 uint32_t ecm_stat_rx_pbuf_fails(void);
 /** @brief RX frames dropped because the tcpip mailbox was full (uplink/ACK loss). */
 uint32_t ecm_stat_rx_mbox_drops(void);
+/** @brief TX drops at linkoutput: queue full / secure-session cap (burst overrun). */
+uint32_t ecm_stat_tx_drops_q(void);
+/** @brief TX drops in the pump: host didn't drain within ECM_TX_DRAIN_MS (poll-gap). */
+uint32_t ecm_stat_tx_drops_pump(void);
 /** @brief Frames received from the host (delivered into lwIP). */
 uint32_t ecm_stat_rx_frames(void);
 /** @brief Frames transmitted to the host. */

@@ -97,6 +97,8 @@ static volatile bool     s_flood_active  = false;
 static volatile uint32_t s_tx_drops      = 0;
 static volatile uint32_t s_rx_pbuf_fails = 0;
 static volatile uint32_t s_rx_mbox_drops = 0;   /* host->stack drops: tcpip mbox full */
+static volatile uint32_t s_tx_drops_q    = 0;   /* TX dropped at linkoutput: queue full / session cap */
+static volatile uint32_t s_tx_drops_pump = 0;   /* TX dropped in pump: host didn't drain in ECM_TX_DRAIN_MS */
 static volatile uint32_t s_rx_frames     = 0;
 static volatile uint32_t s_tx_frames     = 0;
 static volatile uint32_t s_rx_bytes      = 0;
@@ -105,6 +107,8 @@ static volatile uint32_t s_tx_bytes      = 0;
 uint32_t ecm_stat_tx_drops(void)      { return s_tx_drops; }
 uint32_t ecm_stat_rx_pbuf_fails(void) { return s_rx_pbuf_fails; }
 uint32_t ecm_stat_rx_mbox_drops(void) { return s_rx_mbox_drops; }
+uint32_t ecm_stat_tx_drops_q(void)    { return s_tx_drops_q; }
+uint32_t ecm_stat_tx_drops_pump(void) { return s_tx_drops_pump; }
 uint32_t ecm_stat_rx_frames(void)     { return s_rx_frames; }
 uint32_t ecm_stat_tx_frames(void)     { return s_tx_frames; }
 uint32_t ecm_stat_rx_bytes(void)      { return s_rx_bytes; }
@@ -220,6 +224,7 @@ static void ecm_tx_task(void *arg) {
         }
         /* Full ECM_TX_DRAIN_MS timeout: the host drained NO frame in that long. */
         s_tx_drops++;
+        s_tx_drops_pump++;             /* host poll-gap exceeded the drain bound */
         pbuf_free(p);                  /* never deferred -- pump still owns it */
         /* A long unbroken run of these is the can_xmit-stuck wedge: a lost IN
          * completion or a failed usbd_edpt_xfer leaves can_xmit false with
@@ -274,11 +279,12 @@ static void ecm_hb_cb(void *arg) {
      *   B (uplink):    IDLE with qd=0 cx=1 and BOTH rx+tx flat, rxdr climbing. */
     bool active = rxd || txd;
     if (active || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=%u rxdr=%u heap=%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=q%u/p%u rxdr=%u heap=%u",
                   active ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
-                  (int)tud_network_can_xmit(64), (unsigned)s_tx_drops,
+                  (int)tud_network_can_xmit(64),
+                  (unsigned)s_tx_drops_q, (unsigned)s_tx_drops_pump,
                   (unsigned)(s_rx_pbuf_fails + s_rx_mbox_drops),
                   (unsigned)esp_get_free_heap_size());
     }
@@ -296,12 +302,14 @@ static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
      * (pacing alone: min_free 4.4 K; still under the 5 K guard). */
     if (modem_session_busy() && uxQueueMessagesWaiting(s_txq) >= 2) {
         s_tx_drops++;
+        s_tx_drops_q++;
         return ERR_OK;                 /* drop early; TCP paces */
     }
     pbuf_ref(p);
     if (xQueueSend(s_txq, &p, 0) != pdTRUE) {
         pbuf_free(p);                  /* queue full: genuine overload */
         s_tx_drops++;
+        s_tx_drops_q++;                /* burst outran the 8-deep queue */
     }
     return ERR_OK;
 }
