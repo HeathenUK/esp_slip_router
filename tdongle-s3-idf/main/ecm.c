@@ -91,6 +91,13 @@ static bool         s_started = false;
 static QueueHandle_t s_txq    = NULL;
 static esp_timer_handle_t s_hb_timer = NULL;   /* 1 Hz bridge heartbeat */
 
+/* NAPT-layer diagnostics (patched into IDF lwip ip4_napt.c): TCP mappings
+ * garbage-collected, and inbound TCP packets dropped for want of a mapping
+ * (black-holed server replies after an eviction). These sit UPSTREAM of every
+ * ecm.c counter -- the missing-link for the "both directions flat" freeze. */
+extern volatile uint32_t g_napt_tcp_evict;
+extern volatile uint32_t g_napt_recv_nomatch;
+
 static volatile uint32_t s_dbg_drain_ms  = 0;   /* debug: simulate a slow host */
 static volatile bool     s_flood_active  = false;
 
@@ -279,14 +286,14 @@ static void ecm_hb_cb(void *arg) {
      *   B (uplink):    IDLE with qd=0 cx=1 and BOTH rx+tx flat, rxdr climbing. */
     bool active = rxd || txd;
     if (active || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=q%u/p%u rxdr=%u heap=%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=q%u/p%u rxdr=%u napt=e%u/nm%u",
                   active ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
                   (int)tud_network_can_xmit(64),
                   (unsigned)s_tx_drops_q, (unsigned)s_tx_drops_pump,
                   (unsigned)(s_rx_pbuf_fails + s_rx_mbox_drops),
-                  (unsigned)esp_get_free_heap_size());
+                  (unsigned)g_napt_tcp_evict, (unsigned)g_napt_recv_nomatch);
     }
     l_rx = rx; l_tx = tx; was_active = active;
 }
