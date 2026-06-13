@@ -31,6 +31,8 @@
 
 #include "esp_err.h"
 #include "esp_mac.h"
+#include "esp_system.h"   /* esp_get_free_heap_size / minimum -- stall logging */
+#include "esp_timer.h"    /* 1 Hz bridge heartbeat -> /disk-log */
 
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
@@ -70,6 +72,15 @@
 /* Per-frame drain bound inside the pump: a dead/unplugged host must not
  * wedge the pump holding a pbuf forever. */
 #define ECM_TX_DRAIN_MS      200
+/* Consecutive FULL drain timeouts (the host drained ZERO frames for that long)
+ * we treat as a stuck IN endpoint rather than slow-host backpressure. An alive
+ * CH375 host drains a 1500 B frame in ~15 ms even when TCP-window-limited, so
+ * ECM_STUCK_FRAMES * ECM_TX_DRAIN_MS = ~1 s of NOTHING draining is the
+ * can_xmit-stuck wedge (lost IN completion / failed submit), not pacing. We
+ * can't read AT$STATS while the DOS host owns the CDC port, so log it to the
+ * RAM ring (GET /disk-log over WiFi) at onset and heartbeat while it persists. */
+#define ECM_STUCK_FRAMES     5
+#define ECM_STUCK_HEARTBEAT  50    /* re-log every N further drains (~10 s) */
 
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
@@ -78,6 +89,7 @@ uint8_t tud_network_mac_address[6];
 static struct netif s_ecm_nif;
 static bool         s_started = false;
 static QueueHandle_t s_txq    = NULL;
+static esp_timer_handle_t s_hb_timer = NULL;   /* 1 Hz bridge heartbeat */
 
 static volatile uint32_t s_tx_drops      = 0;
 static volatile uint32_t s_rx_pbuf_fails = 0;
@@ -152,7 +164,13 @@ void tud_network_init_cb(void) {
 static SemaphoreHandle_t s_tx_done = NULL;
 
 static void ecm_xmit_in_usbtask(void *param) {
-    tud_network_xmit((struct pbuf *)param, 0);  /* serializes via xmit_cb NOW */
+    struct pbuf *p = (struct pbuf *)param;
+    tud_network_xmit(p, 0);  /* serializes via xmit_cb NOW */
+    pbuf_free(p);            /* the deferred call OWNS this reference and frees
+                              * it -- never the pump. This is what makes a stale
+                              * give (from a previously timed-out submission)
+                              * harmless: the pump can wake early but it never
+                              * frees a pbuf the USB task still holds. */
     xSemaphoreGive(s_tx_done);
 }
 
@@ -161,6 +179,7 @@ static void ecm_xmit_in_usbtask(void *param) {
 static void ecm_tx_task(void *arg) {
     (void)arg;
     struct pbuf *p;
+    uint32_t s_stuck_run = 0;          /* consecutive full-drain timeouts */
     for (;;) {
         if (xQueueReceive(s_txq, &p, portMAX_DELAY) != pdTRUE) continue;
         /* Heap truce with the modem's secure sessions: a libssh2/TLS session
@@ -176,21 +195,69 @@ static void ecm_tx_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(1));
         }
         if (waited <= ECM_TX_DRAIN_MS) {
-            usbd_defer_func(ecm_xmit_in_usbtask, p, false);
-            if (xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
-                /* Deferred call hasn't run (USB task starved/dying): do NOT
-                 * free the pbuf it still references -- deliberate counted
-                 * leak in preference to a use-after-free. */
-                s_tx_drops++;
-                continue;
-            }
+            s_stuck_run = 0;               /* the endpoint drained: not wedged */
             s_tx_frames++;
             s_tx_bytes += p->tot_len;
-        } else {
-            s_tx_drops++;
+            /* Hand the pbuf to the USB task, which owns and frees it. The pump
+             * must NOT free it (use-after-free), nor treat the semaphore as
+             * tracking THIS frame -- a give left from a prior timed-out submit
+             * can wake us early, but since the deferred call owns every pbuf an
+             * early wake only loosens serialization (the can_xmit gate above
+             * re-tightens it next iteration), it never corrupts memory. */
+            usbd_defer_func(ecm_xmit_in_usbtask, p, false);
+            xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(1000));
+            continue;                      /* p is owned by the deferred call */
         }
-        pbuf_free(p);                  /* drop the reference linkoutput took */
+        /* Full ECM_TX_DRAIN_MS timeout: the host drained NO frame in that long. */
+        s_tx_drops++;
+        pbuf_free(p);                  /* never deferred -- pump still owns it */
+        /* A long unbroken run of these is the can_xmit-stuck wedge: a lost IN
+         * completion or a failed usbd_edpt_xfer leaves can_xmit false with
+         * nothing actually in flight, and the pump has no way out. Surface it on
+         * /disk-log (readable over WiFi while DOS owns CDC) at onset, then
+         * heartbeat so its (non-)recovery is visible too. rdy/cx distinguish an
+         * unplugged host (rdy=0) from a stuck endpoint (rdy=1,cx=0). */
+        if (++s_stuck_run == ECM_STUCK_FRAMES ||
+            (s_stuck_run > ECM_STUCK_FRAMES &&
+             (s_stuck_run - ECM_STUCK_FRAMES) % ECM_STUCK_HEARTBEAT == 0)) {
+            disk_logf("[ecm] TX STALL run=%u rdy=%d cx=%d tx=%u drop=%u qd=%u "
+                      "heap=%u min=%u",
+                      (unsigned)s_stuck_run, (int)tud_ready(),
+                      (int)tud_network_can_xmit(64),
+                      (unsigned)s_tx_frames, (unsigned)s_tx_drops,
+                      (unsigned)uxQueueMessagesWaiting(s_txq),
+                      (unsigned)esp_get_free_heap_size(),
+                      (unsigned)esp_get_minimum_free_heap_size());
+        }
     }
+}
+
+/** @brief 1 Hz bridge heartbeat -> /disk-log. The pump's TX-STALL line only
+ *  fires when the device HAS frames it cannot send (topology A: the ECM-TX
+ *  can_xmit-stuck wedge). The other freeze topology -- the host->server uplink
+ *  (TCP ACKs) failing so the server stops sending -- leaves the pump idle on an
+ *  empty queue and is invisible to it. This samples BOTH directions so a stall
+ *  shows WHICH leg stopped: at the freeze the last line reads either
+ *  qd=8,cx=0 (A: device wedged with frames waiting) or qd=0,cx=1 with tx AND rx
+ *  flat (B: device fed everything, nothing more arrived to forward). Logs only
+ *  while traffic moves, plus one trailing snapshot when it stops, so the
+ *  24-line ring isn't flooded at idle. */
+static void ecm_hb_cb(void *arg) {
+    (void)arg;
+    static uint32_t l_rx = 0, l_tx = 0;
+    static bool was_active = false;
+    uint32_t rx = s_rx_frames, tx = s_tx_frames;
+    uint32_t rxd = rx - l_rx, txd = tx - l_tx;
+    UBaseType_t qd = s_txq ? uxQueueMessagesWaiting(s_txq) : 0;
+    bool active = rxd || txd || qd;
+    if (active || was_active) {
+        disk_logf("[ecm] hb rx=%u+%u tx=%u+%u qd=%u cx=%d drop=%u heap=%u min=%u",
+                  (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
+                  (unsigned)qd, (int)tud_network_can_xmit(64),
+                  (unsigned)s_tx_drops, (unsigned)esp_get_free_heap_size(),
+                  (unsigned)esp_get_minimum_free_heap_size());
+    }
+    l_rx = rx; l_tx = tx; was_active = active;
 }
 
 /** @brief linkoutput (tcpip thread): enqueue a reference and return -- the
@@ -307,6 +374,16 @@ esp_err_t ecm_start(void) {
     /* DNS forwarder on the ECM netif IP (same engine the SLIP path uses;
      * DHCP hands 192.168.241.1 to the client as its nameserver). */
     dns_forwarder_init_ip((ECM_IP_A << 24) | (ECM_IP_B << 16) | (ECM_IP_C << 8) | 1U);
+
+    /* Bridge heartbeat: samples both directions to /disk-log (non-fatal if it
+     * can't start -- pure diagnostics, no effect on the data path). */
+    const esp_timer_create_args_t hb_args = {
+        .callback        = ecm_hb_cb,
+        .name            = "ecm_hb",
+        .dispatch_method = ESP_TIMER_TASK,
+    };
+    if (esp_timer_create(&hb_args, &s_hb_timer) == ESP_OK)
+        esp_timer_start_periodic(s_hb_timer, 1000000);   /* 1 s */
 
     s_started = true;
     return ESP_OK;
