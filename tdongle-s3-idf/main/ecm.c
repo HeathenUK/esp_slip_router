@@ -106,6 +106,9 @@ static volatile uint32_t s_rx_pbuf_fails = 0;
 static volatile uint32_t s_rx_mbox_drops = 0;   /* host->stack drops: tcpip mbox full */
 static volatile uint32_t s_tx_drops_q    = 0;   /* TX dropped at linkoutput: queue full / session cap */
 static volatile uint32_t s_tx_drops_pump = 0;   /* TX dropped in pump: host didn't drain in ECM_TX_DRAIN_MS */
+static volatile UBaseType_t s_q_hwm      = 0;   /* TX queue high-water occupancy (will peg at depth) */
+static volatile uint32_t s_drop_run      = 0;   /* current run of consecutive overflow drops */
+static volatile uint32_t s_drop_run_max  = 0;   /* worst burst overrun: slots needed BEYOND the queue */
 static volatile uint32_t s_rx_frames     = 0;
 static volatile uint32_t s_tx_frames     = 0;
 static volatile uint32_t s_rx_bytes      = 0;
@@ -290,14 +293,14 @@ static void ecm_hb_cb(void *arg) {
     bool moved = data || (ev != l_ev) || (nm != l_nm) || (dr != l_dr);
     bool active = data;            /* the IDLE tag tracks DATA, not counters */
     if (moved || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=q%u/p%u rxdr=%u napt=e%u/nm%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=q%u/p%u rxdr=%u burst=hwm%u/run%u",
                   active ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
                   (int)tud_network_can_xmit(64),
                   (unsigned)s_tx_drops_q, (unsigned)s_tx_drops_pump,
                   (unsigned)(s_rx_pbuf_fails + s_rx_mbox_drops),
-                  (unsigned)g_napt_tcp_evict, (unsigned)g_napt_recv_nomatch);
+                  (unsigned)s_q_hwm, (unsigned)s_drop_run_max);
     }
     l_rx = rx; l_tx = tx; l_ev = ev; l_nm = nm; l_dr = dr;
     was_active = moved;
@@ -322,6 +325,11 @@ static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
         pbuf_free(p);                  /* queue full: genuine overload */
         s_tx_drops++;
         s_tx_drops_q++;                /* burst outran the 8-deep queue */
+        if (++s_drop_run > s_drop_run_max) s_drop_run_max = s_drop_run; /* size the ring from this */
+    } else {
+        s_drop_run = 0;                /* a frame got in -> the burst eased */
+        UBaseType_t d = uxQueueMessagesWaiting(s_txq);
+        if (d > s_q_hwm) s_q_hwm = d;
     }
     return ERR_OK;
 }
