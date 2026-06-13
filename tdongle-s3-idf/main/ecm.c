@@ -273,19 +273,23 @@ static void ecm_tx_task(void *arg) {
  *  24-line ring isn't flooded at idle. */
 static void ecm_hb_cb(void *arg) {
     (void)arg;
-    static uint32_t l_rx = 0, l_tx = 0;
+    static uint32_t l_rx = 0, l_tx = 0, l_ev = 0, l_nm = 0, l_dr = 0;
     static bool was_active = false;
     uint32_t rx = s_rx_frames, tx = s_tx_frames;
     uint32_t rxd = rx - l_rx, txd = tx - l_tx;
-    /* "Active" = real PROGRESS in either direction, NOT mere queue occupancy --
-     * otherwise a TX wedge (qd pinned full) would log every second forever and
-     * scroll the pre-freeze trend out of the 24-line ring. While wedged the
-     * dedicated TX STALL line carries the detail; the heartbeat goes quiet
-     * after one trailing "IDLE" snapshot that captures the freeze edge:
-     *   A (TX wedge):  IDLE with qd=8 cx=0, then TX STALL busy=.. follows.
-     *   B (uplink):    IDLE with qd=0 cx=1 and BOTH rx+tx flat, rxdr climbing. */
-    bool active = rxd || txd;
-    if (active || was_active) {
+    uint32_t ev = g_napt_tcp_evict, nm = g_napt_recv_nomatch;
+    uint32_t dr = s_tx_drops_q + s_tx_drops_pump;
+    /* Fire on DATA progress OR on a NAPT/drop counter moving. Progress alone
+     * would silence the heartbeat exactly during a freeze -- but a NAPT
+     * eviction (ev++) and the black-holed server retransmits that follow (nm++)
+     * happen DURING that silence, and they are the whole point. So a freeze
+     * that NAPT is killing logs "IDLE ... napt=e1/nm<climbing>" every second
+     * (cumulative, so e1 shows in every retained line); a TRUE upstream
+     * silence (nothing arriving) logs one IDLE snapshot then goes quiet. */
+    bool data = rxd || txd;
+    bool moved = data || (ev != l_ev) || (nm != l_nm) || (dr != l_dr);
+    bool active = data;            /* the IDLE tag tracks DATA, not counters */
+    if (moved || was_active) {
         disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=q%u/p%u rxdr=%u napt=e%u/nm%u",
                   active ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
@@ -295,7 +299,8 @@ static void ecm_hb_cb(void *arg) {
                   (unsigned)(s_rx_pbuf_fails + s_rx_mbox_drops),
                   (unsigned)g_napt_tcp_evict, (unsigned)g_napt_recv_nomatch);
     }
-    l_rx = rx; l_tx = tx; was_active = active;
+    l_rx = rx; l_tx = tx; l_ev = ev; l_nm = nm; l_dr = dr;
+    was_active = moved;
 }
 
 /** @brief linkoutput (tcpip thread): enqueue a reference and return -- the

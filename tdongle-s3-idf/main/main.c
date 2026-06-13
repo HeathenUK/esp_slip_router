@@ -108,7 +108,7 @@ static const char *reset_reason_name(esp_reset_reason_t rr) {
  * before the new init line. Magic+seq are then cleared so a clean
  * subsequent reboot doesn't double-print. */
 
-#define DISK_LOG_LINES        24       /* 64 -> 48 -> 32 -> 24 (SRAM trim 2026-06-02) */
+#define DISK_LOG_LINES        40       /* 64->48->32->24 (SRAM trim 2026-06-02); 24->40 for ECM freeze capture (+2KB) */
 #define DISK_LOG_LINE_LEN     128      /* prefix + 96-byte msg (kept 128: 96 trips format-truncation) */
 #define DISK_LOG_MSG_LEN      96
 #define RTC_LOG_LINES         32       /* smaller -- RTC SLOW is precious */
