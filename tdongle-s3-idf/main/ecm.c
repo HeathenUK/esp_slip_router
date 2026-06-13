@@ -87,6 +87,16 @@
 #define ECM_STUCK_FRAMES     5
 #define ECM_STUCK_HEARTBEAT  50    /* re-log every N further drains (~10 s) */
 
+/* NAPT freeze instrumentation (defined in the IDF lwIP tree's ip4_napt.c).
+ * g_napt_recv_nomatch: a reverse (world->host) packet whose 5-tuple has NO
+ * NAPT entry -- it gets dropped silently. If a download hard-freezes with the
+ * Mac's send queue stuck and these climb, the server's retransmits are dying
+ * on a broken/evicted mapping. g_napt_tcp_evict: TCP entries reclaimed by GC
+ * timeout or table-full force-eviction (the suspected cause of a mid-stream
+ * mapping loss). */
+extern volatile uint32_t g_napt_recv_nomatch;
+extern volatile uint32_t g_napt_tcp_evict;
+
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
 uint8_t tud_network_mac_address[6];
@@ -263,23 +273,27 @@ static void ecm_tx_task(void *arg) {
  *  IDLE snapshot, so the 24-line ring isn't flooded at idle. */
 static void ecm_hb_cb(void *arg) {
     (void)arg;
-    static uint32_t l_rx = 0, l_tx = 0, l_dr = 0;
+    static uint32_t l_rx = 0, l_tx = 0, l_dr = 0, l_ev = 0, l_nm = 0;
     static bool was_active = false;
     uint32_t rx = s_rx_frames, tx = s_tx_frames;
     uint32_t rxd = rx - l_rx, txd = tx - l_tx;
     uint32_t dr = s_tx_drops;
+    uint32_t ev = g_napt_tcp_evict, nm = g_napt_recv_nomatch;
     bool data = rxd || txd;
-    bool moved = data || (dr != l_dr);
+    /* Fire the line on ANY movement -- including a NAPT eviction or a reverse
+     * no-match -- so a hard-freeze (tx flat, but the server's retransmits
+     * landing with no mapping) still produces a heartbeat showing nm climbing. */
+    bool moved = data || (dr != l_dr) || (ev != l_ev) || (nm != l_nm);
     if (moved || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=%u heap=%u/%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d dr=%u nap=e%u/n%u h=%u",
                   data ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
-                  (int)tud_network_can_xmit(64), (unsigned)s_tx_drops,
-                  (unsigned)esp_get_free_heap_size(),
-                  (unsigned)esp_get_minimum_free_heap_size());
+                  (int)tud_network_can_xmit(64), (unsigned)dr,
+                  (unsigned)ev, (unsigned)nm,
+                  (unsigned)esp_get_free_heap_size());
     }
-    l_rx = rx; l_tx = tx; l_dr = dr;
+    l_rx = rx; l_tx = tx; l_dr = dr; l_ev = ev; l_nm = nm;
     was_active = moved;
 }
 
