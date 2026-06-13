@@ -2530,6 +2530,26 @@ static void handle_dollar(char *s) {
                  cnt, sz, (sz % 64 == 0) ? "yes" : "no", (unsigned)drops);
         cdc_print(o);
         r_ok();
+    } else if (!strcmp(key, "NETFLOOD") && val && eq) {
+        /* AT$NETFLOOD=<ms> -- device-side TX wedge repro: flood the ECM TX path
+         * at full rate for <ms> (no host client / no route change). Runs in a
+         * task; read AT$STATS or GET /disk-log during and after to see whether
+         * tx_frames freezes with cx=0 (the can_xmit-stuck wedge). */
+        long ms = atol(val);
+        if (!usb_net_enabled() || ecm_test_flood((uint32_t)ms) != 0) {
+            r_error(); return;
+        }
+        char o[72];
+        snprintf(o, sizeof o,
+                 "\r\nflooding %ld ms (watch AT$STATS / /disk-log)\r\n", ms);
+        cdc_print(o);
+        r_ok();
+    } else if (!strcmp(key, "NETSLOW") && val && eq) {
+        /* AT$NETSLOW=<ms> -- debug: delay the TX pump per frame to mimic a slow
+         * (~100 KB/s CH375) host drain; 0 = off. Pair with AT$NETFLOOD to
+         * recreate the DOS-host backpressure condition on the fast Mac host. */
+        ecm_dbg_set_drain_ms((uint32_t)atol(val));
+        r_ok();
     } else if (!strcmp(key, "DNS") && val && eq) {
         cmd_dns(val);
     } else if (!strcmp(key, "PING") && val && eq) {

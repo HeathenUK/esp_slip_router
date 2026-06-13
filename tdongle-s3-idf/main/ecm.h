@@ -69,6 +69,22 @@ uint32_t ecm_stat_tx_bytes(void);
  */
 int ecm_test_emit(uint16_t size, uint16_t count, uint32_t *drops_out);
 
+/**
+ * @brief Flood the ECM TX path at full rate for @p ms (1..30000), device-side
+ *  (AT$NETFLOOD). No host client or route change needed -- injects max-size
+ *  frames straight into the bridge's TX pump, the exact path a download takes,
+ *  to reproduce the freeze. Runs in a task; watch AT$STATS / GET /disk-log.
+ * @return 0 started, -1 on bad args / not in NET mode / a flood already running.
+ */
+int ecm_test_flood(uint32_t ms);
+
+/**
+ * @brief Debug: delay the TX pump @p ms per frame to mimic a slow-draining host
+ *  (AT$NETSLOW; 0 = off). Pair with ecm_test_flood to recreate the ~100 KB/s
+ *  CH375 drain condition on a fast host.
+ */
+void ecm_dbg_set_drain_ms(uint32_t ms);
+
 #ifdef __cplusplus
 }
 #endif

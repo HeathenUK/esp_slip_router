@@ -91,6 +91,9 @@ static bool         s_started = false;
 static QueueHandle_t s_txq    = NULL;
 static esp_timer_handle_t s_hb_timer = NULL;   /* 1 Hz bridge heartbeat */
 
+static volatile uint32_t s_dbg_drain_ms  = 0;   /* debug: simulate a slow host */
+static volatile bool     s_flood_active  = false;
+
 static volatile uint32_t s_tx_drops      = 0;
 static volatile uint32_t s_rx_pbuf_fails = 0;
 static volatile uint32_t s_rx_frames     = 0;
@@ -189,6 +192,10 @@ static void ecm_tx_task(void *arg) {
          * TCP self-paces to the slower link and in-flight pbufs shrink. The
          * real DOS host never exceeds this during a session anyway. */
         if (modem_session_busy()) vTaskDelay(pdMS_TO_TICKS(25));
+        /* Debug knob (AT$NETSLOW): delay each frame to mimic a slow-draining
+         * host (the CH375's ~100 KB/s poll) so the DOS wedge can be recreated
+         * on a fast host. 0 = off (the normal path). */
+        if (s_dbg_drain_ms) vTaskDelay(pdMS_TO_TICKS(s_dbg_drain_ms));
         int waited = 0;
         while (!(tud_ready() && tud_network_can_xmit(p->tot_len))) {
             if (++waited > ECM_TX_DRAIN_MS) break;    /* host gone/stalled */
@@ -313,6 +320,53 @@ int ecm_test_emit(uint16_t size, uint16_t count, uint32_t *drops_out) {
         vTaskDelay(pdMS_TO_TICKS(5));                /* paced: a chip test, not a flood */
     }
     if (drops_out) *drops_out = s_tx_drops - drops0;
+    return 0;
+}
+
+void ecm_dbg_set_drain_ms(uint32_t ms) { s_dbg_drain_ms = ms; }
+
+/** @brief Flood the ECM TX path at full rate for a bounded time -- a device-side
+ *  repro of the download wedge with NO host client and NO route changes. Injects
+ *  max-size unicast frames (to the host NIC, ethertype 0x88B5 -- the host drops
+ *  them, never routes them) straight into ecm_linkoutput, exactly the path real
+ *  download traffic takes from NAPT. Self-paces to the pump's drain rate via the
+ *  queue-full check, so it never busy-spins or starves the pump/USB tasks.
+ *  Runs in its own task so the AT/CDC console stays responsive (read AT$STATS /
+ *  GET /disk-log live during the flood). */
+static void ecm_flood_task(void *arg) {
+    uint32_t ms = (uint32_t)(uintptr_t)arg;
+    uint32_t f0 = s_tx_frames, d0 = s_tx_drops, injected = 0;
+    int64_t end = esp_timer_get_time() + (int64_t)ms * 1000;
+    disk_logf("[ecm] FLOOD start %ums slow=%ums", (unsigned)ms,
+              (unsigned)s_dbg_drain_ms);
+    while (esp_timer_get_time() < end) {
+        struct pbuf *p = pbuf_alloc(PBUF_RAW, 1514, PBUF_RAM);
+        if (!p) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+        uint8_t *d = (uint8_t *)p->payload;
+        memcpy(d, tud_network_mac_address, 6);       /* dst: the host NIC */
+        memcpy(d + 6, s_ecm_nif.hwaddr, 6);          /* src: bridge MAC */
+        d[12] = 0x88; d[13] = 0xB5;                  /* ethertype: local-experimental */
+        ecm_linkoutput(&s_ecm_nif, p);               /* refs + queues like real TX */
+        pbuf_free(p);                                /* drop our own reference */
+        injected++;
+        if (uxQueueMessagesWaiting(s_txq) >= ECM_TXQ_DEPTH)
+            vTaskDelay(1);                           /* self-pace to the drain rate */
+    }
+    disk_logf("[ecm] FLOOD done inj=%u sent=%u drops=%u cx=%d",
+              (unsigned)injected, (unsigned)(s_tx_frames - f0),
+              (unsigned)(s_tx_drops - d0), (int)tud_network_can_xmit(64));
+    s_flood_active = false;
+    vTaskDelete(NULL);
+}
+
+int ecm_test_flood(uint32_t ms) {
+    if (!s_started || ms == 0 || ms > 30000 || s_flood_active) return -1;
+    s_flood_active = true;
+    if (xTaskCreatePinnedToCore(ecm_flood_task, "ecm_flood", 2560,
+                                (void *)(uintptr_t)ms, 10, NULL, 1) != pdPASS) {
+        s_flood_active = false;
+        return -1;
+    }
     return 0;
 }
 
