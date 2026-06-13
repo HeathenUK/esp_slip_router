@@ -96,6 +96,15 @@
  * mapping loss). */
 extern volatile uint32_t g_napt_recv_nomatch;
 extern volatile uint32_t g_napt_tcp_evict;
+/* Freeze-mechanism proof (see ip4_napt.c): a SYN reused a (src,sport) entry and
+ * repointed it to a NEW dest -- hijacking a live mapping. _hot = the victim was
+ * active <2 s ago (a LIVE connection clobbered). g_napt_used = live entry count
+ * (table pressure). If a download freezes with g_napt_recv_nomatch climbing AND
+ * g_napt_repoint(_hot) ticked at onset, the (src,sport)-only NAPT key is proven
+ * the cause. */
+extern volatile uint32_t g_napt_repoint;
+extern volatile uint32_t g_napt_repoint_hot;
+extern volatile uint32_t g_napt_used;
 
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
@@ -273,27 +282,29 @@ static void ecm_tx_task(void *arg) {
  *  IDLE snapshot, so the 24-line ring isn't flooded at idle. */
 static void ecm_hb_cb(void *arg) {
     (void)arg;
-    static uint32_t l_rx = 0, l_tx = 0, l_dr = 0, l_ev = 0, l_nm = 0;
+    static uint32_t l_rx = 0, l_tx = 0, l_dr = 0, l_ev = 0, l_nm = 0, l_rp = 0;
     static bool was_active = false;
     uint32_t rx = s_rx_frames, tx = s_tx_frames;
     uint32_t rxd = rx - l_rx, txd = tx - l_tx;
     uint32_t dr = s_tx_drops;
     uint32_t ev = g_napt_tcp_evict, nm = g_napt_recv_nomatch;
+    uint32_t rp = g_napt_repoint, rh = g_napt_repoint_hot, used = g_napt_used;
     bool data = rxd || txd;
-    /* Fire the line on ANY movement -- including a NAPT eviction or a reverse
-     * no-match -- so a hard-freeze (tx flat, but the server's retransmits
-     * landing with no mapping) still produces a heartbeat showing nm climbing. */
-    bool moved = data || (dr != l_dr) || (ev != l_ev) || (nm != l_nm);
+    /* Fire the line on ANY movement -- a NAPT eviction, a reverse no-match, or a
+     * repoint (the freeze trigger) -- so a hard-freeze (tx flat) still produces
+     * heartbeats showing n/r climbing and pins the exact tick they started. */
+    bool moved = data || (dr != l_dr) || (ev != l_ev) || (nm != l_nm) ||
+                 (rp != l_rp);
     if (moved || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d dr=%u nap=e%u/n%u h=%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d dr=%u nap=e%u/n%u/r%u/rh%u u%u h=%u",
                   data ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
                   (int)tud_network_can_xmit(64), (unsigned)dr,
-                  (unsigned)ev, (unsigned)nm,
-                  (unsigned)esp_get_free_heap_size());
+                  (unsigned)ev, (unsigned)nm, (unsigned)rp, (unsigned)rh,
+                  (unsigned)used, (unsigned)esp_get_free_heap_size());
     }
-    l_rx = rx; l_tx = tx; l_dr = dr; l_ev = ev; l_nm = nm;
+    l_rx = rx; l_tx = tx; l_dr = dr; l_ev = ev; l_nm = nm; l_rp = rp;
     was_active = moved;
 }
 
