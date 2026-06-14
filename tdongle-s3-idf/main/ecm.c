@@ -230,7 +230,6 @@ void tud_network_init_cb(void) {
  * stays true until the deferred call consumes it. */
 static SemaphoreHandle_t s_tx_done = NULL;
 
-#if !CFG_TUD_NCM
 static void ecm_xmit_in_usbtask(void *param) {
     struct pbuf *p = (struct pbuf *)param;
     tud_network_xmit(p, 0);  /* serializes via xmit_cb NOW */
@@ -241,38 +240,6 @@ static void ecm_xmit_in_usbtask(void *param) {
                               * frees a pbuf the USB task still holds. */
     xSemaphoreGive(s_tx_done);
 }
-#endif /* !CFG_TUD_NCM */
-
-#if CFG_TUD_NCM
-/** @brief NCM batch-drain (USB task, via usbd_defer_func). Sends the primary
- *  frame, then COALESCES as many further queued frames as the NCM driver will
- *  accept into the current NTB(s) before returning. This is what turns NCM's
- *  per-NTB framing from a regression into a win: with >=2 IN NTBs the driver
- *  packs multiple datagrams behind one USB transfer (and double-buffers the
- *  next while one flies) instead of the ECM one-frame-in-flight cadence.
- *
- *  Contract notes:
- *  - The primary frame is already counted by the pump (s_tx_frames/bytes) and
- *    its can_xmit was confirmed there; we only count the EXTRA coalesced ones.
- *  - NEVER drops and NEVER blocks: frames the driver can't yet take are left on
- *    the queue for the next pump pass (a vTaskDelay here would stall all USB).
- *  - The pump is parked on s_tx_done for the whole call, so the shared counters
- *    are touched by only one task at a time despite the two-context split. */
-static void ncm_xmit_drain(void *param) {
-    struct pbuf *p = (struct pbuf *)param;
-    for (;;) {
-        tud_network_xmit(p, 0);
-        pbuf_free(p);
-        struct pbuf *nxt;
-        if (xQueuePeek(s_txq, &nxt, 0) != pdTRUE) break;       /* queue drained */
-        if (!tud_ready() || !tud_network_can_xmit(nxt->tot_len)) break; /* NTBs full -> leave queued */
-        (void)xQueueReceive(s_txq, &p, 0);                     /* commit the peeked frame */
-        s_tx_frames++;
-        s_tx_bytes += p->tot_len;
-    }
-    xSemaphoreGive(s_tx_done);
-}
-#endif
 
 /** @brief TX pump task: drain the queue into the USB driver, absorbing the
  *  one-frame-in-flight USB latency that linkoutput must not block on. */
@@ -308,11 +275,7 @@ static void ecm_tx_task(void *arg) {
              * can wake us early, but since the deferred call owns every pbuf an
              * early wake only loosens serialization (the can_xmit gate above
              * re-tightens it next iteration), it never corrupts memory. */
-#if CFG_TUD_NCM
-            usbd_defer_func(ncm_xmit_drain, p, false);   /* batch-coalesce */
-#else
             usbd_defer_func(ecm_xmit_in_usbtask, p, false);
-#endif
             xSemaphoreTake(s_tx_done, pdMS_TO_TICKS(1000));
             continue;                      /* p is owned by the deferred call */
         }
@@ -334,14 +297,7 @@ static void ecm_tx_task(void *arg) {
              * it ONLY when the endpoint is genuinely idle (never forces a live
              * transfer). rdy=0 = host unplugged; cx=0 with rec=0 = host simply
              * not draining (normal backpressure). */
-            /* tud_network_xmit_recover() is an ECM/RNDIS-driver-only escape
-             * hatch (the NCM driver doesn't expose it). For the NCM test build
-             * there's no equivalent unstick, so the recovery is a no-op. */
-#if CFG_TUD_NCM
-            bool rec = false;
-#else
             bool rec = tud_network_xmit_recover();
-#endif
             disk_logf("[ecm] TX STALL run=%u rdy=%d cx=%d rec=%d drop=%u qd=%u heap=%u",
                       (unsigned)s_stuck_run, (int)tud_ready(),
                       (int)tud_network_can_xmit(64), (int)rec,
@@ -501,19 +457,7 @@ static dhcp_entry_t s_dhcp_entries[] = {
 };
 
 static dhcp_config_t s_dhcp_config = {
-#if CFG_TUD_NCM
-    /* SAFETY (NCM Mac-test build only): advertise NO default gateway. Switching
-     * to NCM makes macOS attach a different driver and bring up a fresh network
-     * interface that defaults to DHCP -- with a gateway offered, that new
-     * service could route the whole Mac through the dongle (offline risk, which
-     * would also sever the OTA operator). dhserver omits the router option when
-     * router.addr==0, so the new interface gets an IP but can install no default
-     * route. `curl --interface` still measures throughput. The shipping ECM
-     * build keeps the gateway (the DOS host needs it). */
-    .router    = { 0 },
-#else
     .router    = { PP_HTONL(LWIP_MAKEU32(ECM_IP_A, ECM_IP_B, ECM_IP_C, 1)) },
-#endif
     .port      = 67,
     .dns       = { PP_HTONL(LWIP_MAKEU32(ECM_IP_A, ECM_IP_B, ECM_IP_C, 1)) },
     .domain    = "dosongle",

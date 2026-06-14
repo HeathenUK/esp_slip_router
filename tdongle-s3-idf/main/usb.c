@@ -199,31 +199,6 @@ enum {
 };
 #define EPNUM_ECM_NOTIF 0x83   /* MSC's IN slot, reused in dev mode */
 
-#if CFG_TUD_NCM
-/* NCM variant of Mode 2 (build-time, CONFIG_TINYUSB_NET_MODE_NCM=y). Same
- * interface/endpoint shape as the ECM dev descriptor -- CDC + a network class
- * with notif EP, no MSC -- so the 5-IN-FIFO budget and the hardened macOS
- * service binding (kept on PID 0x4024) are unchanged; only the network class
- * (and thus the host driver: AppleUSBNCM vs AppleUserECMData) differs. NCM
- * batches multiple datagrams per USB transfer (NTB) -- the throughput
- * experiment against ECM's cadence ceiling. ECM and NCM are mutually exclusive
- * in one TinyUSB build, so this whole config is compiled in only for the NCM
- * image; the ECM build below is the shipping one. */
-#define CFG_TOTAL_LEN_NET_DEV (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_CDC_NCM_DESC_LEN)
-
-static const uint8_t s_cfg_desc_net_dev[] = {
-    TUD_CONFIG_DESCRIPTOR(1, ITF_DEV_TOTAL, 0, CFG_TOTAL_LEN_NET_DEV,
-                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
-
-    TUD_CDC_DESCRIPTOR(ITF_DEV_CDC, 4, EPNUM_CDC_NOTIF, 8,
-                       EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
-
-    TUD_CDC_NCM_DESCRIPTOR(ITF_DEV_ECM, 6, 7 /* iMACAddress string */,
-                           EPNUM_ECM_NOTIF, 64,
-                           EPNUM_ECM_OUT, EPNUM_ECM_IN,
-                           CFG_TUD_NET_ENDPOINT_SIZE, CFG_TUD_NET_MTU),
-};
-#else
 #define CFG_TOTAL_LEN_NET_DEV (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_CDC_ECM_DESC_LEN)
 
 static const uint8_t s_cfg_desc_net_dev[] = {
@@ -238,7 +213,6 @@ static const uint8_t s_cfg_desc_net_dev[] = {
                            EPNUM_ECM_OUT, EPNUM_ECM_IN,
                            CFG_TUD_NET_ENDPOINT_SIZE, CFG_TUD_NET_MTU),
 };
-#endif
 
 /* Boot-time mode (NVS "slip-router"/"usbnet"): 0 = normal (HID),
  * 1 = DOS net (MSC + ECM no-notif), 2 = dev net (ECM + notif, no MSC). */

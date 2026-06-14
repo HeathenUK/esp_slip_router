@@ -177,37 +177,6 @@ bool    tud_network_xmit_recover(void);
   fi
 fi
 
-# --- Patch 6: ncm_device.c -- ACK the CDC class request macOS issues during
-# NCM controller enable. The stock netd_control_xfer_cb answers ONLY
-# NCM_GET_NTB_PARAMETERS and STALLs every other class request. macOS'
-# AppleUSBNCMData sends SET_ETHERNET_PACKET_FILTER while enabling the
-# controller; a stall there leaves it disabled (ioreg: IOControllerEnabled=No,
-# IOLinkStatus=1 i.e. valid-but-not-active) so the en* interface never goes
-# "active" and no frames flow. This request has no data stage (the filter bits
-# ride in wValue) and we keep no HW filter, so a bare status ACK is correct --
-# exactly the same fix the ECM driver already bakes in (Patch 4's sibling).
-NCM_C="${PROJECT_DIR}/managed_components/espressif__tinyusb/src/class/net/ncm_device.c"
-if [[ -f "${NCM_C}" ]]; then
-  if grep -q 'PATCHED: ACK macOS NCM enable request' "${NCM_C}"; then
-    echo "apply_iram_patches: ncm_device.c already patched"
-  else
-    if ! grep -q 'case NCM_GET_NTB_PARAMETERS: {' "${NCM_C}"; then
-      echo "ERROR: ncm_device.c lacks NCM_GET_NTB_PARAMETERS case -- upstream changed."
-      exit 1
-    fi
-    sed -i.bak '/case NCM_GET_NTB_PARAMETERS: {/i\
-        case NCM_SET_ETHERNET_PACKET_FILTER:\
-          /* PATCHED: ACK macOS NCM enable request (no HW filter, no data stage);\
-           * stalling it leaves IOControllerEnabled=No and the link inactive. */\
-          tud_control_status(rhport, request);\
-          break;\
-' "${NCM_C}"
-    rm -f "${NCM_C}.bak"
-    echo "apply_iram_patches: ncm_device.c patched (ACK macOS SET_ETHERNET_PACKET_FILTER)"
-    patched=1
-  fi
-fi
-
 if [[ ${patched} -eq 0 ]]; then
   echo "apply_iram_patches: nothing to do"
 fi
