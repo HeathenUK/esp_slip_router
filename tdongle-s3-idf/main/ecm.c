@@ -178,7 +178,10 @@ bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
     if (esp_get_free_heap_size() < ECM_ADMIT_FLOOR &&
         ecm_frame_is_new_tcp_syn(src, size)) {
         s_admit_drops++;
-        return true;               /* swallow the SYN; TinyUSB re-arms via return */
+        return false;              /* drop the SYN; driver re-arms the OUT EP for
+                                    * us (same contract as the pbuf-fail drop
+                                    * below -- returning TRUE here without
+                                    * tud_network_recv_renew() wedges RX). */
     }
     struct pbuf *p = pbuf_alloc(PBUF_RAW, size, PBUF_POOL);
     if (!p) {
