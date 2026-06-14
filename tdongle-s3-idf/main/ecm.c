@@ -96,6 +96,14 @@
  * shed gracefully with a fat margin (measured min_free was 116 B under a
  * murderous 8-120 conn flood -- this keeps ~12 K in hand instead). */
 #define ECM_ADMIT_FLOOR      12000U
+/* Hard cap on concurrent forwarded TCP connections. The burst case (N SYNs
+ * arriving while heap is still high, then all N downloads exhausting it) can't
+ * be caught by a heap check at SYN time -- by then there are no SYNs left to
+ * refuse. Capping the live connection COUNT bounds the eventual data-phase heap
+ * directly. 8 covers the DOS/Win95 "small handful" with margin; the 9th+ SYN is
+ * refused and retried. Tune against the heap floor the smoke test reports. */
+#define ECM_MAX_CONNS        8U
+extern volatile uint32_t g_napt_tcp_used;  /* live TCP NAPT entries (ip4_napt.c) */
 
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
@@ -161,10 +169,14 @@ static bool ecm_frame_is_new_tcp_syn(const uint8_t *f, uint16_t len) {
  *  OUT endpoint itself (frame dropped). */
 bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
     if (size == 0) return true;
-    /* Admission control: under low heap, refuse NEW connections (drop the SYN)
-     * so existing flows keep their memory and we never approach OOM. The client
-     * retransmits and connects once heap recovers. Existing connections pass. */
-    if (esp_get_free_heap_size() < ECM_ADMIT_FLOOR &&
+    /* Admission control: refuse NEW connections (drop the SYN) when either the
+     * live connection COUNT is at the cap (bounds data-phase heap; catches the
+     * burst case) OR free heap is already low (catches sustained pressure, e.g.
+     * many held connections). Existing connections (non-SYN) always pass, so a
+     * transfer in progress is never harmed; the client retransmits its SYN and
+     * connects once a slot frees / heap recovers. */
+    if ((g_napt_tcp_used >= ECM_MAX_CONNS ||
+         esp_get_free_heap_size() < ECM_ADMIT_FLOOR) &&
         ecm_frame_is_new_tcp_syn(src, size)) {
         s_admit_drops++;
         return true;               /* swallow the SYN; TinyUSB re-arms via return */
