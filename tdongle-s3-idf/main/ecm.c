@@ -103,8 +103,12 @@
  * queueing it. The dropped data is retransmitted by TCP, so concurrent
  * downloads self-throttle to fit the heap. This needs no connection count and
  * no changes outside this file (the count route would mean touching the lwIP
- * NAPT source, which we don't). Sits above the 5 K allocator guard. */
-#define ECM_TX_HEAP_FLOOR     9000U
+ * NAPT source, which we don't). Set well above the 5 K allocator guard: the
+ * drop is reactive so there's ~3-4 K of in-flight overshoot below the floor
+ * under a heavy burst (measured: floor 9 K -> min_free 5.4 K worst case), so
+ * 13 K keeps the worst case ~9 K. Single-stream and a handful never reach it
+ * (heap stays >20 K there), so there's no throughput cost in normal use. */
+#define ECM_TX_HEAP_FLOOR    13000U
 
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
