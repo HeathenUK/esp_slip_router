@@ -297,7 +297,14 @@ static void ecm_tx_task(void *arg) {
              * it ONLY when the endpoint is genuinely idle (never forces a live
              * transfer). rdy=0 = host unplugged; cx=0 with rec=0 = host simply
              * not draining (normal backpressure). */
+            /* tud_network_xmit_recover() is an ECM/RNDIS-driver-only escape
+             * hatch (the NCM driver doesn't expose it). For the NCM test build
+             * there's no equivalent unstick, so the recovery is a no-op. */
+#if CFG_TUD_NCM
+            bool rec = false;
+#else
             bool rec = tud_network_xmit_recover();
+#endif
             disk_logf("[ecm] TX STALL run=%u rdy=%d cx=%d rec=%d drop=%u qd=%u heap=%u",
                       (unsigned)s_stuck_run, (int)tud_ready(),
                       (int)tud_network_can_xmit(64), (int)rec,
@@ -457,7 +464,19 @@ static dhcp_entry_t s_dhcp_entries[] = {
 };
 
 static dhcp_config_t s_dhcp_config = {
+#if CFG_TUD_NCM
+    /* SAFETY (NCM Mac-test build only): advertise NO default gateway. Switching
+     * to NCM makes macOS attach a different driver and bring up a fresh network
+     * interface that defaults to DHCP -- with a gateway offered, that new
+     * service could route the whole Mac through the dongle (offline risk, which
+     * would also sever the OTA operator). dhserver omits the router option when
+     * router.addr==0, so the new interface gets an IP but can install no default
+     * route. `curl --interface` still measures throughput. The shipping ECM
+     * build keeps the gateway (the DOS host needs it). */
+    .router    = { 0 },
+#else
     .router    = { PP_HTONL(LWIP_MAKEU32(ECM_IP_A, ECM_IP_B, ECM_IP_C, 1)) },
+#endif
     .port      = 67,
     .dns       = { PP_HTONL(LWIP_MAKEU32(ECM_IP_A, ECM_IP_B, ECM_IP_C, 1)) },
     .domain    = "dosongle",
