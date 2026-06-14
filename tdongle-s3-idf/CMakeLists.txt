@@ -77,3 +77,16 @@ idf_build_set_property(COMPILE_DEFINITIONS "-DCFG_TUD_CDC_EP_BUFSIZE=512" APPEND
 # any registry release and can't be cherry-picked (core API drift) -- the
 # path then is vendoring the whole tree.
 idf_build_set_property(COMPILE_DEFINITIONS "-DCFG_TUD_DWC2_DMA_ENABLE=1" APPEND)
+
+# NCM-only: double-buffer the IN NTB ring. The TinyUSB NCM default is a SINGLE
+# IN NTB (CFG_TUD_NCM_IN_NTB_N=1), so every device->host frame stalls on the
+# lone buffer until the prior USB transfer completes (can_xmit goes false) --
+# measured at 207 KB/s, i.e. 2.5x SLOWER than ECM. With 2 IN NTBs the batch
+# pump (main/ecm.c ncm_xmit_drain) fills a second NTB -- coalescing multiple
+# datagrams -- while the first is in flight. We keep the 3200-byte default NTB
+# size (each holds ~2 MTU datagrams) so the static-DRAM cost is only ~+3.2KB,
+# which the no-PSRAM target can spare for the experiment. The ncm.h defaults
+# are #ifndef-guarded, so this -D wins. ECM builds are unaffected.
+if(CONFIG_TINYUSB_NET_MODE_NCM)
+    idf_build_set_property(COMPILE_DEFINITIONS "-DCFG_TUD_NCM_IN_NTB_N=2" APPEND)
+endif()
