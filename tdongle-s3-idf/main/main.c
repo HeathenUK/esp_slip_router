@@ -128,9 +128,13 @@ static RTC_NOINIT_ATTR uint32_t s_rtc_log_seq;
 static RTC_NOINIT_ATTR char     s_rtc_log[RTC_LOG_LINES][RTC_LOG_LINE_LEN];
 
 /* Reboot counter in RTC SLOW: survives every soft reset (SW/PANIC/WDT), zeroed
- * only on a true power-on. Surfaced in /status as "boots" so a stress harness
- * can tell a real reboot (count moved) from a merely-busy httpd (count steady,
- * the trap that made the earlier "12 crashes" a false alarm). */
+ * on a true power-on OR when the magic doesn't match (i.e. uninitialised RTC
+ * garbage on the first boot of a build -- otherwise it shows an insane value).
+ * Surfaced in /status as "boots" so a stress harness can tell a real reboot
+ * (count moved) from a merely-busy httpd (count steady -- the trap that made the
+ * earlier "12 crashes" a false alarm). */
+#define BOOT_MAGIC 0xB007C0DEu
+static RTC_NOINIT_ATTR uint32_t s_boot_magic;
 static RTC_NOINIT_ATTR uint32_t s_boot_count;
 uint32_t dongle_boot_count(void) { return s_boot_count; }
 
@@ -1108,8 +1112,12 @@ void wifi_provision(const char *ssid, const char *pass) {
 /* ===== app_main ====================================================== */
 
 void app_main(void) {
-    /* Reboot counter: zero on a real power-on, ++ on every soft reset. */
-    if (esp_reset_reason() == ESP_RST_POWERON) s_boot_count = 0;
+    /* Reboot counter: magic-guarded so RTC garbage initialises to 0 on the first
+     * boot of this build (and on a true power-on), then ++ each reset. */
+    if (s_boot_magic != BOOT_MAGIC || esp_reset_reason() == ESP_RST_POWERON) {
+        s_boot_magic = BOOT_MAGIC;
+        s_boot_count = 0;
+    }
     s_boot_count++;
 
     esp_err_t err = nvs_flash_init();

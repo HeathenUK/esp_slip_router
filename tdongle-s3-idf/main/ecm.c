@@ -96,17 +96,15 @@
  * shed gracefully with a fat margin (measured min_free was 116 B under a
  * murderous 8-120 conn flood -- this keeps ~12 K in hand instead). */
 #define ECM_ADMIT_FLOOR      12000U
-/* Hard cap on concurrent forwarded TCP connections. The burst case (N SYNs
- * arriving while heap is still high, then all N downloads exhausting it) can't
- * be caught by a heap check at SYN time -- by then there are no SYNs left to
- * refuse. Capping the live connection COUNT bounds the eventual data-phase heap
- * directly. 8 covers the DOS/Win95 "small handful" with margin; the 9th+ SYN is
- * refused and retried. Tune against the heap floor the smoke test reports.
- * Coupled with a shortened NAPT DISCON timeout (10 s, in ip4_napt.c) so the
- * count recovers promptly once a burst of connections closes -- otherwise dead
- * entries would keep the cap closed for ~60 s. */
-#define ECM_MAX_CONNS        8U
-extern volatile uint32_t g_napt_tcp_used;  /* live TCP NAPT entries (ip4_napt.c) */
+/* Critical floor on the DOWNLOAD path (ecm_linkoutput). A SYN burst can't be
+ * caught at SYN time -- all N SYNs admit while heap is still high, and only the
+ * later data phase exhausts it. So we hold the margin where the heap is actually
+ * consumed: when free heap is below this, drop the host-bound frame instead of
+ * queueing it. The dropped data is retransmitted by TCP, so concurrent
+ * downloads self-throttle to fit the heap. This needs no connection count and
+ * no changes outside this file (the count route would mean touching the lwIP
+ * NAPT source, which we don't). Sits above the 5 K allocator guard. */
+#define ECM_TX_HEAP_FLOOR     9000U
 
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
@@ -172,14 +170,12 @@ static bool ecm_frame_is_new_tcp_syn(const uint8_t *f, uint16_t len) {
  *  OUT endpoint itself (frame dropped). */
 bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
     if (size == 0) return true;
-    /* Admission control: refuse NEW connections (drop the SYN) when either the
-     * live connection COUNT is at the cap (bounds data-phase heap; catches the
-     * burst case) OR free heap is already low (catches sustained pressure, e.g.
-     * many held connections). Existing connections (non-SYN) always pass, so a
-     * transfer in progress is never harmed; the client retransmits its SYN and
-     * connects once a slot frees / heap recovers. */
-    if ((g_napt_tcp_used >= ECM_MAX_CONNS ||
-         esp_get_free_heap_size() < ECM_ADMIT_FLOOR) &&
+    /* Admission control: refuse NEW connections (drop the SYN) when free heap is
+     * already low -- catches sustained pressure (many held connections). Burst
+     * concurrency is handled on the download path instead (ECM_TX_HEAP_FLOOR),
+     * since at SYN time heap is still high. Existing connections (non-SYN) always
+     * pass; the client retransmits its SYN and connects once heap recovers. */
+    if (esp_get_free_heap_size() < ECM_ADMIT_FLOOR &&
         ecm_frame_is_new_tcp_syn(src, size)) {
         s_admit_drops++;
         return true;               /* swallow the SYN; TinyUSB re-arms via return */
@@ -337,6 +333,15 @@ static void ecm_hb_cb(void *arg) {
 static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
     (void)nif;
     if (!s_txq || !tud_ready()) return ERR_IF;  /* not enumerated / unplugged */
+    /* Critical-heap backpressure: under heavy concurrent download the in-flight
+     * host-bound pbufs are what run heap toward OOM. Below the floor, drop here
+     * (TCP retransmits) so the downloads self-throttle and the margin holds --
+     * this is what catches the SYN-burst case the SYN gate can't. */
+    if (esp_get_free_heap_size() < ECM_TX_HEAP_FLOOR) {
+        s_tx_drops++;
+        s_tx_drops_q++;
+        return ERR_OK;                 /* shed load; TCP paces */
+    }
     /* Heap truce, intake half: while a secure session runs, also cap the
      * QUEUE to 2 frames -- each queued pbuf pins ~1.6 K of WiFi RX buffer,
      * and 8 of them (~12 K) was most of the remaining gap to the floor
