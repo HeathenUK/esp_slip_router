@@ -101,7 +101,10 @@
  * be caught by a heap check at SYN time -- by then there are no SYNs left to
  * refuse. Capping the live connection COUNT bounds the eventual data-phase heap
  * directly. 8 covers the DOS/Win95 "small handful" with margin; the 9th+ SYN is
- * refused and retried. Tune against the heap floor the smoke test reports. */
+ * refused and retried. Tune against the heap floor the smoke test reports.
+ * Coupled with a shortened NAPT DISCON timeout (10 s, in ip4_napt.c) so the
+ * count recovers promptly once a burst of connections closes -- otherwise dead
+ * entries would keep the cap closed for ~60 s. */
 #define ECM_MAX_CONNS        8U
 extern volatile uint32_t g_napt_tcp_used;  /* live TCP NAPT entries (ip4_napt.c) */
 
