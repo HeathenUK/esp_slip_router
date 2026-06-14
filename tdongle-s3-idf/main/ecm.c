@@ -87,6 +87,16 @@
 #define ECM_STUCK_FRAMES     5
 #define ECM_STUCK_HEARTBEAT  50    /* re-log every N further drains (~10 s) */
 
+/* Low-heap admission control: when free heap falls below this floor, REFUSE
+ * new outbound connections (drop their TCP SYN) instead of letting concurrency
+ * run the heap to the OOM cliff. Existing connections (non-SYN) are never
+ * touched, so a transfer in progress is unharmed; the DOS/Win95 client simply
+ * retransmits its SYN and connects once heap recovers. A handful of concurrent
+ * connections (the real use case) fits well above this; runaway concurrency is
+ * shed gracefully with a fat margin (measured min_free was 116 B under a
+ * murderous 8-120 conn flood -- this keeps ~12 K in hand instead). */
+#define ECM_ADMIT_FLOOR      12000U
+
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
 uint8_t tud_network_mac_address[6];
@@ -108,6 +118,7 @@ static volatile uint32_t s_rx_frames     = 0;
 static volatile uint32_t s_tx_frames     = 0;
 static volatile uint32_t s_rx_bytes      = 0;
 static volatile uint32_t s_tx_bytes      = 0;
+static volatile uint32_t s_admit_drops   = 0;   /* new-conn SYNs refused (low-heap admission control) */
 
 uint32_t ecm_stat_tx_drops(void)      { return s_tx_drops; }
 uint32_t ecm_stat_rx_pbuf_fails(void) { return s_rx_pbuf_fails; }
@@ -130,11 +141,34 @@ void ecm_mac_init(void) {
 
 /* ---- TinyUSB net-driver callbacks (TinyUSB task, CPU1) ---- */
 
+/** @brief Is this host->world frame a brand-new TCP connection (SYN, no ACK)?
+ *  Cheap header walk: Ethernet IPv4 -> TCP -> flags. Only used to decide
+ *  admission, so a conservative "no" on any short/odd frame is fine. */
+static bool ecm_frame_is_new_tcp_syn(const uint8_t *f, uint16_t len) {
+    if (len < 14U + 20U + 20U) return false;           /* eth + min ip + min tcp */
+    if (f[12] != 0x08U || f[13] != 0x00U) return false; /* EtherType IPv4 */
+    const uint8_t *ip = f + 14;
+    if ((ip[0] >> 4) != 4U) return false;
+    uint8_t ihl = (uint8_t)((ip[0] & 0x0FU) * 4U);
+    if (ihl < 20U || ip[9] != 6U) return false;        /* IPv4 header len; proto TCP */
+    if (14U + ihl + 14U > len) return false;
+    uint8_t flags = ip[ihl + 13U];                     /* TCP flags byte */
+    return (flags & 0x02U) && !(flags & 0x10U);        /* SYN set, ACK clear */
+}
+
 /** @brief One Ethernet frame arrived from the host. Copy to a pbuf and
  *  post to the tcpip thread. Returning false makes the driver re-arm the
  *  OUT endpoint itself (frame dropped). */
 bool tud_network_recv_cb(const uint8_t *src, uint16_t size) {
     if (size == 0) return true;
+    /* Admission control: under low heap, refuse NEW connections (drop the SYN)
+     * so existing flows keep their memory and we never approach OOM. The client
+     * retransmits and connects once heap recovers. Existing connections pass. */
+    if (esp_get_free_heap_size() < ECM_ADMIT_FLOOR &&
+        ecm_frame_is_new_tcp_syn(src, size)) {
+        s_admit_drops++;
+        return true;               /* swallow the SYN; TinyUSB re-arms via return */
+    }
     struct pbuf *p = pbuf_alloc(PBUF_RAW, size, PBUF_POOL);
     if (!p) {
         s_rx_pbuf_fails++;
@@ -263,23 +297,23 @@ static void ecm_tx_task(void *arg) {
  *  IDLE snapshot, so the 24-line ring isn't flooded at idle. */
 static void ecm_hb_cb(void *arg) {
     (void)arg;
-    static uint32_t l_rx = 0, l_tx = 0, l_dr = 0;
+    static uint32_t l_rx = 0, l_tx = 0, l_dr = 0, l_ad = 0;
     static bool was_active = false;
     uint32_t rx = s_rx_frames, tx = s_tx_frames;
     uint32_t rxd = rx - l_rx, txd = tx - l_tx;
-    uint32_t dr = s_tx_drops;
+    uint32_t dr = s_tx_drops, ad = s_admit_drops;
     bool data = rxd || txd;
-    bool moved = data || (dr != l_dr);
+    bool moved = data || (dr != l_dr) || (ad != l_ad);
     if (moved || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=%u heap=%u/%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=%u adm=%u heap=%u/%u",
                   data ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
-                  (int)tud_network_can_xmit(64), (unsigned)s_tx_drops,
+                  (int)tud_network_can_xmit(64), (unsigned)s_tx_drops, (unsigned)ad,
                   (unsigned)esp_get_free_heap_size(),
                   (unsigned)esp_get_minimum_free_heap_size());
     }
-    l_rx = rx; l_tx = tx; l_dr = dr;
+    l_rx = rx; l_tx = tx; l_dr = dr; l_ad = ad;
     was_active = moved;
 }
 

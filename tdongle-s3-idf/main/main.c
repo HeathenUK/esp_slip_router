@@ -127,6 +127,13 @@ static RTC_NOINIT_ATTR uint32_t s_rtc_log_magic;
 static RTC_NOINIT_ATTR uint32_t s_rtc_log_seq;
 static RTC_NOINIT_ATTR char     s_rtc_log[RTC_LOG_LINES][RTC_LOG_LINE_LEN];
 
+/* Reboot counter in RTC SLOW: survives every soft reset (SW/PANIC/WDT), zeroed
+ * only on a true power-on. Surfaced in /status as "boots" so a stress harness
+ * can tell a real reboot (count moved) from a merely-busy httpd (count steady,
+ * the trap that made the earlier "12 crashes" a false alarm). */
+static RTC_NOINIT_ATTR uint32_t s_boot_count;
+uint32_t dongle_boot_count(void) { return s_boot_count; }
+
 /* Used during dump_rtc_log_on_boot() to suppress the RTC mirror -- if
  * we DID mirror the dumped lines back, the next boot would re-dump
  * them with another "[pre-reset]" prefix and so on indefinitely. */
@@ -218,6 +225,7 @@ static esp_err_t h_status(httpd_req_t *req) {
         "\"wifi\":{\"connected\":%s,\"ssid\":\"%.32s\",\"ip\":\"" IPSTR "\",\"rssi\":%d},"
         "\"app\":{\"name\":\"%.32s\",\"version\":\"%.32s\"},"
         "\"reset_reason\":\"%s\","
+        "\"boots\":%lu,"
         "\"free_heap\":%lu,"
         "\"min_free_heap\":%lu}",
         wifi_up ? "true" : "false",
@@ -226,6 +234,7 @@ static esp_err_t h_status(httpd_req_t *req) {
         ap.rssi,
         app->project_name, app->version,
         reset_reason_name(esp_reset_reason()),
+        (unsigned long)s_boot_count,
         (unsigned long)esp_get_free_heap_size(),
         (unsigned long)esp_get_minimum_free_heap_size());
     (void)n;
@@ -1099,6 +1108,10 @@ void wifi_provision(const char *ssid, const char *pass) {
 /* ===== app_main ====================================================== */
 
 void app_main(void) {
+    /* Reboot counter: zero on a real power-on, ++ on every soft reset. */
+    if (esp_reset_reason() == ESP_RST_POWERON) s_boot_count = 0;
+    s_boot_count++;
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

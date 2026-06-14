@@ -253,6 +253,7 @@ static bool sta_ip_str(char *out, size_t n) {
 static void display_task(void *arg) {
     char ip[20], r1[12], r2[12], buf[40];
     uint32_t prev_dl = 0, prev_ul = 0;
+    uint32_t dl_ewma = 0, ul_ewma = 0;   /* smoothed display rate (EWMA) */
     int64_t prev_us = esp_timer_get_time();
 
     for (;;) {
@@ -288,8 +289,16 @@ static void display_task(void *arg) {
             uint32_t dl_bps = (dt_us > 0) ? (uint32_t)(((uint64_t)(dl - prev_dl) * 1000000) / dt_us) : 0;
             uint32_t ul_bps = (dt_us > 0) ? (uint32_t)(((uint64_t)(ul - prev_ul) * 1000000) / dt_us) : 0;
             prev_dl = dl; prev_ul = ul; prev_us = now;
-            rate_short(dl_bps, r1, sizeof r1);
-            rate_short(ul_bps, r2, sizeof r2);
+            /* EWMA low-pass on the displayed rate. The raw 200 ms sample swings
+             * between a burst (~150 KB/s) and 0 because the ECM bridge carries
+             * one frame in flight at a time, so the unfiltered number flickers.
+             * A weighted moving average (new 1/8, prior 7/8 -> ~1.6 s time
+             * constant) shows the sustained rate. Integer-only, no buffer; the
+             * same exponential smoother TCP uses for RTT (RFC 6298). */
+            dl_ewma = (uint32_t)(((uint64_t)dl_ewma * 7 + dl_bps) >> 3);
+            ul_ewma = (uint32_t)(((uint64_t)ul_ewma * 7 + ul_bps) >> 3);
+            rate_short(dl_ewma, r1, sizeof r1);
+            rate_short(ul_ewma, r2, sizeof r2);
             snprintf(buf, sizeof buf, "D%s U%s", r1, r2);
             draw_row(4, buf, C_GREEN);
         } else {
