@@ -87,37 +87,6 @@
 #define ECM_STUCK_FRAMES     5
 #define ECM_STUCK_HEARTBEAT  50    /* re-log every N further drains (~10 s) */
 
-/* NAPT freeze instrumentation (defined in the IDF lwIP tree's ip4_napt.c).
- * g_napt_recv_nomatch: a reverse (world->host) packet whose 5-tuple has NO
- * NAPT entry -- it gets dropped silently. If a download hard-freezes with the
- * Mac's send queue stuck and these climb, the server's retransmits are dying
- * on a broken/evicted mapping. g_napt_tcp_evict: TCP entries reclaimed by GC
- * timeout or table-full force-eviction (the suspected cause of a mid-stream
- * mapping loss). */
-extern volatile uint32_t g_napt_recv_nomatch;
-extern volatile uint32_t g_napt_tcp_evict;
-/* Freeze-mechanism proof (see ip4_napt.c): a SYN reused a (src,sport) entry and
- * repointed it to a NEW dest -- hijacking a live mapping. _hot = the victim was
- * active <2 s ago (a LIVE connection clobbered). g_napt_used = live entry count
- * (table pressure). If a download freezes with g_napt_recv_nomatch climbing AND
- * g_napt_repoint(_hot) ticked at onset, the (src,sport)-only NAPT key is proven
- * the cause. */
-extern volatile uint32_t g_napt_repoint;
-extern volatile uint32_t g_napt_repoint_hot;
-extern volatile uint32_t g_napt_used;
-/* At the last reverse no-match: live TCP entries still pointing at that server
- * (dest+dport). dm>0 at a freeze => entry survives but mport no longer matches
- * (identity changed); dm=0 => mapping fully gone. */
-extern volatile uint32_t g_napt_nm_destmatch;
-/* Ground-truth snapshot at the last reverse no-match (see ip4_napt.c): the
- * failing inbound tuple + the first live entry + the REAL walked count. Logged
- * as a [ecm] nm line whenever nm moves, so the freeze shows exactly what is /
- * isn't in the table. Addrs network-order u32; ports host-order. */
-extern volatile uint32_t g_napt_nm_src, g_napt_nm_sport, g_napt_nm_mwant;
-extern volatile uint32_t g_napt_nm_total;
-extern volatile uint32_t g_napt_nm_e0dst, g_napt_nm_e0dport, g_napt_nm_e0mport,
-                         g_napt_nm_e0proto;
-
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
 uint8_t tud_network_mac_address[6];
@@ -294,45 +263,23 @@ static void ecm_tx_task(void *arg) {
  *  IDLE snapshot, so the 24-line ring isn't flooded at idle. */
 static void ecm_hb_cb(void *arg) {
     (void)arg;
-    static uint32_t l_rx = 0, l_tx = 0, l_dr = 0, l_ev = 0, l_nm = 0, l_rp = 0;
+    static uint32_t l_rx = 0, l_tx = 0, l_dr = 0;
     static bool was_active = false;
     uint32_t rx = s_rx_frames, tx = s_tx_frames;
     uint32_t rxd = rx - l_rx, txd = tx - l_tx;
     uint32_t dr = s_tx_drops;
-    uint32_t ev = g_napt_tcp_evict, nm = g_napt_recv_nomatch;
-    uint32_t rp = g_napt_repoint, rh = g_napt_repoint_hot, used = g_napt_used;
-    uint32_t dm = g_napt_nm_destmatch;
     bool data = rxd || txd;
-    /* Fire the line on ANY movement -- a NAPT eviction, a reverse no-match, or a
-     * repoint (the freeze trigger) -- so a hard-freeze (tx flat) still produces
-     * heartbeats showing n/r climbing and pins the exact tick they started. */
-    bool moved = data || (dr != l_dr) || (ev != l_ev) || (nm != l_nm) ||
-                 (rp != l_rp);
+    bool moved = data || (dr != l_dr);
     if (moved || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d dr=%u nap=e%u/n%u/r%u/rh%u u%u dm%u h=%u",
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=%u heap=%u/%u",
                   data ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
-                  (int)tud_network_can_xmit(64), (unsigned)dr,
-                  (unsigned)ev, (unsigned)nm, (unsigned)rp, (unsigned)rh,
-                  (unsigned)used, (unsigned)dm, (unsigned)esp_get_free_heap_size());
+                  (int)tud_network_can_xmit(64), (unsigned)s_tx_drops,
+                  (unsigned)esp_get_free_heap_size(),
+                  (unsigned)esp_get_minimum_free_heap_size());
     }
-    if (nm != l_nm) {
-        /* Ground truth at the black-hole: the failing inbound tuple, the real
-         * table count, and the first live entry. dm=0 + e0 unrelated => the
-         * download mapping is genuinely gone; tot != u => the gauge lies. */
-        uint32_t s = g_napt_nm_src, e = g_napt_nm_e0dst;
-        disk_logf("[ecm] nm %u.%u.%u.%u:%u mw=%u tot=%u u=%u e0=%u.%u.%u.%u:%u/m%u p%u",
-                  (unsigned)(s & 0xff), (unsigned)((s >> 8) & 0xff),
-                  (unsigned)((s >> 16) & 0xff), (unsigned)((s >> 24) & 0xff),
-                  (unsigned)g_napt_nm_sport, (unsigned)g_napt_nm_mwant,
-                  (unsigned)g_napt_nm_total, (unsigned)used,
-                  (unsigned)(e & 0xff), (unsigned)((e >> 8) & 0xff),
-                  (unsigned)((e >> 16) & 0xff), (unsigned)((e >> 24) & 0xff),
-                  (unsigned)g_napt_nm_e0dport, (unsigned)g_napt_nm_e0mport,
-                  (unsigned)g_napt_nm_e0proto);
-    }
-    l_rx = rx; l_tx = tx; l_dr = dr; l_ev = ev; l_nm = nm; l_rp = rp;
+    l_rx = rx; l_tx = tx; l_dr = dr;
     was_active = moved;
 }
 
