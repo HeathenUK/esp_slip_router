@@ -323,13 +323,18 @@ static void ecm_hb_cb(void *arg) {
     bool data = rxd || txd;
     bool moved = data || (dr != l_dr) || (ad != l_ad);
     if (moved || was_active) {
-        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=%u adm=%u heap=%u/%u",
+        /* up = monotonic uptime in ms (esp_timer). It carries no wall-clock, but
+         * the Mac stamps its /disk-log poll with wall time, so this lets
+         * correlate.py map every heartbeat to wall time exactly -- without it the
+         * IDLE-suppressed gaps break the "1 line == 1 s" assumption. */
+        disk_logf("[ecm] hb%s rx=%u+%u tx=%u+%u qd=%u cx=%d txdr=%u adm=%u heap=%u/%u up=%lu",
                   data ? "" : " IDLE",
                   (unsigned)rx, (unsigned)rxd, (unsigned)tx, (unsigned)txd,
                   (unsigned)(s_txq ? uxQueueMessagesWaiting(s_txq) : 0),
                   (int)tud_network_can_xmit(64), (unsigned)s_tx_drops, (unsigned)ad,
                   (unsigned)esp_get_free_heap_size(),
-                  (unsigned)esp_get_minimum_free_heap_size());
+                  (unsigned)esp_get_minimum_free_heap_size(),
+                  (unsigned long)(esp_timer_get_time() / 1000));
     }
     l_rx = rx; l_tx = tx; l_dr = dr; l_ad = ad;
     was_active = moved;
