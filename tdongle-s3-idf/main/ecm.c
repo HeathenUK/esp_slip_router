@@ -106,9 +106,19 @@
  * NAPT source, which we don't). Set well above the 5 K allocator guard: the
  * drop is reactive so there's ~3-4 K of in-flight overshoot below the floor
  * under a heavy burst (measured: floor 9 K -> min_free 5.4 K worst case), so
- * 13 K keeps the worst case ~9 K. Single-stream and a handful never reach it
- * (heap stays >20 K there), so there's no throughput cost in normal use. */
-#define ECM_TX_HEAP_FLOOR    13000U
+ * 13 K keeps the worst case ~9 K. CORRECTION (measured 2026-06-16 on the real
+ * CH375/386 host, NOT the Mac): "single-stream never reaches it" was a fast-host
+ * artifact -- the slow host backs the TX queue up and min_free dips to ~12 K, so
+ * the 13 K floor DROPPED one host-bound frame, and that single loss is
+ * non-recoverable on this path (FTP froze, server retransmitting forever). Two
+ * fixes: (1) lower to 9 K -- the ~12 K dip clears it, and 9 K still lands ~5.4 K
+ * worst-case, above the guard; (2) drop only on SUSTAINED pressure -- a lone
+ * sub-floor frame (a momentary WiFi-RX burst) must NOT kill a connection, so
+ * require >= ECM_LOWHEAP_SUSTAIN consecutive sub-floor frames (worst-case
+ * overshoot then ~5.8 K, still above the 5 K guard). Genuine concurrency stays
+ * sustained-low, so it still self-throttles. */
+#define ECM_TX_HEAP_FLOOR    9000U
+#define ECM_LOWHEAP_SUSTAIN  2U    /* consecutive sub-floor frames before shedding */
 
 /* The host adapter's MAC (served via the iMACAddress string descriptor).
  * Declared extern by TinyUSB's net driver; we own the definition. */
@@ -126,6 +136,7 @@ static volatile uint32_t s_tx_drops      = 0;
 static volatile uint32_t s_rx_pbuf_fails = 0;
 static volatile uint32_t s_rx_mbox_drops = 0;   /* host->stack drops: tcpip mbox full */
 static volatile uint32_t s_tx_drops_q    = 0;   /* TX dropped at linkoutput: queue full / session cap */
+static uint32_t s_lowheap_run = 0;              /* consecutive sub-floor linkoutput calls (sustained-drop gate) */
 static volatile uint32_t s_tx_drops_pump = 0;   /* TX dropped in pump: host didn't drain in ECM_TX_DRAIN_MS */
 static volatile uint32_t s_rx_frames     = 0;
 static volatile uint32_t s_tx_frames     = 0;
@@ -350,9 +361,17 @@ static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
      * (TCP retransmits) so the downloads self-throttle and the margin holds --
      * this is what catches the SYN-burst case the SYN gate can't. */
     if (esp_get_free_heap_size() < ECM_TX_HEAP_FLOOR) {
-        s_tx_drops++;
-        s_tx_drops_q++;
-        return ERR_OK;                 /* shed load; TCP paces */
+        /* SUSTAINED-only: never shed on a single transient dip -- one dropped
+         * frame is non-recoverable on the slow host (it froze FTP). Only shed
+         * once the heap has stayed below the floor for ECM_LOWHEAP_SUSTAIN
+         * frames running = real concurrency pressure, not a momentary burst. */
+        if (++s_lowheap_run >= ECM_LOWHEAP_SUSTAIN) {
+            s_tx_drops++;
+            s_tx_drops_q++;
+            return ERR_OK;             /* sustained pressure: shed; TCP paces */
+        }
+    } else {
+        s_lowheap_run = 0;
     }
     /* Heap truce, intake half: while a secure session runs, also cap the
      * QUEUE to 2 frames -- each queued pbuf pins ~1.6 K of WiFi RX buffer,
