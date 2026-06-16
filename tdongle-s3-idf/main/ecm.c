@@ -99,24 +99,25 @@
 /* Critical floor on the DOWNLOAD path (ecm_linkoutput). A SYN burst can't be
  * caught at SYN time -- all N SYNs admit while heap is still high, and only the
  * later data phase exhausts it. So we hold the margin where the heap is actually
- * consumed: when free heap is below this, drop the host-bound frame instead of
- * queueing it. The dropped data is retransmitted by TCP, so concurrent
- * downloads self-throttle to fit the heap. This needs no connection count and
- * no changes outside this file (the count route would mean touching the lwIP
- * NAPT source, which we don't). Set well above the 5 K allocator guard: the
- * drop is reactive so there's ~3-4 K of in-flight overshoot below the floor
- * under a heavy burst (measured: floor 9 K -> min_free 5.4 K worst case), so
- * 13 K keeps the worst case ~9 K. CORRECTION (measured 2026-06-16 on the real
- * CH375/386 host, NOT the Mac): "single-stream never reaches it" was a fast-host
- * artifact -- the slow host backs the TX queue up and min_free dips to ~12 K, so
- * the 13 K floor DROPPED one host-bound frame, and that single loss is
- * non-recoverable on this path (FTP froze, server retransmitting forever). Two
- * fixes: (1) lower to 9 K -- the ~12 K dip clears it, and 9 K still lands ~5.4 K
- * worst-case, above the guard; (2) drop only on SUSTAINED pressure -- a lone
- * sub-floor frame (a momentary WiFi-RX burst) must NOT kill a connection, so
- * require >= ECM_LOWHEAP_SUSTAIN consecutive sub-floor frames (worst-case
- * overshoot then ~5.8 K, still above the 5 K guard). Genuine concurrency stays
- * sustained-low, so it still self-throttles. */
+ * consumed: when free heap stays below this for ECM_LOWHEAP_SUSTAIN consecutive
+ * frames (sustained pressure, not a transient dip), drop the host-bound frame
+ * instead of queueing it; TCP retransmits, so concurrent downloads self-throttle
+ * to fit the heap. No connection count and no lwIP NAPT changes needed.
+ *
+ * There is NO fixed "heap guard" to sit above -- ESP-IDF malloc simply returns
+ * NULL when the largest free block can't cover a request. The critical
+ * allocations on this path (lwIP pbufs / WiFi RX buffers) are ~1.6 K each, so the
+ * empirical failure point is ~2 K, not a single threshold. (OTA needs much more
+ * but only runs at idle with heap ~28 K, never mid-download.)
+ *
+ * History: this was 13 K, tuned on the Mac's fast USB drain where single-stream
+ * heap stays >20 K. On the real CH375/386 host (measured 2026-06-16) the slow
+ * drain backs the TX queue up and min_free dips to ~12 K, so 13 K dropped one
+ * host-bound frame -- and a SINGLE loss is non-recoverable here (FTP froze, server
+ * retransmitting forever; the bridge even delivered the retransmit but mTCP never
+ * re-ACKed). Fixes: lowered to 9 K (the ~12 K dip clears it) and gated to
+ * sustained-only so a momentary WiFi-RX dip can't kill a connection. A single
+ * 10 MB FTP then ran clean; min_free grazed ~4.6 K with no allocation failure. */
 #define ECM_TX_HEAP_FLOOR    9000U
 #define ECM_LOWHEAP_SUSTAIN  2U    /* consecutive sub-floor frames before shedding */
 
@@ -357,9 +358,10 @@ static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
     (void)nif;
     if (!s_txq || !tud_ready()) return ERR_IF;  /* not enumerated / unplugged */
     /* Critical-heap backpressure: under heavy concurrent download the in-flight
-     * host-bound pbufs are what run heap toward OOM. Below the floor, drop here
-     * (TCP retransmits) so the downloads self-throttle and the margin holds --
-     * this is what catches the SYN-burst case the SYN gate can't. */
+     * host-bound pbufs are what run heap toward OOM. Below the floor -- and only
+     * once it's SUSTAINED (see below) -- drop here (TCP retransmits) so the
+     * downloads self-throttle and the margin holds -- this is what catches the
+     * SYN-burst case the SYN gate can't. */
     if (esp_get_free_heap_size() < ECM_TX_HEAP_FLOOR) {
         /* SUSTAINED-only: never shed on a single transient dip -- one dropped
          * frame is non-recoverable on the slow host (it froze FTP). Only shed
@@ -374,9 +376,9 @@ static err_t ecm_linkoutput(struct netif *nif, struct pbuf *p) {
         s_lowheap_run = 0;
     }
     /* Heap truce, intake half: while a secure session runs, also cap the
-     * QUEUE to 2 frames -- each queued pbuf pins ~1.6 K of WiFi RX buffer,
-     * and 8 of them (~12 K) was most of the remaining gap to the floor
-     * (pacing alone: min_free 4.4 K; still under the 5 K guard). */
+     * QUEUE to 2 frames -- each queued pbuf pins ~1.6 K of WiFi RX buffer, and
+     * 8 of them (~12 K) was most of the remaining gap; pacing alone left min_free
+     * ~4.4 K (uncomfortably near the ~2 K empirical OOM point), so cap intake too. */
     if (modem_session_busy() && uxQueueMessagesWaiting(s_txq) >= 2) {
         s_tx_drops++;
         s_tx_drops_q++;
